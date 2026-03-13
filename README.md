@@ -9,13 +9,29 @@ Rust-powered meteorology toolkit with MetPy-compatible Python APIs.
 from metpy.calc import cape_cin, potential_temperature
 from metpy.units import units
 
-# After
+# After — same code, faster results
 from metrust.calc import cape_cin, potential_temperature
 from metrust.units import units
 
 p = [1000, 925, 850, 700, 500] * units.hPa
 T = [25, 20, 15, 5, -15] * units.degC
 Td = [20, 15, 10, -5, -25] * units.degC
+```
+
+Scalars and arrays both work — pass a single value or a full grid:
+
+```python
+import numpy as np
+from metrust.calc import potential_temperature, saturation_vapor_pressure
+from metrust.units import units
+
+# Scalar
+theta = potential_temperature(850 * units.hPa, 20 * units.degC)
+
+# 2D grid (e.g., HRRR 1059x1799)
+p_grid = np.full((1059, 1799), 850.0) * units.hPa
+t_grid = np.random.uniform(15, 30, (1059, 1799)) * units.degC
+theta_grid = potential_temperature(p_grid, t_grid)  # shape preserved
 ```
 
 ## Installation
@@ -51,13 +67,17 @@ Native Rust implementations cover a large portion of the day-to-day meteorology 
 - I/O: Level-III, METAR parsing, station lookup, GINI, GEMPAK grid/sounding/surface, WPC surface bulletin parsing
 - Constants: the core meteorological constants used by the calculation layer
 
-On the Python side, `metrust` now also normalizes several wrapper mismatches that previously blocked MetPy-style use:
+On the Python side, `metrust` normalizes wrapper mismatches that previously blocked MetPy-style use:
 
-- Offset temperatures now work with Pint quantities like `20 * units.degC`
+- All thermodynamic and humidity functions accept scalars, 1D arrays, and 2D grids with shape preservation
+- 28 hot-path functions have dedicated Rust array bindings (zero Python loop overhead)
+- Remaining functions use a Python-side vectorizer (`_vec_call`) for automatic scalar/array dispatch
+- Offset temperatures work with Pint quantities like `20 * units.degC`
 - `saturation_vapor_pressure()` returns `Pa`
 - `saturation_mixing_ratio()` returns dimensionless `kg/kg`
 - `relative_humidity_from_dewpoint()` returns a dimensionless fraction
 - Common MetPy signatures such as `cape_cin(p, t, td, parcel_profile=...)` are accepted
+- `compute_cape_cin` supports `top_m` parameter for capped CAPE (e.g., SB3CAPE at 3 km AGL)
 
 ## Compatibility Model
 
@@ -126,6 +146,7 @@ This is not a full package-level replacement for all of MetPy yet.
 - Level-II access currently relies on MetPy from the Python surface
 - Numerical agreement is close for most shared calculations, but not bit-identical
 - `moist_lapse` still needs more scrutiny before being treated as high-confidence parity work
+- Grid kinematics (divergence, vorticity, etc.) require scalar `dx`/`dy` grid spacings — variable-resolution grids are not yet supported
 
 Known numerical differences include:
 
