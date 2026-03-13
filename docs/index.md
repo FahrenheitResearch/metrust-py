@@ -169,7 +169,7 @@ The architecture is designed for the kind of batch processing that meteorologica
 
     Platform support, from-source builds, and optional dependencies.
 
-    [:octicons-arrow-right-24: Installation Guide](guides/installation.md)
+    [&rarr;Installation Guide](guides/installation.md)
 
 -   **Migration from MetPy**
 
@@ -177,7 +177,7 @@ The architecture is designed for the kind of batch processing that meteorologica
 
     Detailed guide for moving existing MetPy code to metrust.
 
-    [:octicons-arrow-right-24: Migration Guide](guides/migration.md)
+    [&rarr;Migration Guide](guides/migration.md)
 
 -   **Array Support**
 
@@ -185,7 +185,7 @@ The architecture is designed for the kind of batch processing that meteorologica
 
     How metrust handles scalars, 1-D arrays, and 2-D grids uniformly.
 
-    [:octicons-arrow-right-24: Array Guide](guides/arrays.md)
+    [&rarr;Array Guide](guides/arrays.md)
 
 -   **Performance**
 
@@ -193,7 +193,7 @@ The architecture is designed for the kind of batch processing that meteorologica
 
     Three-tier benchmark methodology and full results.
 
-    [:octicons-arrow-right-24: Benchmarks](performance.md)
+    [&rarr;Benchmarks](performance.md)
 
 -   **API Reference**
 
@@ -201,7 +201,7 @@ The architecture is designed for the kind of batch processing that meteorologica
 
     Full function reference organized by domain.
 
-    [:octicons-arrow-right-24: Thermodynamics](api/thermodynamics.md) | [:octicons-arrow-right-24: Wind](api/wind.md) | [:octicons-arrow-right-24: Kinematics](api/kinematics.md) | [:octicons-arrow-right-24: Severe](api/severe.md)
+    [&rarr;Thermodynamics](api/thermodynamics.md) | [&rarr;Wind](api/wind.md) | [&rarr;Kinematics](api/kinematics.md) | [&rarr;Severe](api/severe.md)
 
 -   **Compatibility**
 
@@ -209,7 +209,7 @@ The architecture is designed for the kind of batch processing that meteorologica
 
     What works, what's shimmed, and known numerical differences.
 
-    [:octicons-arrow-right-24: Compatibility Notes](compatibility.md)
+    [&rarr;Compatibility Notes](compatibility.md)
 
 </div>
 

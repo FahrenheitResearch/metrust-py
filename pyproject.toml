@@ -5,9 +5,27 @@ build-backend = "maturin"
 [project]
 name = "metrust"
 version = "0.1.8"
-description = "Rust-powered meteorology toolkit for Python"
+description = "Rust-powered drop-in replacement for MetPy -- 100+ meteorological calculations, 10-90x faster"
 requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [{name = "Fahrenheit Research"}]
+keywords = ["meteorology", "weather", "rust", "metpy", "atmospheric-science", "nwp", "cape", "sounding"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Atmospheric Science",
+]
 dependencies = ["numpy>=1.20", "pint>=0.20"]
+readme = "README.md"
+
+[project.urls]
+Homepage = "https://github.com/FahrenheitResearch/metrust-py"
+Documentation = "https://fahrenheitresearch.github.io/metrust-py/"
+Repository = "https://github.com/FahrenheitResearch/metrust-py"
+Issues = "https://github.com/FahrenheitResearch/metrust-py/issues"
 
 [tool.maturin]
 python-source = "python"
