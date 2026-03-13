@@ -13,7 +13,9 @@ fn smooth_gaussian<'py>(
     let shape = data.shape();
     let (ny, nx) = (shape[0], shape[1]);
     let flat: Vec<f64> = data.as_slice()?.to_vec();
-    let result = metrust::calc::smooth::smooth_gaussian(&flat, nx, ny, sigma);
+    let result = py.allow_threads(|| {
+        metrust::calc::smooth::smooth_gaussian(&flat, nx, ny, sigma)
+    });
     let rows: Vec<Vec<f64>> = result.chunks(nx).map(|c| c.to_vec()).collect();
     Ok(PyArray2::from_vec2(py, &rows)?.into())
 }
@@ -32,7 +34,9 @@ fn smooth_rectangular<'py>(
     let shape = data.shape();
     let (ny, nx) = (shape[0], shape[1]);
     let flat: Vec<f64> = data.as_slice()?.to_vec();
-    let result = metrust::calc::smooth::smooth_rectangular(&flat, nx, ny, size, passes);
+    let result = py.allow_threads(|| {
+        metrust::calc::smooth::smooth_rectangular(&flat, nx, ny, size, passes)
+    });
     let rows: Vec<Vec<f64>> = result.chunks(nx).map(|c| c.to_vec()).collect();
     Ok(PyArray2::from_vec2(py, &rows)?.into())
 }
@@ -51,7 +55,9 @@ fn smooth_circular<'py>(
     let shape = data.shape();
     let (ny, nx) = (shape[0], shape[1]);
     let flat: Vec<f64> = data.as_slice()?.to_vec();
-    let result = metrust::calc::smooth::smooth_circular(&flat, nx, ny, radius, passes);
+    let result = py.allow_threads(|| {
+        metrust::calc::smooth::smooth_circular(&flat, nx, ny, radius, passes)
+    });
     let rows: Vec<Vec<f64>> = result.chunks(nx).map(|c| c.to_vec()).collect();
     Ok(PyArray2::from_vec2(py, &rows)?.into())
 }
@@ -70,7 +76,9 @@ fn smooth_n_point<'py>(
     let shape = data.shape();
     let (ny, nx) = (shape[0], shape[1]);
     let flat: Vec<f64> = data.as_slice()?.to_vec();
-    let result = metrust::calc::smooth::smooth_n_point(&flat, nx, ny, n, passes);
+    let result = py.allow_threads(|| {
+        metrust::calc::smooth::smooth_n_point(&flat, nx, ny, n, passes)
+    });
     let rows: Vec<Vec<f64>> = result.chunks(nx).map(|c| c.to_vec()).collect();
     Ok(PyArray2::from_vec2(py, &rows)?.into())
 }
@@ -98,9 +106,11 @@ fn smooth_window<'py>(
     let (window_ny, window_nx) = (w_shape[0], w_shape[1]);
     let flat_data: Vec<f64> = data.as_slice()?.to_vec();
     let flat_window: Vec<f64> = window.as_slice()?.to_vec();
-    let result = metrust::calc::smooth::smooth_window(
-        &flat_data, nx, ny, &flat_window, window_nx, window_ny, passes, normalize_weights,
-    );
+    let result = py.allow_threads(|| {
+        metrust::calc::smooth::smooth_window(
+            &flat_data, nx, ny, &flat_window, window_nx, window_ny, passes, normalize_weights,
+        )
+    });
     let rows: Vec<Vec<f64>> = result.chunks(nx).map(|c| c.to_vec()).collect();
     Ok(PyArray2::from_vec2(py, &rows)?.into())
 }
@@ -119,7 +129,9 @@ fn gradient_x<'py>(
     let shape = data.shape();
     let (ny, nx) = (shape[0], shape[1]);
     let flat: Vec<f64> = data.as_slice()?.to_vec();
-    let result = metrust::calc::smooth::gradient_x(&flat, nx, ny, dx);
+    let result = py.allow_threads(|| {
+        metrust::calc::smooth::gradient_x(&flat, nx, ny, dx)
+    });
     let rows: Vec<Vec<f64>> = result.chunks(nx).map(|c| c.to_vec()).collect();
     Ok(PyArray2::from_vec2(py, &rows)?.into())
 }
@@ -136,7 +148,9 @@ fn gradient_y<'py>(
     let shape = data.shape();
     let (ny, nx) = (shape[0], shape[1]);
     let flat: Vec<f64> = data.as_slice()?.to_vec();
-    let result = metrust::calc::smooth::gradient_y(&flat, nx, ny, dy);
+    let result = py.allow_threads(|| {
+        metrust::calc::smooth::gradient_y(&flat, nx, ny, dy)
+    });
     let rows: Vec<Vec<f64>> = result.chunks(nx).map(|c| c.to_vec()).collect();
     Ok(PyArray2::from_vec2(py, &rows)?.into())
 }
@@ -154,7 +168,9 @@ fn laplacian<'py>(
     let shape = data.shape();
     let (ny, nx) = (shape[0], shape[1]);
     let flat: Vec<f64> = data.as_slice()?.to_vec();
-    let result = metrust::calc::smooth::laplacian(&flat, nx, ny, dx, dy);
+    let result = py.allow_threads(|| {
+        metrust::calc::smooth::laplacian(&flat, nx, ny, dx, dy)
+    });
     let rows: Vec<Vec<f64>> = result.chunks(nx).map(|c| c.to_vec()).collect();
     Ok(PyArray2::from_vec2(py, &rows)?.into())
 }
@@ -173,7 +189,9 @@ fn first_derivative<'py>(
     let shape = data.shape();
     let (ny, nx) = (shape[0], shape[1]);
     let flat: Vec<f64> = data.as_slice()?.to_vec();
-    let result = metrust::calc::smooth::first_derivative(&flat, axis_spacing, axis, nx, ny);
+    let result = py.allow_threads(|| {
+        metrust::calc::smooth::first_derivative(&flat, axis_spacing, axis, nx, ny)
+    });
     let rows: Vec<Vec<f64>> = result.chunks(nx).map(|c| c.to_vec()).collect();
     Ok(PyArray2::from_vec2(py, &rows)?.into())
 }
@@ -192,7 +210,9 @@ fn second_derivative<'py>(
     let shape = data.shape();
     let (ny, nx) = (shape[0], shape[1]);
     let flat: Vec<f64> = data.as_slice()?.to_vec();
-    let result = metrust::calc::smooth::second_derivative(&flat, axis_spacing, axis, nx, ny);
+    let result = py.allow_threads(|| {
+        metrust::calc::smooth::second_derivative(&flat, axis_spacing, axis, nx, ny)
+    });
     let rows: Vec<Vec<f64>> = result.chunks(nx).map(|c| c.to_vec()).collect();
     Ok(PyArray2::from_vec2(py, &rows)?.into())
 }
@@ -214,9 +234,9 @@ fn lat_lon_grid_deltas<'py>(
     let (ny, nx) = (shape[0], shape[1]);
     let flat_lats: Vec<f64> = lats.as_slice()?.to_vec();
     let flat_lons: Vec<f64> = lons.as_slice()?.to_vec();
-    let (dx_vec, dy_vec) = metrust::calc::smooth::lat_lon_grid_deltas(
-        &flat_lats, &flat_lons, nx, ny,
-    );
+    let (dx_vec, dy_vec) = py.allow_threads(|| {
+        metrust::calc::smooth::lat_lon_grid_deltas(&flat_lats, &flat_lons, nx, ny)
+    });
     let dx_rows: Vec<Vec<f64>> = dx_vec.chunks(nx).map(|c| c.to_vec()).collect();
     let dy_rows: Vec<Vec<f64>> = dy_vec.chunks(nx).map(|c| c.to_vec()).collect();
     Ok((
@@ -242,9 +262,9 @@ fn geospatial_gradient<'py>(
     let flat_data: Vec<f64> = data.as_slice()?.to_vec();
     let flat_lats: Vec<f64> = lats.as_slice()?.to_vec();
     let flat_lons: Vec<f64> = lons.as_slice()?.to_vec();
-    let (dfdx, dfdy) = metrust::calc::smooth::geospatial_gradient(
-        &flat_data, &flat_lats, &flat_lons, nx, ny,
-    );
+    let (dfdx, dfdy) = py.allow_threads(|| {
+        metrust::calc::smooth::geospatial_gradient(&flat_data, &flat_lats, &flat_lons, nx, ny)
+    });
     let dfdx_rows: Vec<Vec<f64>> = dfdx.chunks(nx).map(|c| c.to_vec()).collect();
     let dfdy_rows: Vec<Vec<f64>> = dfdy.chunks(nx).map(|c| c.to_vec()).collect();
     Ok((
@@ -270,9 +290,9 @@ fn geospatial_laplacian<'py>(
     let flat_data: Vec<f64> = data.as_slice()?.to_vec();
     let flat_lats: Vec<f64> = lats.as_slice()?.to_vec();
     let flat_lons: Vec<f64> = lons.as_slice()?.to_vec();
-    let result = metrust::calc::smooth::geospatial_laplacian(
-        &flat_data, &flat_lats, &flat_lons, nx, ny,
-    );
+    let result = py.allow_threads(|| {
+        metrust::calc::smooth::geospatial_laplacian(&flat_data, &flat_lats, &flat_lons, nx, ny)
+    });
     let rows: Vec<Vec<f64>> = result.chunks(nx).map(|c| c.to_vec()).collect();
     Ok(PyArray2::from_vec2(py, &rows)?.into())
 }

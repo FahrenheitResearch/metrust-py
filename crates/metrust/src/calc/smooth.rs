@@ -58,6 +58,8 @@ pub use wx_math::gridmath::geospatial_laplacian;
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
+use rayon::prelude::*;
+
 /// Row-major index.
 #[inline(always)]
 fn idx(j: usize, i: usize, nx: usize) -> usize {
@@ -115,19 +117,18 @@ pub fn smooth_gaussian(data: &[f64], nx: usize, ny: usize, sigma: f64) -> Vec<f6
         kernel[k] = (-d * d / two_sigma2).exp();
     }
 
-    // Pass 1: smooth along x (rows)
+    // Pass 1: smooth along x (rows) — each row is independent
     let mut temp = vec![f64::NAN; n];
-    for j in 0..ny {
+    temp.par_chunks_mut(nx).enumerate().for_each(|(j, row)| {
         for i in 0..nx {
             let mut wsum = 0.0;
             let mut vsum = 0.0;
             for k in 0..kernel_size {
-                let ki = k as isize - half as isize;
-                let ii = i as isize + ki;
+                let ii = i as isize + k as isize - half as isize;
                 if ii < 0 || ii >= nx as isize {
                     continue;
                 }
-                let val = data[idx(j, ii as usize, nx)];
+                let val = data[j * nx + ii as usize];
                 if val.is_nan() {
                     continue;
                 }
@@ -135,23 +136,22 @@ pub fn smooth_gaussian(data: &[f64], nx: usize, ny: usize, sigma: f64) -> Vec<f6
                 wsum += w;
                 vsum += w * val;
             }
-            temp[idx(j, i, nx)] = if wsum > 0.0 { vsum / wsum } else { f64::NAN };
+            row[i] = if wsum > 0.0 { vsum / wsum } else { f64::NAN };
         }
-    }
+    });
 
-    // Pass 2: smooth along y (columns)
+    // Pass 2: smooth along y (columns) — parallelize by output row
     let mut out = vec![f64::NAN; n];
-    for j in 0..ny {
+    out.par_chunks_mut(nx).enumerate().for_each(|(j, row)| {
         for i in 0..nx {
             let mut wsum = 0.0;
             let mut vsum = 0.0;
             for k in 0..kernel_size {
-                let kj = k as isize - half as isize;
-                let jj = j as isize + kj;
+                let jj = j as isize + k as isize - half as isize;
                 if jj < 0 || jj >= ny as isize {
                     continue;
                 }
-                let val = temp[idx(jj as usize, i, nx)];
+                let val = temp[jj as usize * nx + i];
                 if val.is_nan() {
                     continue;
                 }
@@ -159,9 +159,9 @@ pub fn smooth_gaussian(data: &[f64], nx: usize, ny: usize, sigma: f64) -> Vec<f6
                 wsum += w;
                 vsum += w * val;
             }
-            out[idx(j, i, nx)] = if wsum > 0.0 { vsum / wsum } else { f64::NAN };
+            row[i] = if wsum > 0.0 { vsum / wsum } else { f64::NAN };
         }
-    }
+    });
 
     out
 }
@@ -208,43 +208,80 @@ pub fn smooth_rectangular(data: &[f64], nx: usize, ny: usize, size: usize, passe
     assert!(size > 0, "kernel size must be > 0");
 
     let half = size / 2;
-
     let mut current = data.to_vec();
 
+    // Padded dimensions for summed area table (1-indexed with zero border)
+    let pnx = nx + 1;
+    let pny = ny + 1;
+
     for _ in 0..passes {
+        // Build summed area tables for values and NaN count — O(n)
+        let mut sat_val = vec![0.0; pnx * pny];
+        let mut sat_nan = vec![0u32; pnx * pny];
+
+        for j in 0..ny {
+            for i in 0..nx {
+                let v = current[j * nx + i];
+                let is_nan = v.is_nan();
+                let pj = j + 1;
+                let pi = i + 1;
+                let pidx = pj * pnx + pi;
+                sat_val[pidx] = (if is_nan { 0.0 } else { v })
+                    + sat_val[(pj - 1) * pnx + pi]
+                    + sat_val[pj * pnx + (pi - 1)]
+                    - sat_val[(pj - 1) * pnx + (pi - 1)];
+                sat_nan[pidx] = (if is_nan { 1 } else { 0 })
+                    + sat_nan[(pj - 1) * pnx + pi]
+                    + sat_nan[pj * pnx + (pi - 1)]
+                    - sat_nan[(pj - 1) * pnx + (pi - 1)];
+            }
+        }
+
+        // Compute output using O(1) SAT lookups per point — parallelized by row
         let mut out = current.clone();
+        let interior_j_start = half;
+        let interior_j_end = ny.saturating_sub(half);
 
-        for j in half..ny.saturating_sub(half) {
-            for i in half..nx.saturating_sub(half) {
-                let j_lo = j - half;
-                let j_hi = j + half;
-                let i_lo = i - half;
-                let i_hi = i + half;
+        if interior_j_end > interior_j_start {
+            let interior_rows = interior_j_end - interior_j_start;
+            let mut interior_slice = vec![0.0f64; interior_rows * nx];
 
-                let mut sum = 0.0;
-                let mut has_nan = false;
-                let mut count = 0u32;
+            interior_slice.par_chunks_mut(nx).enumerate().for_each(|(row_idx, row)| {
+                let j = interior_j_start + row_idx;
+                for i in half..nx.saturating_sub(half) {
+                    // Window corners in padded coords
+                    let y1 = j - half;       // top row (0-indexed in data)
+                    let y2 = j + half;       // bottom row
+                    let x1 = i - half;
+                    let x2 = i + half;
+                    // SAT: sum(y1..y2, x1..x2) = SAT[y2+1][x2+1] - SAT[y1][x2+1] - SAT[y2+1][x1] + SAT[y1][x1]
+                    let br = (y2 + 1) * pnx + (x2 + 1);
+                    let tr = y1 * pnx + (x2 + 1);
+                    let bl = (y2 + 1) * pnx + x1;
+                    let tl = y1 * pnx + x1;
 
-                for jj in j_lo..=j_hi {
-                    for ii in i_lo..=i_hi {
-                        let val = current[idx(jj, ii, nx)];
-                        if val.is_nan() {
-                            has_nan = true;
-                            break;
-                        }
-                        sum += val;
-                        count += 1;
+                    let nan_count = sat_nan[br] - sat_nan[tr] - sat_nan[bl] + sat_nan[tl];
+                    if nan_count > 0 {
+                        row[i] = f64::NAN;
+                    } else {
+                        let sum = sat_val[br] - sat_val[tr] - sat_val[bl] + sat_val[tl];
+                        let count = (y2 - y1 + 1) * (x2 - x1 + 1);
+                        row[i] = sum / count as f64;
                     }
-                    if has_nan { break; }
                 }
+                // Copy edge values within this row
+                for i in 0..half {
+                    row[i] = current[(interior_j_start + row_idx) * nx + i];
+                }
+                for i in nx.saturating_sub(half)..nx {
+                    row[i] = current[(interior_j_start + row_idx) * nx + i];
+                }
+            });
 
-                out[idx(j, i, nx)] = if has_nan {
-                    f64::NAN
-                } else if count > 0 {
-                    sum / count as f64
-                } else {
-                    f64::NAN
-                };
+            // Write interior rows back to output
+            for (row_idx, chunk) in interior_slice.chunks(nx).enumerate() {
+                let j = interior_j_start + row_idx;
+                out[j * nx..(j + 1) * nx].copy_from_slice(chunk);
             }
         }
 
@@ -315,32 +352,54 @@ pub fn smooth_circular(data: &[f64], nx: usize, ny: usize, radius: f64, passes: 
 
     for _ in 0..passes {
         let mut out = current.clone();
+        let j_start = half_u;
+        let j_end = ny.saturating_sub(half_u);
 
-        for j in half_u..ny.saturating_sub(half_u) {
-            for i in half_u..nx.saturating_sub(half_u) {
-                let mut sum = 0.0;
-                let mut count = 0u32;
-                let mut has_nan = false;
+        if j_end > j_start {
+            // Parallelize over interior rows
+            let interior_rows = j_end - j_start;
+            let mut interior = vec![0.0f64; interior_rows * nx];
 
-                for &(dj, di) in &offsets {
-                    let jj = (j as isize + dj) as usize;
-                    let ii = (i as isize + di) as usize;
-                    let val = current[idx(jj, ii, nx)];
-                    if val.is_nan() {
-                        has_nan = true;
-                        break;
-                    }
-                    sum += val;
-                    count += 1;
+            interior.par_chunks_mut(nx).enumerate().for_each(|(row_idx, row)| {
+                let j = j_start + row_idx;
+                // Copy edge columns from current
+                for i in 0..half_u.min(nx) {
+                    row[i] = current[j * nx + i];
                 }
+                for i in nx.saturating_sub(half_u)..nx {
+                    row[i] = current[j * nx + i];
+                }
+                // Compute interior columns
+                for i in half_u..nx.saturating_sub(half_u) {
+                    let mut sum = 0.0;
+                    let mut count = 0u32;
+                    let mut has_nan = false;
 
-                out[idx(j, i, nx)] = if has_nan {
-                    f64::NAN
-                } else if count > 0 {
-                    sum / count as f64
-                } else {
-                    f64::NAN
-                };
+                    for &(dj, di) in &offsets {
+                        let jj = (j as isize + dj) as usize;
+                        let ii = (i as isize + di) as usize;
+                        let val = current[jj * nx + ii];
+                        if val.is_nan() {
+                            has_nan = true;
+                            break;
+                        }
+                        sum += val;
+                        count += 1;
+                    }
+
+                    row[i] = if has_nan {
+                        f64::NAN
+                    } else if count > 0 {
+                        sum / count as f64
+                    } else {
+                        f64::NAN
+                    };
+                }
+            });
+
+            for (row_idx, chunk) in interior.chunks(nx).enumerate() {
+                let j = j_start + row_idx;
+                out[j * nx..(j + 1) * nx].copy_from_slice(chunk);
             }
         }
 
@@ -500,28 +559,42 @@ pub fn smooth_window(
 
     for _ in 0..passes {
         let mut out = current.clone();
+        let j_start = half_y;
+        let j_end = ny.saturating_sub(half_y);
 
-        // Only smooth interior points where the full kernel fits.
-        for j in half_y..ny.saturating_sub(half_y) {
-            for i in half_x..nx.saturating_sub(half_x) {
-                let mut vsum = 0.0;
-                let mut has_nan = false;
+        if j_end > j_start {
+            let interior_rows = j_end - j_start;
+            let mut interior = vec![0.0f64; interior_rows * nx];
 
-                for wj in 0..window_ny {
-                    let jj = j + wj - half_y;
-                    for wi in 0..window_nx {
-                        let ii = i + wi - half_x;
-                        let val = current[idx(jj, ii, nx)];
-                        if val.is_nan() {
-                            has_nan = true;
-                            break;
+            interior.par_chunks_mut(nx).enumerate().for_each(|(row_idx, row)| {
+                let j = j_start + row_idx;
+                // Copy full row from current (edges preserved)
+                row.copy_from_slice(&current[j * nx..(j + 1) * nx]);
+                // Compute interior columns
+                for i in half_x..nx.saturating_sub(half_x) {
+                    let mut vsum = 0.0;
+                    let mut has_nan = false;
+
+                    'outer: for wj in 0..window_ny {
+                        let jj = j + wj - half_y;
+                        for wi in 0..window_nx {
+                            let ii = i + wi - half_x;
+                            let val = current[jj * nx + ii];
+                            if val.is_nan() {
+                                has_nan = true;
+                                break 'outer;
+                            }
+                            vsum += weights[wj * window_nx + wi] * val;
                         }
-                        vsum += weights[wj * window_nx + wi] * val;
                     }
-                    if has_nan { break; }
-                }
 
-                out[idx(j, i, nx)] = if has_nan { f64::NAN } else { vsum };
+                    row[i] = if has_nan { f64::NAN } else { vsum };
+                }
+            });
+
+            for (row_idx, chunk) in interior.chunks(nx).enumerate() {
+                let j = j_start + row_idx;
+                out[j * nx..(j + 1) * nx].copy_from_slice(chunk);
             }
         }
 
