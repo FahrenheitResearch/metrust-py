@@ -20,12 +20,18 @@ T = [25, 20, 15, 5, -15] * units.degC
 ## Installation
 
 ```bash
+pip install metrust
+```
+
+That's it. Pre-built wheels for Linux, macOS (Intel + Apple Silicon), and Windows. No Rust toolchain needed.
+
+**From source** (if you want to build it yourself):
+```bash
 pip install maturin
+git clone https://github.com/FahrenheitResearch/metrust-py
 cd metrust-py
 maturin develop --release
 ```
-
-Requires Rust toolchain (rustup) and Python >= 3.9 with numpy and pint.
 
 ## Performance
 
