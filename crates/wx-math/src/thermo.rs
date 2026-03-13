@@ -2166,7 +2166,7 @@ pub fn isentropic_interpolation(
                 }
             }
 
-            // Interpolate each theta level
+            // Interpolate each theta level using log-pressure (MetPy-compatible)
             for (ti, &target_theta) in theta_levels.iter().enumerate() {
                 let out_idx = ti * n2d + idx2;
 
@@ -2182,8 +2182,13 @@ pub fn isentropic_interpolation(
                             continue;
                         }
                         let frac = (target_theta - th_lo) / dth;
-                        output[0][out_idx] = col_p[k] + frac * (col_p[k + 1] - col_p[k]);
+                        // Pressure: interpolate in log-pressure space (MetPy convention)
+                        let ln_p_lo = col_p[k].ln();
+                        let ln_p_hi = col_p[k + 1].ln();
+                        output[0][out_idx] = (ln_p_lo + frac * (ln_p_hi - ln_p_lo)).exp();
+                        // Temperature: interpolate linearly with ln(p) as coordinate
                         output[1][out_idx] = col_t[k] + frac * (col_t[k + 1] - col_t[k]);
+                        // Other fields: interpolate linearly
                         for f in 0..n_fields {
                             output[2 + f][out_idx] = col_fields[f][k]
                                 + frac * (col_fields[f][k + 1] - col_fields[f][k]);

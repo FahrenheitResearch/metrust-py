@@ -611,15 +611,42 @@ def cape_cin(pressure, temperature, dewpoint, parcel_profile_or_height=None,
     metpy_profile_form = fourth is not None and _is_temperature_like(fourth)
     if metpy_profile_form:
         # MetPy calling convention: 4th arg is a parcel temperature profile.
-        # Derive height from pressure via standard atmosphere and let Rust recompute the parcel.
-        h_vals = np.array([_calc.pressure_to_height_std(float(pi)) for pi in p])
-        h = _as_1d(h_vals - h_vals[0])
-        if psfc is None:
-            psfc = pressure[0] if hasattr(pressure, '__getitem__') else pressure
-        if t2m is None:
-            t2m = temperature[0] if hasattr(temperature, '__getitem__') else temperature
-        if td2m is None:
-            td2m = dewpoint[0] if hasattr(dewpoint, '__getitem__') else dewpoint
+        # Integrate CAPE/CIN directly using the provided parcel profile,
+        # matching MetPy's integration: g * (Tv_p - Tv_e) / Tv_e * dz
+        t_parcel = _as_1d(_strip(fourth, "degC"))
+        # Compute height from hypsometric equation using environment
+        h_calc = np.zeros(len(p))
+        for i in range(1, len(p)):
+            if p[i] <= 0 or p[i-1] <= 0:
+                h_calc[i] = h_calc[i-1]
+                continue
+            tv_mean = (_calc.virtual_temp(t[i-1], p[i-1], td[i-1])
+                       + _calc.virtual_temp(t[i], p[i], td[i])) / 2.0 + 273.15
+            h_calc[i] = h_calc[i-1] + (287.04749 * tv_mean / 9.80665) * np.log(p[i-1] / p[i])
+
+        # Integrate CAPE/CIN: trapezoidal rule
+        cape_val = 0.0
+        cin_val = 0.0
+        for i in range(1, len(p)):
+            if p[i] <= 0:
+                continue
+            # Environment virtual temperature
+            tv_e_lo = _calc.virtual_temp(t[i-1], p[i-1], td[i-1]) + 273.15
+            tv_e_hi = _calc.virtual_temp(t[i], p[i], td[i]) + 273.15
+            # Parcel virtual temperature (saturated above LCL, so Td_parcel ≈ T_parcel)
+            tv_p_lo = _calc.virtual_temp(t_parcel[i-1], p[i-1], t_parcel[i-1]) + 273.15
+            tv_p_hi = _calc.virtual_temp(t_parcel[i], p[i], t_parcel[i]) + 273.15
+            dz = h_calc[i] - h_calc[i-1]
+            if abs(dz) < 1e-6 or tv_e_lo <= 0 or tv_e_hi <= 0:
+                continue
+            buoy_lo = (tv_p_lo - tv_e_lo) / tv_e_lo
+            buoy_hi = (tv_p_hi - tv_e_hi) / tv_e_hi
+            val = 9.80665 * (buoy_lo + buoy_hi) / 2.0 * dz
+            if val > 0:
+                cape_val += val
+            else:
+                cin_val += val
+        return cape_val * units("J/kg"), cin_val * units("J/kg")
     elif fourth is not None:
         h = _as_1d(_strip(fourth, "m"))
     else:
