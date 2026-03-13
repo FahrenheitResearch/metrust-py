@@ -1807,10 +1807,11 @@ def wind_speed(u, v):
     -------
     array Quantity (m/s)
     """
+    orig_shape = np.asarray(_strip(u, "m/s")).shape
     u_arr = _as_1d(_strip(u, "m/s"))
     v_arr = _as_1d(_strip(v, "m/s"))
     result = np.asarray(_calc.wind_speed(u_arr, v_arr))
-    return result * units("m/s")
+    return result.reshape(orig_shape) * units("m/s")
 
 
 def wind_direction(u, v):
@@ -1824,10 +1825,11 @@ def wind_direction(u, v):
     -------
     array Quantity (degree)
     """
+    orig_shape = np.asarray(_strip(u, "m/s")).shape
     u_arr = _as_1d(_strip(u, "m/s"))
     v_arr = _as_1d(_strip(v, "m/s"))
     result = np.asarray(_calc.wind_direction(u_arr, v_arr))
-    return result * units.degree
+    return result.reshape(orig_shape) * units.degree
 
 
 def wind_components(speed, direction):
@@ -1842,10 +1844,12 @@ def wind_components(speed, direction):
     -------
     tuple of (array Quantity (m/s), array Quantity (m/s))
     """
+    orig_shape = np.asarray(_strip(speed, "m/s")).shape
     spd = _as_1d(_strip(speed, "m/s"))
     dirn = _as_1d(_strip(direction, "degree"))
     u, v = _calc.wind_components(spd, dirn)
-    return np.asarray(u) * units("m/s"), np.asarray(v) * units("m/s")
+    ms = units("m/s")
+    return np.asarray(u).reshape(orig_shape) * ms, np.asarray(v).reshape(orig_shape) * ms
 
 
 def bulk_shear(pressure_or_u, u_or_v, v_or_height, height=None, bottom=None, depth=None, top=None):
@@ -2054,14 +2058,14 @@ def _grid_shape(data):
 
 
 def _flat(data, unit=None):
-    """Flatten a 2-D Quantity to a contiguous float64 1-D array."""
+    """Strip units and return a contiguous float64 array preserving shape."""
     if unit and hasattr(data, "magnitude"):
         arr = np.asarray(data.to(unit).magnitude, dtype=np.float64)
     elif hasattr(data, "magnitude"):
         arr = np.asarray(data.magnitude, dtype=np.float64)
     else:
         arr = np.asarray(data, dtype=np.float64)
-    return np.ascontiguousarray(arr.ravel())
+    return np.ascontiguousarray(arr)
 
 
 def divergence(u, v, dx, dy):
@@ -2076,13 +2080,12 @@ def divergence(u, v, dx, dy):
     -------
     2-D array Quantity (1/s)
     """
-    ny, nx = _grid_shape(u)
     u_f = _flat(u, "m/s")
     v_f = _flat(v, "m/s")
     dx_val = _as_float(_strip(dx, "m"))
     dy_val = _as_float(_strip(dy, "m"))
-    result = np.array(_calc.divergence(u_f, v_f, nx, ny, dx_val, dy_val))
-    return result.reshape(ny, nx) * units("1/s")
+    result = np.asarray(_calc.divergence(u_f, v_f, dx_val, dy_val))
+    return result * units("1/s")
 
 
 def vorticity(u, v, dx, dy):
@@ -2097,13 +2100,12 @@ def vorticity(u, v, dx, dy):
     -------
     2-D array Quantity (1/s)
     """
-    ny, nx = _grid_shape(u)
     u_f = _flat(u, "m/s")
     v_f = _flat(v, "m/s")
     dx_val = _as_float(_strip(dx, "m"))
     dy_val = _as_float(_strip(dy, "m"))
-    result = np.array(_calc.vorticity(u_f, v_f, nx, ny, dx_val, dy_val))
-    return result.reshape(ny, nx) * units("1/s")
+    result = np.asarray(_calc.vorticity(u_f, v_f, dx_val, dy_val))
+    return result * units("1/s")
 
 
 def absolute_vorticity(u, v, lats, dx, dy):
@@ -2119,14 +2121,13 @@ def absolute_vorticity(u, v, lats, dx, dy):
     -------
     2-D array Quantity (1/s)
     """
-    ny, nx = _grid_shape(u)
     u_f = _flat(u, "m/s")
     v_f = _flat(v, "m/s")
     lats_f = _flat(lats, "degree") if hasattr(lats, "magnitude") else _flat(lats)
     dx_val = _as_float(_strip(dx, "m"))
     dy_val = _as_float(_strip(dy, "m"))
-    result = np.array(_calc.absolute_vorticity(u_f, v_f, lats_f, nx, ny, dx_val, dy_val))
-    return result.reshape(ny, nx) * units("1/s")
+    result = np.asarray(_calc.absolute_vorticity(u_f, v_f, lats_f, dx_val, dy_val))
+    return result * units("1/s")
 
 
 def advection(scalar, u, v, dx, dy):
@@ -2142,7 +2143,6 @@ def advection(scalar, u, v, dx, dy):
     -------
     2-D array Quantity (scalar_units / s)
     """
-    ny, nx = _grid_shape(scalar)
     has_units = hasattr(scalar, "units")
     s_unit = scalar.units if has_units else units.dimensionless
     s_f = _flat(scalar)
@@ -2150,8 +2150,8 @@ def advection(scalar, u, v, dx, dy):
     v_f = _flat(v, "m/s")
     dx_val = _as_float(_strip(dx, "m"))
     dy_val = _as_float(_strip(dy, "m"))
-    result = np.array(_calc.advection(s_f, u_f, v_f, nx, ny, dx_val, dy_val))
-    return result.reshape(ny, nx) * (s_unit / units.s)
+    result = np.asarray(_calc.advection(s_f, u_f, v_f, dx_val, dy_val))
+    return result * (s_unit / units.s)
 
 
 def frontogenesis(theta, u, v, dx, dy):
@@ -2167,14 +2167,13 @@ def frontogenesis(theta, u, v, dx, dy):
     -------
     2-D array Quantity (K/m/s)
     """
-    ny, nx = _grid_shape(theta)
     t_f = _flat(theta, "K")
     u_f = _flat(u, "m/s")
     v_f = _flat(v, "m/s")
     dx_val = _as_float(_strip(dx, "m"))
     dy_val = _as_float(_strip(dy, "m"))
-    result = np.array(_calc.frontogenesis(t_f, u_f, v_f, nx, ny, dx_val, dy_val))
-    return result.reshape(ny, nx) * units("K/m/s")
+    result = np.asarray(_calc.frontogenesis(t_f, u_f, v_f, dx_val, dy_val))
+    return result * units("K/m/s")
 
 
 def geostrophic_wind(heights, lats, dx, dy):
@@ -2190,14 +2189,13 @@ def geostrophic_wind(heights, lats, dx, dy):
     -------
     tuple of (2-D array Quantity (m/s), 2-D array Quantity (m/s))
     """
-    ny, nx = _grid_shape(heights)
     h_f = _flat(heights, "m")
     lats_f = _flat(lats, "degree") if hasattr(lats, "magnitude") else _flat(lats)
     dx_val = _as_float(_strip(dx, "m"))
     dy_val = _as_float(_strip(dy, "m"))
-    u_g, v_g = _calc.geostrophic_wind(h_f, lats_f, nx, ny, dx_val, dy_val)
+    u_g, v_g = _calc.geostrophic_wind(h_f, lats_f, dx_val, dy_val)
     ms = units("m/s")
-    return np.array(u_g).reshape(ny, nx) * ms, np.array(v_g).reshape(ny, nx) * ms
+    return np.asarray(u_g) * ms, np.asarray(v_g) * ms
 
 
 def ageostrophic_wind(u, v, heights, lats, dx, dy):
@@ -2214,16 +2212,22 @@ def ageostrophic_wind(u, v, heights, lats, dx, dy):
     -------
     tuple of (2-D array Quantity (m/s), 2-D array Quantity (m/s))
     """
-    ny, nx = _grid_shape(u)
     u_f = _flat(u, "m/s")
     v_f = _flat(v, "m/s")
     h_f = _flat(heights, "m")
     lats_f = _flat(lats, "degree") if hasattr(lats, "magnitude") else _flat(lats)
     dx_val = _as_float(_strip(dx, "m"))
     dy_val = _as_float(_strip(dy, "m"))
-    ua, va = _calc.ageostrophic_wind(u_f, v_f, h_f, lats_f, nx, ny, dx_val, dy_val)
+    # Compute geostrophic wind first, then ageostrophic = total - geostrophic
+    u_g, v_g = _calc.geostrophic_wind(h_f, lats_f, dx_val, dy_val)
+    u_g_flat = np.ascontiguousarray(np.asarray(u_g).ravel(), dtype=np.float64)
+    v_g_flat = np.ascontiguousarray(np.asarray(v_g).ravel(), dtype=np.float64)
+    u_flat = np.ascontiguousarray(u_f.ravel(), dtype=np.float64)
+    v_flat = np.ascontiguousarray(v_f.ravel(), dtype=np.float64)
+    ua, va = _calc.ageostrophic_wind(u_flat, v_flat, u_g_flat, v_g_flat)
     ms = units("m/s")
-    return np.array(ua).reshape(ny, nx) * ms, np.array(va).reshape(ny, nx) * ms
+    orig_shape = np.asarray(_strip(u, "m/s")).shape
+    return np.asarray(ua).reshape(orig_shape) * ms, np.asarray(va).reshape(orig_shape) * ms
 
 
 def potential_vorticity_baroclinic(potential_temp, pressure, theta_below,
@@ -2259,10 +2263,10 @@ def potential_vorticity_baroclinic(potential_temp, pressure, theta_below,
         p_arr = np.asarray(pressure.to("Pa").magnitude, dtype=np.float64)
     else:
         p_arr = np.asarray(pressure, dtype=np.float64)
-    result = np.array(_calc.potential_vorticity_baroclinic(
-        pt_f, p_arr, tb_f, ta_f, u_f, v_f, lats_f, nx, ny, dx_val, dy_val,
+    result = np.asarray(_calc.potential_vorticity_baroclinic(
+        pt_f, p_arr, tb_f, ta_f, u_f, v_f, lats_f, dx_val, dy_val,
     ))
-    return result.reshape(ny, nx) * units("K*m**2/(kg*s)")
+    return result * units("K*m**2/(kg*s)")
 
 
 def potential_vorticity_barotropic(heights, u, v, lats, dx, dy):
@@ -2279,17 +2283,16 @@ def potential_vorticity_barotropic(heights, u, v, lats, dx, dy):
     -------
     2-D array Quantity (1/(m*s))
     """
-    ny, nx = _grid_shape(heights)
     h_f = _flat(heights, "m")
     u_f = _flat(u, "m/s")
     v_f = _flat(v, "m/s")
     lats_f = _flat(lats, "degree") if hasattr(lats, "magnitude") else _flat(lats)
     dx_val = _as_float(_strip(dx, "m"))
     dy_val = _as_float(_strip(dy, "m"))
-    result = np.array(_calc.potential_vorticity_barotropic(
-        h_f, u_f, v_f, lats_f, nx, ny, dx_val, dy_val,
+    result = np.asarray(_calc.potential_vorticity_barotropic(
+        h_f, u_f, v_f, lats_f, dx_val, dy_val,
     ))
-    return result.reshape(ny, nx) * units("1/(m*s)")
+    return result * units("1/(m*s)")
 
 
 def normal_component(u, v, start, end):
@@ -2356,18 +2359,17 @@ def vector_derivative(u, v, dx, dy):
     tuple of four 2-D arrays Quantity (1/s)
         (du/dx, du/dy, dv/dx, dv/dy)
     """
-    ny, nx = _grid_shape(u)
     u_f = _flat(u, "m/s")
     v_f = _flat(v, "m/s")
     dx_val = _as_float(_strip(dx, "m"))
     dy_val = _as_float(_strip(dy, "m"))
-    dudx, dudy, dvdx, dvdy = _calc.vector_derivative(u_f, v_f, nx, ny, dx_val, dy_val)
+    dudx, dudy, dvdx, dvdy = _calc.vector_derivative(u_f, v_f, dx_val, dy_val)
     inv_s = units("1/s")
     return (
-        np.array(dudx).reshape(ny, nx) * inv_s,
-        np.array(dudy).reshape(ny, nx) * inv_s,
-        np.array(dvdx).reshape(ny, nx) * inv_s,
-        np.array(dvdy).reshape(ny, nx) * inv_s,
+        np.asarray(dudx) * inv_s,
+        np.asarray(dudy) * inv_s,
+        np.asarray(dvdx) * inv_s,
+        np.asarray(dvdy) * inv_s,
     )
 
 
