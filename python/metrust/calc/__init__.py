@@ -544,8 +544,8 @@ def mixing_ratio(partial_press_or_pressure, total_press_or_temperature,
             result = _calc.mixing_ratio(vals[0], vals[1]) / 1000.0
         return _attach(result, "kg/kg")
     # partial_pressure / total_pressure path: w = eps * e / (p - e)
-    e = _as_float(_strip(partial_press_or_pressure, "Pa"))
-    p = _as_float(_strip(total_press_or_temperature, "Pa"))
+    e = np.asarray(_strip(partial_press_or_pressure, "Pa"), dtype=np.float64)
+    p = np.asarray(_strip(total_press_or_temperature, "Pa"), dtype=np.float64)
     eps = molecular_weight_ratio
     return _attach(eps * e / (p - e), "kg/kg")
 
@@ -997,9 +997,10 @@ def vapor_pressure(pressure_or_dewpoint, mixing_ratio=None,
     Quantity (hPa)
     """
     if mixing_ratio is not None:
-        pressure_pa = _attach(_as_float(_strip(pressure_or_dewpoint, "Pa")), "Pa")
-        mixing_ratio_val = _attach(_as_float(_strip(mixing_ratio, "kg/kg")), "kg/kg")
-        return pressure_pa * mixing_ratio_val / (molecular_weight_ratio + mixing_ratio_val)
+        p_raw = np.asarray(_strip(pressure_or_dewpoint, "Pa"), dtype=np.float64)
+        w_raw = np.asarray(_strip(mixing_ratio, "kg/kg"), dtype=np.float64)
+        result = p_raw * w_raw / (molecular_weight_ratio + w_raw)
+        return _attach(result, "Pa")
     td_raw = _strip(pressure_or_dewpoint, "degC")
     vals, shape, is_arr = _prep(td_raw)
     if is_arr:

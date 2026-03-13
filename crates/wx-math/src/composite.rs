@@ -143,7 +143,7 @@ pub fn compute_cape_cin(
             metfuncs::cape_cin_core(
                 &p_hpa, &t_c, &td_c, &h_agl,
                 psfc_hpa, t2m_c, td2m_c,
-                &parcel_type_owned, 100.0, 300.0, None,
+                &parcel_type_owned, 100.0, 300.0, top_m,
             )
         })
         .collect();
