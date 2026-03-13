@@ -17,6 +17,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Create virtualenv
+        run: python -m venv .venv
+      - name: Activate venv and install deps (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          source .venv/bin/activate
+          pip install numpy pint pytest
+      - name: Activate venv and install deps (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          .venv\Scripts\activate
+          pip install numpy pint pytest
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Build and install
@@ -24,9 +36,15 @@ jobs:
         with:
           command: develop
           args: --release
-      - name: Install test deps
-        run: pip install numpy pint pytest
       - name: Run Rust tests
         run: cargo test --workspace
-      - name: Test Python import
-        run: python -c "from metrust.calc import potential_temperature; from metrust.units import units; print('OK:', potential_temperature(1000 * units.hPa, 25 * units.degC))"
+      - name: Test Python import (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          source .venv/bin/activate
+          python -c "from metrust.calc import potential_temperature; from metrust.units import units; print('OK:', potential_temperature(1000 * units.hPa, 25 * units.degC))"
+      - name: Test Python import (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          .venv\Scripts\activate
+          python -c "from metrust.calc import potential_temperature; from metrust.units import units; print('OK:', potential_temperature(1000 * units.hPa, 25 * units.degC))"
