@@ -2573,9 +2573,226 @@ def _mean_spacing(val, target_unit="m"):
     return float(arr.mean()) if arr.ndim > 0 and arr.size > 1 else float(arr)
 
 
+def _is_variable_spacing(val):
+    """Check if dx/dy is a 2D array (variable spacing, e.g., lat/lon grid)."""
+    if hasattr(val, "magnitude"):
+        arr = np.asarray(val.magnitude)
+    else:
+        arr = np.asarray(val)
+    if arr.ndim < 2:
+        return False
+    # Check if values vary significantly (>5% relative range)
+    finite = arr[np.isfinite(arr)]
+    if finite.size < 2:
+        return False
+    rng = finite.max() - finite.min()
+    return rng > 0.05 * abs(finite.mean()) if abs(finite.mean()) > 1e-10 else rng > 1e-10
+
+
+def _gradient_2d_variable(field, dx_2d, dy_2d):
+    """Compute ∂f/∂x and ∂f/∂y with variable 2D grid spacing.
+
+    Uses centered differences in the interior, one-sided at boundaries,
+    matching MetPy's first_derivative behavior on variable-spaced grids.
+    """
+    arr = np.asarray(field, dtype=np.float64)
+    ny, nx = arr.shape
+    dx = np.asarray(dx_2d, dtype=np.float64)
+    dy = np.asarray(dy_2d, dtype=np.float64)
+
+    # Pad dx/dy to match field shape if needed (MetPy grid_deltas returns (ny, nx-1) and (ny-1, nx))
+    if dx.shape != (ny, nx):
+        if dx.shape == (ny, nx - 1):
+            # Average adjacent to get (ny, nx)
+            dx_full = np.empty((ny, nx))
+            dx_full[:, 0] = dx[:, 0]
+            dx_full[:, -1] = dx[:, -1]
+            dx_full[:, 1:-1] = (dx[:, :-1] + dx[:, 1:]) / 2.0
+            dx = dx_full
+        else:
+            dx = np.broadcast_to(dx, (ny, nx)).copy()
+    if dy.shape != (ny, nx):
+        if dy.shape == (ny - 1, nx):
+            dy_full = np.empty((ny, nx))
+            dy_full[0, :] = dy[0, :]
+            dy_full[-1, :] = dy[-1, :]
+            dy_full[1:-1, :] = (dy[:-1, :] + dy[1:, :]) / 2.0
+            dy = dy_full
+        else:
+            dy = np.broadcast_to(dy, (ny, nx)).copy()
+
+    # Replace zeros/near-zeros with NaN to avoid division by zero (poles)
+    dx[np.abs(dx) < 1.0] = np.nan
+    dy[np.abs(dy) < 1.0] = np.nan
+
+    # ∂f/∂x — centered differences along axis=1
+    dfdx = np.full_like(arr, np.nan)
+    dfdx[:, 1:-1] = (arr[:, 2:] - arr[:, :-2]) / (2.0 * dx[:, 1:-1])
+    dfdx[:, 0] = (arr[:, 1] - arr[:, 0]) / dx[:, 0]
+    dfdx[:, -1] = (arr[:, -1] - arr[:, -2]) / dx[:, -1]
+
+    # ∂f/∂y — centered differences along axis=0
+    dfdy = np.full_like(arr, np.nan)
+    dfdy[1:-1, :] = (arr[2:, :] - arr[:-2, :]) / (2.0 * dy[1:-1, :])
+    dfdy[0, :] = (arr[1, :] - arr[0, :]) / dy[0, :]
+    dfdy[-1, :] = (arr[-1, :] - arr[-2, :]) / dy[-1, :]
+
+    return dfdx, dfdy
+
+
 def _safe_unit_str(unit_obj):
     """Return a unit string usable with *our* registry, avoiding cross-registry ops."""
     return str(unit_obj)
+
+
+def _first_derivative_variable(field, delta, axis):
+    """Compute first derivative with variable spacing along an axis.
+
+    Matches MetPy's first_derivative: centered differences in interior,
+    one-sided at boundaries. *delta* is a 1-D or 2-D array of grid spacings
+    (one fewer element than field along *axis*).
+    """
+    arr = np.asarray(field, dtype=np.float64)
+    d = np.asarray(delta, dtype=np.float64).copy()
+    # Replace near-zero spacings with NaN to avoid division by zero (e.g., at poles)
+    d[np.abs(d) < 1.0] = np.nan
+    n = arr.shape[axis]
+
+    # Expand delta to match field dimensions if needed
+    if d.ndim == 1 and d.size == n - 1:
+        # Standard case: spacing between adjacent levels
+        pass
+    elif d.ndim == 2 and d.shape[axis] == n - 1:
+        pass
+    elif d.ndim == 2 and d.shape[axis] == n:
+        # Average adjacent to get n-1 spacings
+        d = (np.take(d, range(d.shape[axis] - 1), axis=axis)
+             + np.take(d, range(1, d.shape[axis]), axis=axis)) / 2.0
+    elif d.size == 1:
+        return np.gradient(arr, float(d.ravel()[0]), axis=axis)
+    else:
+        return np.gradient(arr, float(np.mean(d)), axis=axis)
+
+    result = np.empty_like(arr)
+    # Interior: centered differences
+    slc_c = [slice(None)] * arr.ndim
+    slc_p = [slice(None)] * arr.ndim
+    slc_m = [slice(None)] * arr.ndim
+    slc_c[axis] = slice(1, -1)
+    slc_p[axis] = slice(2, None)
+    slc_m[axis] = slice(None, -2)
+
+    # d_fwd[i] = spacing from i to i+1, d_bwd[i] = spacing from i-1 to i
+    slc_df = [slice(None)] * d.ndim
+    slc_db = [slice(None)] * d.ndim
+    slc_df[axis] = slice(1, None)    # d[1:]
+    slc_db[axis] = slice(None, -1)   # d[:-1]
+
+    d_fwd = d[tuple(slc_df)]
+    d_bwd = d[tuple(slc_db)]
+
+    # Broadcast delta to match field shape
+    if d_fwd.ndim < arr.ndim:
+        shape = [1] * arr.ndim
+        shape[axis] = d_fwd.shape[0] if d_fwd.ndim > 0 else 1
+        d_fwd = d_fwd.reshape(shape)
+        d_bwd = d_bwd.reshape(shape)
+
+    result[tuple(slc_c)] = (arr[tuple(slc_p)] - arr[tuple(slc_m)]) / (d_fwd + d_bwd)
+
+    # Boundaries: forward/backward differences
+    slc_0 = [slice(None)] * arr.ndim
+    slc_1 = [slice(None)] * arr.ndim
+    slc_0[axis] = 0
+    slc_1[axis] = 1
+    d0 = np.take(d, 0, axis=axis)
+    if d0.ndim < arr[tuple(slc_0)].ndim:
+        d0 = np.expand_dims(d0, axis=axis) if d0.ndim > 0 else d0
+    result[tuple(slc_0)] = (arr[tuple(slc_1)] - arr[tuple(slc_0)]) / d0
+
+    slc_n1 = [slice(None)] * arr.ndim
+    slc_n2 = [slice(None)] * arr.ndim
+    slc_n1[axis] = -1
+    slc_n2[axis] = -2
+    dn = np.take(d, -1, axis=axis)
+    if dn.ndim < arr[tuple(slc_n1)].ndim:
+        dn = np.expand_dims(dn, axis=axis) if dn.ndim > 0 else dn
+    result[tuple(slc_n1)] = (arr[tuple(slc_n1)] - arr[tuple(slc_n2)]) / dn
+
+    return result
+
+
+def _get_scale_factors(data):
+    """Extract map projection scale factors from xarray CRS metadata.
+
+    Returns (parallel_scale, meridional_scale) as 2D arrays matching data shape,
+    or (None, None) if no CRS is available.
+    """
+    if not hasattr(data, "metpy"):
+        return None, None
+    try:
+        crs = data.metpy.cartopy_crs
+    except Exception:
+        return None, None
+
+    lat_arr, lon_arr = _infer_lat_lon(data)
+    if lat_arr is None:
+        return None, None
+
+    lat_2d = np.asarray(lat_arr.magnitude if hasattr(lat_arr, "magnitude") else lat_arr, dtype=np.float64)
+    lon_2d = np.asarray(lon_arr.magnitude if hasattr(lon_arr, "magnitude") else lon_arr, dtype=np.float64)
+
+    ny, nx = data.shape[-2:]
+    if lat_2d.ndim == 1:
+        lat_2d = np.broadcast_to(lat_2d[:, None], (ny, nx))
+        lon_2d = np.broadcast_to(lon_2d[None, :], (ny, nx))
+
+    try:
+        from pyproj import Proj
+        proj = Proj(crs)
+        factors = proj.get_factors(lon_2d.ravel(), lat_2d.ravel())
+        ps = np.asarray(factors.parallel_scale).reshape(ny, nx)
+        ms = np.asarray(factors.meridional_scale).reshape(ny, nx)
+        return ps, ms
+    except Exception:
+        # Fallback for lat/lon: parallel_scale = 1/cos(lat), meridional_scale = 1
+        ps = 1.0 / np.cos(np.deg2rad(lat_2d))
+        ms = np.ones_like(ps)
+        return ps, ms
+
+
+def _vector_derivative_corrected(u_arr, v_arr, dx, dy, parallel_scale, meridional_scale):
+    """Compute map-projection-corrected vector derivative components.
+
+    Returns (du_dy_corrected, dv_dx_corrected) for vorticity,
+    or (du_dx_corrected, dv_dy_corrected) for divergence.
+    """
+    dx_m = np.asarray(dx.to("m").magnitude if hasattr(dx, "to") else dx, dtype=np.float64)
+    dy_m = np.asarray(dy.to("m").magnitude if hasattr(dy, "to") else dy, dtype=np.float64)
+
+    # Cartesian derivatives with variable spacing
+    du_dx = _first_derivative_variable(u_arr, dx_m, axis=-1)
+    du_dy = _first_derivative_variable(u_arr, dy_m, axis=-2)
+    dv_dx = _first_derivative_variable(v_arr, dx_m, axis=-1)
+    dv_dy = _first_derivative_variable(v_arr, dy_m, axis=-2)
+
+    ps = np.asarray(parallel_scale, dtype=np.float64)
+    ms = np.asarray(meridional_scale, dtype=np.float64)
+
+    # Scale factor derivatives
+    dp_dy = _first_derivative_variable(ps, dy_m, axis=-2)
+    dm_dx = _first_derivative_variable(ms, dx_m, axis=-1)
+
+    # Map factor corrections (MetPy vector_derivative formula)
+    dx_correction = ms / ps * dp_dy
+    dy_correction = ps / ms * dm_dx
+
+    du_dx_corr = ps * du_dx - v_arr * dx_correction
+    du_dy_corr = ms * du_dy + v_arr * dy_correction
+    dv_dx_corr = ps * dv_dx + u_arr * dx_correction
+    dv_dy_corr = ms * dv_dy - u_arr * dy_correction
+
+    return du_dx_corr, du_dy_corr, dv_dx_corr, dv_dy_corr
 
 
 def divergence(u, v, dx=None, dy=None, x_dim=-1, y_dim=-2, parallel_scale=None,
@@ -2598,8 +2815,34 @@ def divergence(u, v, dx=None, dy=None, x_dim=-1, y_dim=-2, parallel_scale=None,
         raise TypeError("divergence requires dx/dy or inferable latitude/longitude coordinates")
     u_arr = np.asarray(_strip(u, "m/s"), dtype=np.float64)
     v_arr = np.asarray(_strip(v, "m/s"), dtype=np.float64)
-    dx_val = _mean_spacing(dx, "m")
-    dy_val = _mean_spacing(dy, "m")
+
+    # Check for map projection scale factors (spherical corrections)
+    if parallel_scale is None and meridional_scale is None:
+        ps, ms = _get_scale_factors(u)
+    else:
+        ps = np.asarray(parallel_scale, dtype=np.float64) if parallel_scale is not None else None
+        ms = np.asarray(meridional_scale, dtype=np.float64) if meridional_scale is not None else None
+
+    dx_m = np.asarray(dx.to("m").magnitude if hasattr(dx, "to") else dx, dtype=np.float64)
+    dy_m = np.asarray(dy.to("m").magnitude if hasattr(dy, "to") else dy, dtype=np.float64)
+
+    # If we have scale factors, use full vector derivative with metric corrections
+    if ps is not None and ms is not None:
+        du_dx_corr, _, _, dv_dy_corr = _vector_derivative_corrected(
+            u_arr, v_arr, dx, dy, ps, ms)
+        result = du_dx_corr + dv_dy_corr
+        return _wrap_result_like(u, result, "1/s")
+
+    # Variable spacing without scale factors
+    if _is_variable_spacing(dx) or _is_variable_spacing(dy) or dx_m.ndim >= 2:
+        dudx = _first_derivative_variable(u_arr, dx_m, axis=-1)
+        dvdy = _first_derivative_variable(v_arr, dy_m, axis=-2)
+        result = dudx + dvdy
+        return _wrap_result_like(u, result, "1/s")
+
+    # Uniform grid: fast Rust path
+    dx_val = float(dx_m.mean()) if dx_m.ndim > 0 else float(dx_m)
+    dy_val = float(dy_m.mean()) if dy_m.ndim > 0 else float(dy_m)
     if u_arr.ndim == 2:
         result = np.asarray(_calc.divergence(np.ascontiguousarray(u_arr), np.ascontiguousarray(v_arr), dx_val, dy_val))
         return _wrap_result_like(u, result, "1/s")
@@ -2632,11 +2875,37 @@ def vorticity(u, v, dx=None, dy=None, x_dim=-1, y_dim=-2,
     dx, dy = _resolve_dx_dy(u, dx=dx, dy=dy, latitude=latitude, longitude=longitude)
     if dx is None or dy is None:
         raise TypeError("vorticity requires dx/dy or inferable latitude/longitude coordinates")
-    u_f = _flat(u, "m/s")
-    v_f = _flat(v, "m/s")
-    dx_val = _mean_spacing(dx, "m")
-    dy_val = _mean_spacing(dy, "m")
-    result = np.asarray(_calc.vorticity(u_f, v_f, dx_val, dy_val))
+    u_arr = np.asarray(_strip(u, "m/s"), dtype=np.float64)
+    v_arr = np.asarray(_strip(v, "m/s"), dtype=np.float64)
+
+    # Check for map projection scale factors (spherical corrections)
+    if parallel_scale is None and meridional_scale is None:
+        ps, ms = _get_scale_factors(u)
+    else:
+        ps = np.asarray(parallel_scale, dtype=np.float64) if parallel_scale is not None else None
+        ms = np.asarray(meridional_scale, dtype=np.float64) if meridional_scale is not None else None
+
+    dx_m = np.asarray(dx.to("m").magnitude if hasattr(dx, "to") else dx, dtype=np.float64)
+    dy_m = np.asarray(dy.to("m").magnitude if hasattr(dy, "to") else dy, dtype=np.float64)
+
+    # If we have scale factors, use full vector derivative with metric corrections
+    if ps is not None and ms is not None:
+        _, du_dy_corr, dv_dx_corr, _ = _vector_derivative_corrected(
+            u_arr, v_arr, dx, dy, ps, ms)
+        result = dv_dx_corr - du_dy_corr
+        return _wrap_result_like(u, result, "1/s")
+
+    # Variable spacing without scale factors (flat-Earth, variable grid)
+    if _is_variable_spacing(dx) or _is_variable_spacing(dy) or dx_m.ndim >= 2:
+        dvdx = _first_derivative_variable(v_arr, dx_m, axis=-1)
+        dudy = _first_derivative_variable(u_arr, dy_m, axis=-2)
+        result = dvdx - dudy
+        return _wrap_result_like(u, result, "1/s")
+
+    # Uniform grid: fast Rust path
+    dx_val = float(dx_m.mean()) if dx_m.ndim > 0 else float(dx_m)
+    dy_val = float(dy_m.mean()) if dy_m.ndim > 0 else float(dy_m)
+    result = np.asarray(_calc.vorticity(np.ascontiguousarray(u_arr), np.ascontiguousarray(v_arr), dx_val, dy_val))
     return _wrap_result_like(u, result, "1/s")
 
 
@@ -4056,8 +4325,37 @@ def lat_lon_grid_deltas(longitude, latitude, x_dim=-1, y_dim=-2, geod=None):
         lon_arr, lat_arr = lat_arr, lon_arr
     if lon_arr.ndim == 1 and lat_arr.ndim == 1:
         lon_arr, lat_arr = np.meshgrid(lon_arr, lat_arr)
-    dx, dy = _calc.lat_lon_grid_deltas(lat_arr, lon_arr)
-    return np.asarray(dx) * units.m, np.asarray(dy) * units.m
+    dx_abs, dy_abs = _calc.lat_lon_grid_deltas(lat_arr, lon_arr)
+    dx_out = np.asarray(dx_abs, dtype=np.float64)
+    dy_out = np.asarray(dy_abs, dtype=np.float64)
+
+    # Apply sign based on coordinate direction (MetPy convention):
+    # dx > 0 when longitude increases, dy > 0 when latitude increases
+    ny, nx = lat_arr.shape
+    # dx sign: based on longitude difference (column-wise)
+    if nx > 1:
+        lon_sign = np.sign(lon_arr[:, 1:] - lon_arr[:, :-1])
+        # Pad to match dx shape (which may be ny x nx or ny x nx-1)
+        if dx_out.shape[-1] == nx - 1:
+            dx_out = dx_out * lon_sign
+        elif dx_out.shape[-1] == nx:
+            lon_sign_full = np.ones((ny, nx))
+            lon_sign_full[:, 1:] = lon_sign
+            lon_sign_full[:, 0] = lon_sign[:, 0]
+            dx_out = dx_out * lon_sign_full
+
+    # dy sign: based on latitude difference (row-wise)
+    if ny > 1:
+        lat_sign = np.sign(lat_arr[1:, :] - lat_arr[:-1, :])
+        if dy_out.shape[0] == ny - 1:
+            dy_out = dy_out * lat_sign
+        elif dy_out.shape[0] == ny:
+            lat_sign_full = np.ones((ny, nx))
+            lat_sign_full[1:, :] = lat_sign
+            lat_sign_full[0, :] = lat_sign[0, :]
+            dy_out = dy_out * lat_sign_full
+
+    return dx_out * units.m, dy_out * units.m
 
 
 # ============================================================================

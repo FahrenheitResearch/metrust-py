@@ -1,6 +1,6 @@
 [package]
 name = "wx-radar"
-version = "0.2.8"
+version = "0.2.9"
 edition = "2021"
 description = "Radar data processing — NEXRAD Level-II parser, PPI renderer, color tables"
 license = "MIT"
