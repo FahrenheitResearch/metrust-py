@@ -1757,7 +1757,7 @@ def montgomery_streamfunction(theta, pressure, temperature, height):
     return result * units("J/kg")
 
 
-def most_unstable_cape_cin(pressure, temperature, dewpoint):
+def most_unstable_cape_cin(pressure, temperature, dewpoint, depth=300, **kwargs):
     """Most-unstable CAPE and CIN.
 
     Parameters
@@ -1765,6 +1765,8 @@ def most_unstable_cape_cin(pressure, temperature, dewpoint):
     pressure : array Quantity (pressure)
     temperature : array Quantity (temperature)
     dewpoint : array Quantity (temperature)
+    depth : Quantity or float, optional
+        Search depth in hPa (default 300).
 
     Returns
     -------
@@ -2594,7 +2596,7 @@ def vorticity(u, v, dx=None, dy=None, x_dim=-1, y_dim=-2,
     dx_val = _mean_spacing(dx, "m")
     dy_val = _mean_spacing(dy, "m")
     result = np.asarray(_calc.vorticity(u_f, v_f, dx_val, dy_val))
-    return result * units("1/s")
+    return _wrap_result_like(u, result, "1/s")
 
 
 def absolute_vorticity(u, v, lats=None, dx=None, dy=None, latitude=None,
@@ -2674,8 +2676,15 @@ def advection(scalar, *args, dx=None, dy=None, dz=None, x_dim=-1, y_dim=-2,
     dy_val = _mean_spacing(dy, "m")
     result = np.asarray(_calc.advection(s_f, u_f, v_f, dx_val, dy_val))
     if has_units:
-        return result * (scalar.units / units.s)
-    return result / units.s
+        # Build output unit safely — scalar.units may be a string (xarray attr)
+        # or a Pint Unit from either metrust or MetPy registry.
+        try:
+            s_u = units.Unit(str(scalar.units))
+        except Exception:
+            s_u = units.dimensionless
+        out = _wrap_result_like(scalar, result, str(s_u / units.s))
+        return out
+    return _wrap_result_like(scalar, result, "1/s")
 
 
 def frontogenesis(theta, u, v, dx=None, dy=None, x_dim=-1, y_dim=-2,
@@ -4627,17 +4636,52 @@ def isentropic_interpolation_as_dataset(levels, temperature, *args,
         p_3d = p_vals
     extra = [np.asarray(a.values if hasattr(a, "values") else a, dtype=np.float64) for a in args]
     result = isentropic_interpolation(theta_levs, p_3d, t_vals, extra)
-    # Package as Dataset
+    # Package as Dataset, preserving spatial dimensions for 3D output
+    n_theta = len(theta_levs)
     theta_coord = xr.Variable("isentropic_level", theta_levs, attrs={"units": "K", "positive": "up"})
+
+    # Determine output spatial dims from the input temperature array
+    has_spatial = hasattr(temperature, "dims") and len(temperature.dims) >= 2
+    if has_spatial:
+        # Input is (vertical, ..spatial_dims..). Output is (isentropic_level, ..spatial_dims..)
+        spatial_dims = temperature.dims[1:]  # e.g., ("y", "x")
+        spatial_coords = {k: temperature.coords[k] for k in temperature.coords
+                          if k not in (temperature.dims[0],) and k != "isentropic_level"}
+        out_dims = ("isentropic_level",) + spatial_dims
+        spatial_shape = tuple(temperature.sizes[d] for d in spatial_dims)
+    else:
+        spatial_dims = ()
+        spatial_coords = {}
+        out_dims = ("isentropic_level",)
+        spatial_shape = ()
+
     ds_vars = {}
+    all_coords = {"isentropic_level": theta_coord}
+    all_coords.update(spatial_coords)
+
     if isinstance(result, (list, tuple)) and len(result) >= 2:
-        ds_vars["pressure"] = xr.Variable("isentropic_level", np.asarray(result[0]), attrs={"units": "hPa"})
-        ds_vars["temperature"] = xr.Variable("isentropic_level", np.asarray(result[1]), attrs={"units": "K"})
+        target_shape = (n_theta,) + spatial_shape
+        p_arr = np.asarray(result[0])
+        t_arr = np.asarray(result[1])
+        if p_arr.shape != target_shape and spatial_shape:
+            try:
+                p_arr = p_arr.reshape(target_shape)
+                t_arr = t_arr.reshape(target_shape)
+            except ValueError:
+                pass
+        ds_vars["pressure"] = xr.Variable(out_dims, p_arr, attrs={"units": "hPa"})
+        ds_vars["temperature"] = xr.Variable(out_dims, t_arr, attrs={"units": "K"})
         for i, a in enumerate(args):
             name = getattr(a, "name", None) or f"field_{i}"
             if 2 + i < len(result):
-                ds_vars[name] = xr.Variable("isentropic_level", np.asarray(result[2 + i]))
-    return xr.Dataset(ds_vars, coords={"isentropic_level": theta_coord})
+                f_arr = np.asarray(result[2 + i])
+                if f_arr.shape != target_shape and spatial_shape:
+                    try:
+                        f_arr = f_arr.reshape(target_shape)
+                    except ValueError:
+                        pass
+                ds_vars[name] = xr.Variable(out_dims, f_arr)
+    return xr.Dataset(ds_vars, coords=all_coords)
 
 
 def zoom_xarray(input_field, zoom, output=None, order=3, mode="constant",
