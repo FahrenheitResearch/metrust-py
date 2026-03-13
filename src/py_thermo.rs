@@ -1,5 +1,6 @@
 use pyo3::prelude::*;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
+use rayon::prelude::*;
 
 // =============================================================================
 // Scalar thermodynamic functions
@@ -923,9 +924,11 @@ fn potential_temperature_array<'py>(
 ) -> PyResult<Bound<'py, PyArray1<f64>>> {
     let p = pressure.as_slice()?;
     let t = temperature.as_slice()?;
-    let result: Vec<f64> = p.iter().zip(t.iter())
-        .map(|(&p, &t)| metrust::calc::thermo::potential_temperature(p, t))
-        .collect();
+    let result: Vec<f64> = py.allow_threads(|| {
+        p.par_iter().zip(t.par_iter())
+            .map(|(&p, &t)| metrust::calc::thermo::potential_temperature(p, t))
+            .collect()
+    });
     Ok(result.into_pyarray(py))
 }
 
@@ -940,9 +943,11 @@ fn equivalent_potential_temperature_array<'py>(
     let p = pressure.as_slice()?;
     let t = temperature.as_slice()?;
     let td = dewpoint.as_slice()?;
-    let result: Vec<f64> = p.iter().zip(t.iter().zip(td.iter()))
-        .map(|(&p, (&t, &td))| metrust::calc::thermo::equivalent_potential_temperature(p, t, td))
-        .collect();
+    let result: Vec<f64> = py.allow_threads(|| {
+        p.par_iter().zip(t.par_iter().zip(td.par_iter()))
+            .map(|(&p, (&t, &td))| metrust::calc::thermo::equivalent_potential_temperature(p, t, td))
+            .collect()
+    });
     Ok(result.into_pyarray(py))
 }
 
@@ -953,9 +958,11 @@ fn saturation_vapor_pressure_array<'py>(
     temperature: PyReadonlyArray1<f64>,
 ) -> PyResult<Bound<'py, PyArray1<f64>>> {
     let t = temperature.as_slice()?;
-    let result: Vec<f64> = t.iter()
-        .map(|&t| metrust::calc::thermo::saturation_vapor_pressure(t))
-        .collect();
+    let result: Vec<f64> = py.allow_threads(|| {
+        t.par_iter()
+            .map(|&t| metrust::calc::thermo::saturation_vapor_pressure(t))
+            .collect()
+    });
     Ok(result.into_pyarray(py))
 }
 
@@ -968,9 +975,11 @@ fn saturation_mixing_ratio_array<'py>(
 ) -> PyResult<Bound<'py, PyArray1<f64>>> {
     let p = pressure.as_slice()?;
     let t = temperature.as_slice()?;
-    let result: Vec<f64> = p.iter().zip(t.iter())
-        .map(|(&p, &t)| metrust::calc::thermo::saturation_mixing_ratio(p, t))
-        .collect();
+    let result: Vec<f64> = py.allow_threads(|| {
+        p.par_iter().zip(t.par_iter())
+            .map(|(&p, &t)| metrust::calc::thermo::saturation_mixing_ratio(p, t))
+            .collect()
+    });
     Ok(result.into_pyarray(py))
 }
 
@@ -985,9 +994,11 @@ fn wet_bulb_temperature_array<'py>(
     let p = pressure.as_slice()?;
     let t = temperature.as_slice()?;
     let td = dewpoint.as_slice()?;
-    let result: Vec<f64> = p.iter().zip(t.iter().zip(td.iter()))
-        .map(|(&p, (&t, &td))| metrust::calc::thermo::wet_bulb_temperature(p, t, td))
-        .collect();
+    let result: Vec<f64> = py.allow_threads(|| {
+        p.par_iter().zip(t.par_iter().zip(td.par_iter()))
+            .map(|(&p, (&t, &td))| metrust::calc::thermo::wet_bulb_temperature(p, t, td))
+            .collect()
+    });
     Ok(result.into_pyarray(py))
 }
 
@@ -1002,9 +1013,11 @@ fn virtual_temp_array<'py>(
     let t = temperature.as_slice()?;
     let p = pressure.as_slice()?;
     let td = dewpoint.as_slice()?;
-    let result: Vec<f64> = t.iter().zip(p.iter().zip(td.iter()))
-        .map(|(&t, (&p, &td))| metrust::calc::thermo::virtual_temp(t, p, td))
-        .collect();
+    let result: Vec<f64> = py.allow_threads(|| {
+        t.par_iter().zip(p.par_iter().zip(td.par_iter()))
+            .map(|(&t, (&p, &td))| metrust::calc::thermo::virtual_temp(t, p, td))
+            .collect()
+    });
     Ok(result.into_pyarray(py))
 }
 
@@ -1017,9 +1030,11 @@ fn dewpoint_from_rh_array<'py>(
 ) -> PyResult<Bound<'py, PyArray1<f64>>> {
     let t = temperature.as_slice()?;
     let r = rh.as_slice()?;
-    let result: Vec<f64> = t.iter().zip(r.iter())
-        .map(|(&t, &r)| metrust::calc::thermo::dewpoint_from_rh(t, r))
-        .collect();
+    let result: Vec<f64> = py.allow_threads(|| {
+        t.par_iter().zip(r.par_iter())
+            .map(|(&t, &r)| metrust::calc::thermo::dewpoint_from_rh(t, r))
+            .collect()
+    });
     Ok(result.into_pyarray(py))
 }
 
@@ -1032,9 +1047,11 @@ fn rh_from_dewpoint_array<'py>(
 ) -> PyResult<Bound<'py, PyArray1<f64>>> {
     let t = temperature.as_slice()?;
     let td = dewpoint.as_slice()?;
-    let result: Vec<f64> = t.iter().zip(td.iter())
-        .map(|(&t, &td)| metrust::calc::thermo::rh_from_dewpoint(t, td))
-        .collect();
+    let result: Vec<f64> = py.allow_threads(|| {
+        t.par_iter().zip(td.par_iter())
+            .map(|(&t, &td)| metrust::calc::thermo::rh_from_dewpoint(t, td))
+            .collect()
+    });
     Ok(result.into_pyarray(py))
 }
 
@@ -1047,9 +1064,11 @@ fn mixing_ratio_array<'py>(
 ) -> PyResult<Bound<'py, PyArray1<f64>>> {
     let p = pressure.as_slice()?;
     let td = dewpoint.as_slice()?;
-    let result: Vec<f64> = p.iter().zip(td.iter())
-        .map(|(&p, &td)| metrust::calc::thermo::mixing_ratio(p, td))
-        .collect();
+    let result: Vec<f64> = py.allow_threads(|| {
+        p.par_iter().zip(td.par_iter())
+            .map(|(&p, &td)| metrust::calc::thermo::mixing_ratio(p, td))
+            .collect()
+    });
     Ok(result.into_pyarray(py))
 }
 
@@ -1060,9 +1079,11 @@ fn vapor_pressure_array<'py>(
     dewpoint: PyReadonlyArray1<f64>,
 ) -> PyResult<Bound<'py, PyArray1<f64>>> {
     let td = dewpoint.as_slice()?;
-    let result: Vec<f64> = td.iter()
-        .map(|&td| metrust::calc::thermo::vapor_pressure(td))
-        .collect();
+    let result: Vec<f64> = py.allow_threads(|| {
+        td.par_iter()
+            .map(|&td| metrust::calc::thermo::vapor_pressure(td))
+            .collect()
+    });
     Ok(result.into_pyarray(py))
 }
 
@@ -1077,9 +1098,11 @@ fn density_array<'py>(
     let p = pressure.as_slice()?;
     let t = temperature.as_slice()?;
     let w = mixing_ratio.as_slice()?;
-    let result: Vec<f64> = p.iter().zip(t.iter().zip(w.iter()))
-        .map(|(&p, (&t, &w))| metrust::calc::thermo::density(p, t, w))
-        .collect();
+    let result: Vec<f64> = py.allow_threads(|| {
+        p.par_iter().zip(t.par_iter().zip(w.par_iter()))
+            .map(|(&p, (&t, &w))| metrust::calc::thermo::density(p, t, w))
+            .collect()
+    });
     Ok(result.into_pyarray(py))
 }
 
@@ -1090,9 +1113,11 @@ fn exner_function_array<'py>(
     pressure: PyReadonlyArray1<f64>,
 ) -> PyResult<Bound<'py, PyArray1<f64>>> {
     let p = pressure.as_slice()?;
-    let result: Vec<f64> = p.iter()
-        .map(|&p| metrust::calc::thermo::exner_function(p))
-        .collect();
+    let result: Vec<f64> = py.allow_threads(|| {
+        p.par_iter()
+            .map(|&p| metrust::calc::thermo::exner_function(p))
+            .collect()
+    });
     Ok(result.into_pyarray(py))
 }
 
@@ -1107,9 +1132,11 @@ fn mixing_ratio_from_relative_humidity_array<'py>(
     let p = pressure.as_slice()?;
     let t = temperature.as_slice()?;
     let r = rh.as_slice()?;
-    let result: Vec<f64> = p.iter().zip(t.iter().zip(r.iter()))
-        .map(|(&p, (&t, &r))| metrust::calc::thermo::mixing_ratio_from_relative_humidity(p, t, r))
-        .collect();
+    let result: Vec<f64> = py.allow_threads(|| {
+        p.par_iter().zip(t.par_iter().zip(r.par_iter()))
+            .map(|(&p, (&t, &r))| metrust::calc::thermo::mixing_ratio_from_relative_humidity(p, t, r))
+            .collect()
+    });
     Ok(result.into_pyarray(py))
 }
 
@@ -1124,9 +1151,11 @@ fn relative_humidity_from_mixing_ratio_array<'py>(
     let p = pressure.as_slice()?;
     let t = temperature.as_slice()?;
     let w = mixing_ratio.as_slice()?;
-    let result: Vec<f64> = p.iter().zip(t.iter().zip(w.iter()))
-        .map(|(&p, (&t, &w))| metrust::calc::thermo::relative_humidity_from_mixing_ratio(p, t, w))
-        .collect();
+    let result: Vec<f64> = py.allow_threads(|| {
+        p.par_iter().zip(t.par_iter().zip(w.par_iter()))
+            .map(|(&p, (&t, &w))| metrust::calc::thermo::relative_humidity_from_mixing_ratio(p, t, w))
+            .collect()
+    });
     Ok(result.into_pyarray(py))
 }
 
@@ -1141,9 +1170,11 @@ fn relative_humidity_from_specific_humidity_array<'py>(
     let p = pressure.as_slice()?;
     let t = temperature.as_slice()?;
     let q = specific_humidity.as_slice()?;
-    let result: Vec<f64> = p.iter().zip(t.iter().zip(q.iter()))
-        .map(|(&p, (&t, &q))| metrust::calc::thermo::relative_humidity_from_specific_humidity(p, t, q))
-        .collect();
+    let result: Vec<f64> = py.allow_threads(|| {
+        p.par_iter().zip(t.par_iter().zip(q.par_iter()))
+            .map(|(&p, (&t, &q))| metrust::calc::thermo::relative_humidity_from_specific_humidity(p, t, q))
+            .collect()
+    });
     Ok(result.into_pyarray(py))
 }
 
@@ -1156,9 +1187,11 @@ fn specific_humidity_from_dewpoint_array<'py>(
 ) -> PyResult<Bound<'py, PyArray1<f64>>> {
     let p = pressure.as_slice()?;
     let td = dewpoint.as_slice()?;
-    let result: Vec<f64> = p.iter().zip(td.iter())
-        .map(|(&p, &td)| metrust::calc::thermo::specific_humidity_from_dewpoint(p, td))
-        .collect();
+    let result: Vec<f64> = py.allow_threads(|| {
+        p.par_iter().zip(td.par_iter())
+            .map(|(&p, &td)| metrust::calc::thermo::specific_humidity_from_dewpoint(p, td))
+            .collect()
+    });
     Ok(result.into_pyarray(py))
 }
 
@@ -1171,9 +1204,11 @@ fn dewpoint_from_specific_humidity_array<'py>(
 ) -> PyResult<Bound<'py, PyArray1<f64>>> {
     let p = pressure.as_slice()?;
     let q = specific_humidity.as_slice()?;
-    let result: Vec<f64> = p.iter().zip(q.iter())
-        .map(|(&p, &q)| metrust::calc::thermo::dewpoint_from_specific_humidity(p, q))
-        .collect();
+    let result: Vec<f64> = py.allow_threads(|| {
+        p.par_iter().zip(q.par_iter())
+            .map(|(&p, &q)| metrust::calc::thermo::dewpoint_from_specific_humidity(p, q))
+            .collect()
+    });
     Ok(result.into_pyarray(py))
 }
 
@@ -1186,9 +1221,11 @@ fn specific_humidity_array<'py>(
 ) -> PyResult<Bound<'py, PyArray1<f64>>> {
     let p = pressure.as_slice()?;
     let w = mixing_ratio.as_slice()?;
-    let result: Vec<f64> = p.iter().zip(w.iter())
-        .map(|(&p, &w)| metrust::calc::thermo::specific_humidity(p, w))
-        .collect();
+    let result: Vec<f64> = py.allow_threads(|| {
+        p.par_iter().zip(w.par_iter())
+            .map(|(&p, &w)| metrust::calc::thermo::specific_humidity(p, w))
+            .collect()
+    });
     Ok(result.into_pyarray(py))
 }
 
@@ -1199,9 +1236,11 @@ fn mixing_ratio_from_specific_humidity_array<'py>(
     specific_humidity: PyReadonlyArray1<f64>,
 ) -> PyResult<Bound<'py, PyArray1<f64>>> {
     let q = specific_humidity.as_slice()?;
-    let result: Vec<f64> = q.iter()
-        .map(|&q| metrust::calc::thermo::mixing_ratio_from_specific_humidity(q))
-        .collect();
+    let result: Vec<f64> = py.allow_threads(|| {
+        q.par_iter()
+            .map(|&q| metrust::calc::thermo::mixing_ratio_from_specific_humidity(q))
+            .collect()
+    });
     Ok(result.into_pyarray(py))
 }
 
@@ -1212,9 +1251,11 @@ fn specific_humidity_from_mixing_ratio_array<'py>(
     mixing_ratio: PyReadonlyArray1<f64>,
 ) -> PyResult<Bound<'py, PyArray1<f64>>> {
     let w = mixing_ratio.as_slice()?;
-    let result: Vec<f64> = w.iter()
-        .map(|&w| metrust::calc::thermo::specific_humidity_from_mixing_ratio(w))
-        .collect();
+    let result: Vec<f64> = py.allow_threads(|| {
+        w.par_iter()
+            .map(|&w| metrust::calc::thermo::specific_humidity_from_mixing_ratio(w))
+            .collect()
+    });
     Ok(result.into_pyarray(py))
 }
 
@@ -1225,9 +1266,11 @@ fn dewpoint_array<'py>(
     vp: PyReadonlyArray1<f64>,
 ) -> PyResult<Bound<'py, PyArray1<f64>>> {
     let e = vp.as_slice()?;
-    let result: Vec<f64> = e.iter()
-        .map(|&e| metrust::calc::thermo::dewpoint_from_vapor_pressure(e))
-        .collect();
+    let result: Vec<f64> = py.allow_threads(|| {
+        e.par_iter()
+            .map(|&e| metrust::calc::thermo::dewpoint_from_vapor_pressure(e))
+            .collect()
+    });
     Ok(result.into_pyarray(py))
 }
 
@@ -1242,9 +1285,11 @@ fn virtual_potential_temperature_array<'py>(
     let p = pressure.as_slice()?;
     let t = temperature.as_slice()?;
     let w = mixing_ratio.as_slice()?;
-    let result: Vec<f64> = p.iter().zip(t.iter().zip(w.iter()))
-        .map(|(&p, (&t, &w))| metrust::calc::thermo::virtual_potential_temperature(p, t, w))
-        .collect();
+    let result: Vec<f64> = py.allow_threads(|| {
+        p.par_iter().zip(t.par_iter().zip(w.par_iter()))
+            .map(|(&p, (&t, &w))| metrust::calc::thermo::virtual_potential_temperature(p, t, w))
+            .collect()
+    });
     Ok(result.into_pyarray(py))
 }
 
@@ -1257,9 +1302,11 @@ fn temperature_from_potential_temperature_array<'py>(
 ) -> PyResult<Bound<'py, PyArray1<f64>>> {
     let p = pressure.as_slice()?;
     let th = theta.as_slice()?;
-    let result: Vec<f64> = p.iter().zip(th.iter())
-        .map(|(&p, &th)| metrust::calc::thermo::temperature_from_potential_temperature(p, th))
-        .collect();
+    let result: Vec<f64> = py.allow_threads(|| {
+        p.par_iter().zip(th.par_iter())
+            .map(|(&p, &th)| metrust::calc::thermo::temperature_from_potential_temperature(p, th))
+            .collect()
+    });
     Ok(result.into_pyarray(py))
 }
 
@@ -1274,9 +1321,11 @@ fn lcl_pressure_array<'py>(
     let p = pressure.as_slice()?;
     let t = temperature.as_slice()?;
     let td = dewpoint.as_slice()?;
-    let result: Vec<f64> = p.iter().zip(t.iter().zip(td.iter()))
-        .map(|(&p, (&t, &td))| metrust::calc::thermo::lcl_pressure(p, t, td))
-        .collect();
+    let result: Vec<f64> = py.allow_threads(|| {
+        p.par_iter().zip(t.par_iter().zip(td.par_iter()))
+            .map(|(&p, (&t, &td))| metrust::calc::thermo::lcl_pressure(p, t, td))
+            .collect()
+    });
     Ok(result.into_pyarray(py))
 }
 
@@ -1289,9 +1338,11 @@ fn saturation_equivalent_potential_temperature_array<'py>(
 ) -> PyResult<Bound<'py, PyArray1<f64>>> {
     let p = pressure.as_slice()?;
     let t = temperature.as_slice()?;
-    let result: Vec<f64> = p.iter().zip(t.iter())
-        .map(|(&p, &t)| metrust::calc::thermo::saturation_equivalent_potential_temperature(p, t))
-        .collect();
+    let result: Vec<f64> = py.allow_threads(|| {
+        p.par_iter().zip(t.par_iter())
+            .map(|(&p, &t)| metrust::calc::thermo::saturation_equivalent_potential_temperature(p, t))
+            .collect()
+    });
     Ok(result.into_pyarray(py))
 }
 
@@ -1306,9 +1357,11 @@ fn wet_bulb_potential_temperature_array<'py>(
     let p = pressure.as_slice()?;
     let t = temperature.as_slice()?;
     let td = dewpoint.as_slice()?;
-    let result: Vec<f64> = p.iter().zip(t.iter().zip(td.iter()))
-        .map(|(&p, (&t, &td))| metrust::calc::thermo::wet_bulb_potential_temperature(p, t, td))
-        .collect();
+    let result: Vec<f64> = py.allow_threads(|| {
+        p.par_iter().zip(t.par_iter().zip(td.par_iter()))
+            .map(|(&p, (&t, &td))| metrust::calc::thermo::wet_bulb_potential_temperature(p, t, td))
+            .collect()
+    });
     Ok(result.into_pyarray(py))
 }
 
@@ -1321,9 +1374,11 @@ fn frost_point_array<'py>(
 ) -> PyResult<Bound<'py, PyArray1<f64>>> {
     let t = temperature.as_slice()?;
     let r = rh.as_slice()?;
-    let result: Vec<f64> = t.iter().zip(r.iter())
-        .map(|(&t, &r)| metrust::calc::thermo::frost_point(t, r))
-        .collect();
+    let result: Vec<f64> = py.allow_threads(|| {
+        t.par_iter().zip(r.par_iter())
+            .map(|(&t, &r)| metrust::calc::thermo::frost_point(t, r))
+            .collect()
+    });
     Ok(result.into_pyarray(py))
 }
 
@@ -1338,9 +1393,11 @@ fn virtual_temperature_from_dewpoint_array<'py>(
     let t = temperature.as_slice()?;
     let td = dewpoint.as_slice()?;
     let p = pressure.as_slice()?;
-    let result: Vec<f64> = t.iter().zip(td.iter().zip(p.iter()))
-        .map(|(&t, (&td, &p))| metrust::calc::thermo::virtual_temperature_from_dewpoint(t, td, p))
-        .collect();
+    let result: Vec<f64> = py.allow_threads(|| {
+        t.par_iter().zip(td.par_iter().zip(p.par_iter()))
+            .map(|(&t, (&td, &p))| metrust::calc::thermo::virtual_temperature_from_dewpoint(t, td, p))
+            .collect()
+    });
     Ok(result.into_pyarray(py))
 }
 

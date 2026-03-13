@@ -5,6 +5,7 @@
 /// `dx` and `dy` are grid spacings in meters.
 
 use std::f64::consts::PI;
+use rayon::prelude::*;
 
 /// Earth's angular velocity (rad/s).
 const OMEGA: f64 = 7.2921159e-5;
@@ -31,86 +32,72 @@ fn idx(j: usize, i: usize, nx: usize) -> usize {
 /// ∂f/∂x using centered differences (2nd-order one-sided at boundaries).
 pub fn gradient_x(values: &[f64], nx: usize, ny: usize, dx: f64) -> Vec<f64> {
     assert_eq!(values.len(), nx * ny);
-    let mut out = vec![0.0; nx * ny];
     let inv_2dx = 1.0 / (2.0 * dx);
     let inv_dx = 1.0 / dx;
 
-    for j in 0..ny {
-        for i in 0..nx {
-            let grad = if nx < 2 {
+    let rows: Vec<Vec<f64>> = (0..ny).into_par_iter().map(|j| {
+        (0..nx).map(|i| {
+            if nx < 2 {
                 0.0
             } else if nx == 2 {
                 (values[idx(j, 1, nx)] - values[idx(j, 0, nx)]) * inv_dx
             } else if i == 0 {
-                // 2nd-order forward: (-3f[0] + 4f[1] - f[2]) / (2dx)
                 (-3.0 * values[idx(j, 0, nx)] + 4.0 * values[idx(j, 1, nx)]
                     - values[idx(j, 2, nx)]) * inv_2dx
             } else if i == nx - 1 {
-                // 2nd-order backward: (3f[n] - 4f[n-1] + f[n-2]) / (2dx)
                 (3.0 * values[idx(j, nx - 1, nx)] - 4.0 * values[idx(j, nx - 2, nx)]
                     + values[idx(j, nx - 3, nx)]) * inv_2dx
             } else {
-                // centered difference
                 (values[idx(j, i + 1, nx)] - values[idx(j, i - 1, nx)]) * inv_2dx
-            };
-            out[idx(j, i, nx)] = grad;
-        }
-    }
-    out
+            }
+        }).collect()
+    }).collect();
+    rows.into_iter().flatten().collect()
 }
 
 /// ∂f/∂y using centered differences (2nd-order one-sided at boundaries).
 pub fn gradient_y(values: &[f64], nx: usize, ny: usize, dy: f64) -> Vec<f64> {
     assert_eq!(values.len(), nx * ny);
-    let mut out = vec![0.0; nx * ny];
     let inv_2dy = 1.0 / (2.0 * dy);
     let inv_dy = 1.0 / dy;
 
-    for j in 0..ny {
-        for i in 0..nx {
-            let grad = if ny < 2 {
+    let rows: Vec<Vec<f64>> = (0..ny).into_par_iter().map(|j| {
+        (0..nx).map(|i| {
+            if ny < 2 {
                 0.0
             } else if ny == 2 {
                 (values[idx(1, i, nx)] - values[idx(0, i, nx)]) * inv_dy
             } else if j == 0 {
-                // 2nd-order forward: (-3f[0] + 4f[1] - f[2]) / (2dy)
                 (-3.0 * values[idx(0, i, nx)] + 4.0 * values[idx(1, i, nx)]
                     - values[idx(2, i, nx)]) * inv_2dy
             } else if j == ny - 1 {
-                // 2nd-order backward: (3f[n] - 4f[n-1] + f[n-2]) / (2dy)
                 (3.0 * values[idx(ny - 1, i, nx)] - 4.0 * values[idx(ny - 2, i, nx)]
                     + values[idx(ny - 3, i, nx)]) * inv_2dy
             } else {
                 (values[idx(j + 1, i, nx)] - values[idx(j - 1, i, nx)]) * inv_2dy
-            };
-            out[idx(j, i, nx)] = grad;
-        }
-    }
-    out
+            }
+        }).collect()
+    }).collect();
+    rows.into_iter().flatten().collect()
 }
 
 /// Laplacian ∇²f = ∂²f/∂x² + ∂²f/∂y².
 pub fn laplacian(values: &[f64], nx: usize, ny: usize, dx: f64, dy: f64) -> Vec<f64> {
     assert_eq!(values.len(), nx * ny);
-    let mut out = vec![0.0; nx * ny];
     let inv_dx2 = 1.0 / (dx * dx);
     let inv_dy2 = 1.0 / (dy * dy);
 
-    for j in 0..ny {
-        for i in 0..nx {
-            // ∂²f/∂x²
+    let rows: Vec<Vec<f64>> = (0..ny).into_par_iter().map(|j| {
+        (0..nx).map(|i| {
             let d2x = if nx < 3 {
                 0.0
             } else if i == 0 {
-                // forward: f(2) - 2f(1) + f(0)
                 (values[idx(j, 2, nx)] - 2.0 * values[idx(j, 1, nx)] + values[idx(j, 0, nx)]) * inv_dx2
             } else if i == nx - 1 {
                 (values[idx(j, nx - 1, nx)] - 2.0 * values[idx(j, nx - 2, nx)] + values[idx(j, nx - 3, nx)]) * inv_dx2
             } else {
                 (values[idx(j, i + 1, nx)] - 2.0 * values[idx(j, i, nx)] + values[idx(j, i - 1, nx)]) * inv_dx2
             };
-
-            // ∂²f/∂y²
             let d2y = if ny < 3 {
                 0.0
             } else if j == 0 {
@@ -120,11 +107,10 @@ pub fn laplacian(values: &[f64], nx: usize, ny: usize, dx: f64, dy: f64) -> Vec<
             } else {
                 (values[idx(j + 1, i, nx)] - 2.0 * values[idx(j, i, nx)] + values[idx(j - 1, i, nx)]) * inv_dy2
             };
-
-            out[idx(j, i, nx)] = d2x + d2y;
-        }
-    }
-    out
+            d2x + d2y
+        }).collect()
+    }).collect();
+    rows.into_iter().flatten().collect()
 }
 
 // ─────────────────────────────────────────────
@@ -135,14 +121,14 @@ pub fn laplacian(values: &[f64], nx: usize, ny: usize, dx: f64, dy: f64) -> Vec<
 pub fn divergence(u: &[f64], v: &[f64], nx: usize, ny: usize, dx: f64, dy: f64) -> Vec<f64> {
     let dudx = gradient_x(u, nx, ny, dx);
     let dvdy = gradient_y(v, nx, ny, dy);
-    dudx.iter().zip(dvdy.iter()).map(|(a, b)| a + b).collect()
+    dudx.par_iter().zip(dvdy.par_iter()).map(|(a, b)| a + b).collect()
 }
 
 /// Relative vorticity: ∂v/∂x - ∂u/∂y.
 pub fn vorticity(u: &[f64], v: &[f64], nx: usize, ny: usize, dx: f64, dy: f64) -> Vec<f64> {
     let dvdx = gradient_x(v, nx, ny, dx);
     let dudy = gradient_y(u, nx, ny, dy);
-    dvdx.iter().zip(dudy.iter()).map(|(a, b)| a - b).collect()
+    dvdx.par_iter().zip(dudy.par_iter()).map(|(a, b)| a - b).collect()
 }
 
 /// Coriolis parameter: f = 2Ω sin(φ).
@@ -158,8 +144,8 @@ pub fn absolute_vorticity(
 ) -> Vec<f64> {
     let rel = vorticity(u, v, nx, ny, dx, dy);
     assert_eq!(lats.len(), nx * ny);
-    rel.iter()
-        .zip(lats.iter())
+    rel.par_iter()
+        .zip(lats.par_iter())
         .map(|(zeta, lat)| zeta + coriolis_parameter(*lat))
         .collect()
 }
@@ -170,7 +156,7 @@ pub fn stretching_deformation(
 ) -> Vec<f64> {
     let dudx = gradient_x(u, nx, ny, dx);
     let dvdy = gradient_y(v, nx, ny, dy);
-    dudx.iter().zip(dvdy.iter()).map(|(a, b)| a - b).collect()
+    dudx.par_iter().zip(dvdy.par_iter()).map(|(a, b)| a - b).collect()
 }
 
 /// Shearing deformation: ∂v/∂x + ∂u/∂y.
@@ -179,7 +165,7 @@ pub fn shearing_deformation(
 ) -> Vec<f64> {
     let dvdx = gradient_x(v, nx, ny, dx);
     let dudy = gradient_y(u, nx, ny, dy);
-    dvdx.iter().zip(dudy.iter()).map(|(a, b)| a + b).collect()
+    dvdx.par_iter().zip(dudy.par_iter()).map(|(a, b)| a + b).collect()
 }
 
 /// Total deformation: √(stretching² + shearing²).
@@ -188,8 +174,8 @@ pub fn total_deformation(
 ) -> Vec<f64> {
     let st = stretching_deformation(u, v, nx, ny, dx, dy);
     let sh = shearing_deformation(u, v, nx, ny, dx, dy);
-    st.iter()
-        .zip(sh.iter())
+    st.par_iter()
+        .zip(sh.par_iter())
         .map(|(s, h)| (s * s + h * h).sqrt())
         .collect()
 }
@@ -205,12 +191,9 @@ pub fn advection(
 ) -> Vec<f64> {
     let dsdx = gradient_x(scalar, nx, ny, dx);
     let dsdy = gradient_y(scalar, nx, ny, dy);
-    let n = nx * ny;
-    let mut out = vec![0.0; n];
-    for k in 0..n {
-        out[k] = -u[k] * dsdx[k] - v[k] * dsdy[k];
-    }
-    out
+    (0..nx * ny).into_par_iter()
+        .map(|k| -u[k] * dsdx[k] - v[k] * dsdy[k])
+        .collect()
 }
 
 /// Temperature advection (wrapper around `advection`).
@@ -310,8 +293,8 @@ pub fn q_vector_convergence(
     let dq1dx = gradient_x(q1, nx, ny, dx);
     let dq2dy = gradient_y(q2, nx, ny, dy);
     dq1dx
-        .iter()
-        .zip(dq2dy.iter())
+        .par_iter()
+        .zip(dq2dy.par_iter())
         .map(|(a, b)| -2.0 * (a + b))
         .collect()
 }
@@ -323,8 +306,8 @@ pub fn q_vector_convergence(
 /// Wind speed: √(u² + v²).
 pub fn wind_speed(u: &[f64], v: &[f64]) -> Vec<f64> {
     assert_eq!(u.len(), v.len());
-    u.iter()
-        .zip(v.iter())
+    u.par_iter()
+        .zip(v.par_iter())
         .map(|(ui, vi)| (ui * ui + vi * vi).sqrt())
         .collect()
 }
@@ -333,8 +316,8 @@ pub fn wind_speed(u: &[f64], v: &[f64]) -> Vec<f64> {
 /// Returns the direction the wind is coming FROM.
 pub fn wind_direction(u: &[f64], v: &[f64]) -> Vec<f64> {
     assert_eq!(u.len(), v.len());
-    u.iter()
-        .zip(v.iter())
+    u.par_iter()
+        .zip(v.par_iter())
         .map(|(ui, vi)| {
             let spd = (ui * ui + vi * vi).sqrt();
             if spd < 1e-10 {
@@ -351,16 +334,14 @@ pub fn wind_direction(u: &[f64], v: &[f64]) -> Vec<f64> {
 /// Direction is in degrees (0 = from north).
 pub fn wind_components(speed: &[f64], direction: &[f64]) -> (Vec<f64>, Vec<f64>) {
     assert_eq!(speed.len(), direction.len());
-    let u: Vec<f64> = speed
-        .iter()
-        .zip(direction.iter())
-        .map(|(s, d)| -s * (d * PI / 180.0).sin())
-        .collect();
-    let v: Vec<f64> = speed
-        .iter()
-        .zip(direction.iter())
-        .map(|(s, d)| -s * (d * PI / 180.0).cos())
-        .collect();
+    let (u, v): (Vec<f64>, Vec<f64>) = speed
+        .par_iter()
+        .zip(direction.par_iter())
+        .map(|(s, d)| {
+            let rad = d * PI / 180.0;
+            (-s * rad.sin(), -s * rad.cos())
+        })
+        .unzip();
     (u, v)
 }
 
@@ -406,8 +387,8 @@ pub fn ageostrophic_wind(
     assert_eq!(u.len(), v.len());
     assert_eq!(u.len(), u_geo.len());
     assert_eq!(u.len(), v_geo.len());
-    let ua: Vec<f64> = u.iter().zip(u_geo.iter()).map(|(a, b)| a - b).collect();
-    let va: Vec<f64> = v.iter().zip(v_geo.iter()).map(|(a, b)| a - b).collect();
+    let ua: Vec<f64> = u.par_iter().zip(u_geo.par_iter()).map(|(a, b)| a - b).collect();
+    let va: Vec<f64> = v.par_iter().zip(v_geo.par_iter()).map(|(a, b)| a - b).collect();
     (ua, va)
 }
 
@@ -466,7 +447,7 @@ pub fn shear_vorticity(
 ) -> Vec<f64> {
     let total = vorticity(u, v, nx, ny, dx, dy);
     let curv = curvature_vorticity(u, v, nx, ny, dx, dy);
-    total.iter().zip(curv.iter()).map(|(t, c)| t - c).collect()
+    total.par_iter().zip(curv.par_iter()).map(|(t, c)| t - c).collect()
 }
 
 // ─────────────────────────────────────────────
@@ -520,8 +501,8 @@ pub fn absolute_momentum(
 ) -> Vec<f64> {
     assert_eq!(u.len(), lats.len());
     assert_eq!(u.len(), y_distances.len());
-    u.iter()
-        .zip(lats.iter().zip(y_distances.iter()))
+    u.par_iter()
+        .zip(lats.par_iter().zip(y_distances.par_iter()))
         .map(|(&ui, (&lat, &y))| {
             let f = coriolis_parameter(lat);
             ui - f * y
@@ -535,8 +516,8 @@ pub fn absolute_momentum(
 pub fn kinematic_flux(v_component: &[f64], scalar: &[f64]) -> Vec<f64> {
     assert_eq!(v_component.len(), scalar.len());
     v_component
-        .iter()
-        .zip(scalar.iter())
+        .par_iter()
+        .zip(scalar.par_iter())
         .map(|(v, s)| v * s)
         .collect()
 }

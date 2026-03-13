@@ -20,14 +20,15 @@ from metrust.calc import (
     relative_humidity_from_dewpoint, mixing_ratio,
     lcl, lfc, el, parcel_profile, cape_cin,
     precipitable_water, wet_bulb_temperature,
+    pressure_to_height_std,
 )
 from metrust.units import units
 
 # --- Input sounding ---
-p  = np.array([1000, 925, 850, 700, 500, 300, 200]) * units.hPa
-T  = np.array([  30,  24,  18,   6, -14, -42, -58]) * units.degC
-Td = np.array([  22,  18,  14,  -2, -24, -48, -64]) * units.degC
-hgt = np.array([  0, 750,1500,3000,5500,9000,12000]) * units.m
+p  = np.array([1000, 925, 850, 700, 500, 400, 300, 250, 200]) * units.hPa
+T  = np.array([  30,  24,  18,   6, -14, -24, -42, -52, -58]) * units.degC
+Td = np.array([  22,  18,  14,  -2, -24, -36, -52, -62, -68]) * units.degC
+hgt = np.array([  0, 750,1500,3000,5500,7200,9000,10500,12000]) * units.m
 
 # Thermodynamic profiles
 theta   = potential_temperature(p, T)
@@ -201,7 +202,7 @@ p  = np.array([1000, 950, 900, 850, 800, 700, 600, 500]) * units.hPa
 T  = np.array([  -1,   0,   2,   3,   1,  -5, -15, -25]) * units.degC
 Td = np.array([  -2,  -1,   1,   1,  -1,  -8, -20, -35]) * units.degC
 
-# Wet-bulb temperature profile
+# Wet-bulb temperature at each level
 Tw = wet_bulb_temperature(p, T, Td)
 
 # Check for a warm nose (above-freezing layer aloft)
@@ -210,7 +211,9 @@ sfc_T  = T[0].magnitude
 sfc_Tw = Tw[0].magnitude
 warm_layer = np.any(Tw.magnitude > 0)
 
-print(f"Surface T: {sfc_T:.1f} C  |  Surface Tw: {sfc_Tw:.1f} C  |  Warm nose: {has_warm_nose}")
+print(f"Surface T:  {sfc_T:.1f} C")
+print(f"Surface Tw: {sfc_Tw:.1f} C")
+print(f"Warm nose:  {has_warm_nose}")
 
 if sfc_Tw <= 0 and not warm_layer:
     print("Diagnosis: SNOW -- entire column below freezing wet-bulb")
@@ -223,7 +226,7 @@ elif sfc_T <= 0 and has_warm_nose:
 elif sfc_T > 0:
     print("Diagnosis: RAIN -- above-freezing surface")
 else:
-    print("Diagnosis: RAIN -- wet-bulb profile above freezing")
+    print("Diagnosis: Mixed -- borderline freezing, monitor closely")
 ```
 
 ---
@@ -248,8 +251,14 @@ hgt = np.array([   0, 750,1500,3000,5500,9000]) * units.m
 stations = ["OUN", "DDC", "TOP", "SGF", "LBF"]
 sfc_temps = [30, 28, 26, 24, 22]
 sfc_tds   = [22, 20, 18, 16, 14]
-T_data  = [np.array([st, st-6, st-12, st-24, st-44, st-72]) * units.degC for st in sfc_temps]
-Td_data = [np.array([sd, sd-2, sd-4,  sd-12, sd-34, sd-58]) * units.degC for sd in sfc_tds]
+T_data = [
+    np.array([st, st-6, st-12, st-24, st-44, st-72]) * units.degC
+    for st in sfc_temps
+]
+Td_data = [
+    np.array([sd, sd-2, sd-4, sd-12, sd-34, sd-58]) * units.degC
+    for sd in sfc_tds
+]
 
 # Batch processing
 start = time.perf_counter()
@@ -298,8 +307,8 @@ temperature_c = np.linspace(28, -55, nz).reshape(nz,1,1) * np.ones((1,ny,nx))
 qvapor_3d     = np.linspace(0.015, 0.0001, nz).reshape(nz,1,1) * np.ones((1,ny,nx))
 height_agl_3d = np.linspace(0, 14000, nz).reshape(nz,1,1) * np.ones((1,ny,nx))
 
-# Add horizontal variation to make it interesting
-temperature_c += np.random.normal(0, 2, (nz, ny, nx))
+# Add horizontal variation
+temperature_c += np.random.default_rng(42).normal(0, 2, (nz, ny, nx))
 
 # Surface fields
 psfc = np.full((ny, nx), 100000.0)
@@ -337,7 +346,7 @@ print(f"CIN  range: {cin.magnitude.min():.0f} to {cin.magnitude.max():.0f} J/kg"
 
 Compute bulk shear at multiple layer depths and storm-relative helicity
 at multiple integration depths. This gives a complete picture of the
-vertical wind shear structure.
+vertical wind shear structure for storm-mode forecasting.
 
 ```python
 import numpy as np
@@ -374,6 +383,7 @@ for depth in srh_layers:
 # Storm motion summary
 print(f"\nBunkers right-mover: u={rm_u:.1f}, v={rm_v:.1f}")
 print(f"Bunkers left-mover:  u={lm_u:.1f}, v={lm_v:.1f}")
+print(f"Mean wind:           u={mw_u:.1f}, v={mw_v:.1f}")
 ```
 
 ---
@@ -403,9 +413,11 @@ theta_e = equivalent_potential_temperature(p_sfc, T_sfc, Td_sfc)
 theta_e_vals = theta_e.magnitude
 gradient = np.diff(theta_e_vals)
 
+print("=== Theta-E Transect ===")
 for i in range(len(stations)):
-    print(f"{stations[i]:>8}  T={T_sfc[i].m:.0f}C  Td={Td_sfc[i].m:.0f}C"
-          f"  theta-e={theta_e_vals[i]:.1f} K")
+    print(f"  {stations[i]:>8}  T={T_sfc[i].m:5.0f} C  "
+          f"Td={Td_sfc[i].m:5.0f} C  "
+          f"theta-e={theta_e_vals[i]:.1f} K")
 
 # Flag the strongest gradient as the likely boundary location
 max_grad_idx = np.argmax(np.abs(gradient))
@@ -443,20 +455,30 @@ theta_vals = theta.magnitude
 hgt_vals = hgt.magnitude
 
 # Find where theta_env first exceeds theta_sfc (PBL top)
+# Using a 0.5 K threshold to account for near-neutral layers
 above_idx = np.where(theta_vals > theta_sfc + 0.5)[0]
 
 if len(above_idx) > 0:
     idx = above_idx[0]
     if idx > 0:
-        frac = ((theta_sfc + 0.5) - theta_vals[idx-1]) / (theta_vals[idx] - theta_vals[idx-1])
+        # Linear interpolation for fractional level
+        frac = ((theta_sfc + 0.5) - theta_vals[idx-1]) / (
+            theta_vals[idx] - theta_vals[idx-1]
+        )
         mix_height = hgt_vals[idx-1] + frac * (hgt_vals[idx] - hgt_vals[idx-1])
     else:
         mix_height = hgt_vals[0]
     print(f"Surface theta: {theta_sfc:.1f} K")
     print(f"Mixing height: {mix_height:.0f} m AGL")
 else:
-    print("Mixing height above sounding top")
+    print("Mixing height above sounding top -- deep boundary layer")
 ```
+
+!!! tip
+    This "parcel method" is a rough estimate. The actual PBL height depends
+    on turbulence, moisture, and surface heat flux. For more precision,
+    look for the base of a capping inversion or a sharp decrease in
+    moisture with height.
 
 ---
 
@@ -500,9 +522,9 @@ rh = relative_humidity_from_dewpoint(T_c, Td_c)
 stn_p = altimeter_to_station_pressure(altimeter_hPa, elevation_m)
 hi = heat_index(T_c, rh.magnitude * 100)
 
-print(f"\nRH:              {rh.magnitude*100:.0f}%")
-print(f"Station pressure: {stn_p:.1f}")
-print(f"Heat index:       {hi:.1f}  ({hi.to('degF'):.1f})")
+print(f"\nRH:               {rh.magnitude*100:.0f}%")
+print(f"Station pressure:  {stn_p:.1f}")
+print(f"Heat index:        {hi:.1f}  ({hi.to('degF'):.1f})")
 
 # You can also pass non-metric units directly -- metrust auto-converts
 hi_direct = heat_index(T_f, rh.magnitude * 100)
@@ -520,7 +542,8 @@ print(f"Heat index (direct from F): {hi_direct:.1f}")
 
 The same calculation done one element at a time in a Python loop versus
 vectorized over an array. Always use arrays when possible -- the Rust
-backend processes entire arrays in a single FFI call.
+backend processes entire arrays in a single FFI call with zero per-element
+Python overhead.
 
 ```python
 import numpy as np
@@ -530,8 +553,9 @@ from metrust.units import units
 
 # Generate a large array
 n = 100_000
-p_arr = np.random.uniform(300, 1000, n) * units.hPa
-T_arr = np.random.uniform(-60, 35, n) * units.degC
+rng = np.random.default_rng(42)
+p_arr = rng.uniform(300, 1000, n) * units.hPa
+T_arr = rng.uniform(-60, 35, n) * units.degC
 
 # --- Vectorized (fast): pass the entire array ---
 start = time.perf_counter()
@@ -553,13 +577,10 @@ print(f"\nResults match: {np.allclose(theta_vec.magnitude, theta_loop)}")
 ```
 
 !!! tip
-    Functions marked "Rust array binding" in the API docs have dedicated
+    Functions with "Rust array binding" in the API docs have dedicated
     compiled entry points that process an entire NumPy array in a single
-    Rust call with zero per-element Python overhead. Functions using
-    `_vec_call` still benefit from Rust speed per element, but pay Python
-    dispatch cost per iteration. For the best performance, prefer the
-    array-binding functions and always pass arrays rather than looping over
-    scalars.
+    Rust call with zero per-element Python overhead. For the best
+    performance, always pass arrays rather than looping over scalars.
 
 ---
 
