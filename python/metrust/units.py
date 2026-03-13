@@ -3,7 +3,9 @@
 import numpy as np
 import pint
 
-units = pint.UnitRegistry(autoconvert_offset_to_baseunit=True)
+# Use Pint's application registry so metrust and MetPy share the same unit
+# system when both are imported in the same process.
+units = pint.get_application_registry()
 units.autoconvert_offset_to_baseunit = True
 
 # Ensure common meteorological aliases are registered.  degC, degF, and hPa

@@ -89,6 +89,81 @@ def _prep(*values):
     return flat, orig_shape, True
 
 
+def _interp_profile_level(pressure, values, target_pressure_hpa, value_unit=None):
+    """Interpolate a profile to a pressure level in hPa."""
+    p_arr = np.asarray(_strip(pressure, "hPa"), dtype=np.float64).ravel()
+    if value_unit is not None and hasattr(values, "magnitude"):
+        v_arr = np.asarray(values.to(value_unit).magnitude, dtype=np.float64).ravel()
+    elif hasattr(values, "magnitude"):
+        v_arr = np.asarray(values.magnitude, dtype=np.float64).ravel()
+    else:
+        v_arr = np.asarray(values, dtype=np.float64).ravel()
+
+    if p_arr[0] > p_arr[-1]:
+        p_arr = p_arr[::-1]
+        v_arr = v_arr[::-1]
+
+    return float(np.interp(float(target_pressure_hpa), p_arr, v_arr))
+
+
+def _coord_values(coord):
+    """Extract plain float coordinate values from xarray-like or Pint inputs."""
+    if coord is None:
+        return None
+    if hasattr(coord, "values"):
+        coord = coord.values
+    elif hasattr(coord, "magnitude"):
+        coord = coord.magnitude
+    return np.asarray(coord, dtype=np.float64)
+
+
+def _infer_lat_lon(data, latitude=None, longitude=None):
+    """Infer latitude/longitude grids from a field for MetPy-style grid calls."""
+    lat = latitude
+    lon = longitude
+
+    if lat is None or lon is None:
+        try:
+            lat = data.metpy.latitude
+            lon = data.metpy.longitude
+        except Exception:
+            pass
+
+    coords = getattr(data, "coords", None)
+    if coords is not None:
+        if lat is None:
+            for name in ("latitude", "lat"):
+                if name in coords:
+                    lat = coords[name]
+                    break
+        if lon is None:
+            for name in ("longitude", "lon"):
+                if name in coords:
+                    lon = coords[name]
+                    break
+
+    if lat is None or lon is None:
+        return None, None
+
+    lat_arr = _coord_values(lat)
+    lon_arr = _coord_values(lon)
+    if lat_arr.ndim == 1 and lon_arr.ndim == 1:
+        lon_arr, lat_arr = np.meshgrid(lon_arr, lat_arr)
+    return lat_arr, lon_arr
+
+
+def _resolve_dx_dy(data, dx=None, dy=None, latitude=None, longitude=None):
+    """Resolve grid spacing from explicit args or inferred lat/lon coordinates."""
+    if dx is not None and dy is not None:
+        return dx, dy
+
+    lat_arr, lon_arr = _infer_lat_lon(data, latitude=latitude, longitude=longitude)
+    if lat_arr is None or lon_arr is None:
+        return dx, dy
+
+    return lat_lon_grid_deltas(lat_arr, lon_arr)
+
+
 def _vec_call(fn, *stripped_args):
     """Call scalar Rust fn element-wise over array args; return scalar or reshaped array."""
     vals, shape, is_arr = _prep(*stripped_args)
@@ -265,7 +340,8 @@ def wet_bulb_temperature(pressure, temperature, dewpoint):
     return result * units.degC
 
 
-def lfc(pressure, temperature, dewpoint):
+def lfc(pressure, temperature, dewpoint, parcel_temperature_profile=None,
+        dewpoint_start=None, which="top"):
     """Level of Free Convection.
 
     Parameters
@@ -276,17 +352,19 @@ def lfc(pressure, temperature, dewpoint):
 
     Returns
     -------
-    Quantity (hPa)
-        LFC pressure.
+    tuple of (Quantity (hPa), Quantity (degC))
+        LFC pressure and parcel temperature at the LFC.
     """
     p = _as_1d(_strip(pressure, "hPa"))
     t = _as_1d(_strip(temperature, "degC"))
     td = _as_1d(_strip(dewpoint, "degC"))
-    result = _calc.lfc(p, t, td)
-    return result * units.hPa
+    result = np.asarray(_calc.lfc(p, t, td), dtype=np.float64).ravel()
+    if result.size >= 2:
+        return result[0] * units.hPa, result[1] * units.degC
+    return result[0] * units.hPa, np.nan * units.degC
 
 
-def el(pressure, temperature, dewpoint):
+def el(pressure, temperature, dewpoint, parcel_temperature_profile=None, which="top"):
     """Equilibrium Level.
 
     Parameters
@@ -297,14 +375,16 @@ def el(pressure, temperature, dewpoint):
 
     Returns
     -------
-    Quantity (hPa)
-        EL pressure.
+    tuple of (Quantity (hPa), Quantity (degC))
+        EL pressure and parcel temperature at the EL.
     """
     p = _as_1d(_strip(pressure, "hPa"))
     t = _as_1d(_strip(temperature, "degC"))
     td = _as_1d(_strip(dewpoint, "degC"))
-    result = _calc.el(p, t, td)
-    return result * units.hPa
+    result = np.asarray(_calc.el(p, t, td), dtype=np.float64).ravel()
+    if result.size >= 2:
+        return result[0] * units.hPa, result[1] * units.degC
+    return result[0] * units.hPa, np.nan * units.degC
 
 
 def lcl(pressure, temperature, dewpoint):
@@ -504,7 +584,8 @@ def cape_cin(pressure, temperature, dewpoint, parcel_profile_or_height=None,
     # Detect whether the 4th arg is height (length units) or parcel profile (temperature units).
     # MetPy's cape_cin signature is cape_cin(p, T, Td, parcel_profile).
     fourth = parcel_profile_or_height
-    if fourth is not None and _is_temperature_like(fourth):
+    metpy_profile_form = fourth is not None and _is_temperature_like(fourth)
+    if metpy_profile_form:
         # MetPy calling convention: 4th arg is a parcel temperature profile.
         # Derive height from pressure via standard atmosphere and let Rust recompute the parcel.
         h_vals = np.array([_calc.pressure_to_height_std(float(pi)) for pi in p])
@@ -535,6 +616,8 @@ def cape_cin(pressure, temperature, dewpoint, parcel_profile_or_height=None,
         p, t, td, h, ps, t2, td2, parcel_type,
         float(ml_depth), float(mu_depth), top_m,
     )
+    if metpy_profile_form:
+        return cape_val * units("J/kg"), cin_val * units("J/kg")
     return (
         cape_val * units("J/kg"),
         cin_val * units("J/kg"),
@@ -605,9 +688,17 @@ def k_index(*args, vertical_dim=0):
     -------
     Quantity (delta_degC)
     """
-    if len(args) != 5:
+    if len(args) == 3:
+        pressure, temperature, dewpoint = args
+        t850 = _interp_profile_level(pressure, temperature, 850.0, "degC")
+        td850 = _interp_profile_level(pressure, dewpoint, 850.0, "degC")
+        t700 = _interp_profile_level(pressure, temperature, 700.0, "degC")
+        td700 = _interp_profile_level(pressure, dewpoint, 700.0, "degC")
+        t500 = _interp_profile_level(pressure, temperature, 500.0, "degC")
+    elif len(args) == 5:
+        t850, td850, t700, td700, t500 = args
+    else:
         raise TypeError("k_index expects either (pressure, temperature, dewpoint) or 5 scalar level values")
-    t850, td850, t700, td700, t500 = args
     return _attach(
         _calc.k_index(
             _as_float(_strip(t850, "degC")),
@@ -627,9 +718,15 @@ def total_totals(*args, vertical_dim=0):
     -------
     Quantity (delta_degC)
     """
-    if len(args) != 3:
+    if len(args) == 3 and np.asarray(_strip(args[0], "hPa")).ndim > 0:
+        pressure, temperature, dewpoint = args
+        t850 = _interp_profile_level(pressure, temperature, 850.0, "degC")
+        td850 = _interp_profile_level(pressure, dewpoint, 850.0, "degC")
+        t500 = _interp_profile_level(pressure, temperature, 500.0, "degC")
+    elif len(args) == 3:
+        t850, td850, t500 = args
+    else:
         raise TypeError("total_totals expects either (pressure, temperature, dewpoint) or 3 scalar level values")
-    t850, td850, t500 = args
     return _attach(
         _calc.total_totals(
             _as_float(_strip(t850, "degC")),
@@ -666,9 +763,14 @@ def cross_totals(*args, vertical_dim=0):
     -------
     Quantity (delta_degC)
     """
-    if len(args) != 2:
+    if len(args) == 3:
+        pressure, temperature, dewpoint = args
+        td850 = _interp_profile_level(pressure, dewpoint, 850.0, "degC")
+        t500 = _interp_profile_level(pressure, temperature, 500.0, "degC")
+    elif len(args) == 2:
+        td850, t500 = args
+    else:
         raise TypeError("cross_totals expects either (pressure, temperature, dewpoint) or (td850, t500)")
-    td850, t500 = args
     return _attach(
         _calc.cross_totals(
             _as_float(_strip(td850, "degC")),
@@ -685,9 +787,14 @@ def vertical_totals(*args, vertical_dim=0):
     -------
     Quantity (delta_degC)
     """
-    if len(args) != 2:
+    if len(args) == 2 and np.asarray(_strip(args[0], "hPa")).ndim > 0:
+        pressure, temperature = args
+        t850 = _interp_profile_level(pressure, temperature, 850.0, "degC")
+        t500 = _interp_profile_level(pressure, temperature, 500.0, "degC")
+    elif len(args) == 2:
+        t850, t500 = args
+    else:
         raise TypeError("vertical_totals expects either (pressure, temperature) or (t850, t500)")
-    t850, t500 = args
     return _attach(
         _calc.vertical_totals(
             _as_float(_strip(t850, "degC")),
@@ -994,21 +1101,49 @@ def add_pressure_to_height(height, delta_pressure):
     return result * units.m
 
 
-def thickness_hydrostatic(p_bottom, p_top, t_mean):
-    """Hypsometric thickness between two pressure levels.
+def thickness_hydrostatic(pressure_or_bottom, temperature_or_top, t_mean=None,
+                          mixing_ratio=None,
+                          molecular_weight_ratio=0.6219569100577033,
+                          bottom=None, depth=None):
+    """Hypsometric thickness.
 
-    Parameters
-    ----------
-    p_bottom : Quantity (pressure)
-    p_top : Quantity (pressure)
-    t_mean : Quantity (temperature, K)
-
-    Returns
-    -------
-    Quantity (m)
+    Supports both the original scalar form ``thickness_hydrostatic(p_bottom, p_top, t_mean)``
+    and the MetPy-style profile form ``thickness_hydrostatic(pressure, temperature, ...)``.
     """
-    result = _vec_call(_calc.thickness_hydrostatic, _strip(p_bottom, "hPa"), _strip(p_top, "hPa"), _strip(t_mean, "K"))
-    return result * units.m
+    if t_mean is not None:
+        result = _vec_call(
+            _calc.thickness_hydrostatic,
+            _strip(pressure_or_bottom, "hPa"),
+            _strip(temperature_or_top, "hPa"),
+            _strip(t_mean, "K"),
+        )
+        return result * units.m
+
+    pressure = pressure_or_bottom
+    temperature = temperature_or_top
+    if bottom is not None or depth is not None:
+        extracted = get_layer(pressure, temperature, *( [mixing_ratio] if mixing_ratio is not None else [] ),
+                              bottom=bottom if bottom is not None else pressure[0],
+                              depth=depth if depth is not None else (pressure[0] - pressure[-1]),
+                              interpolate=True)
+        if mixing_ratio is not None:
+            pressure, temperature, mixing_ratio = extracted
+        else:
+            pressure, temperature = extracted
+
+    p = _as_1d(_strip(pressure, "Pa"))
+    t = _as_1d(_strip(temperature, "K"))
+    if mixing_ratio is not None:
+        w = _as_1d(_strip(mixing_ratio, "kg/kg"))
+        eps = molecular_weight_ratio
+        t = t * (1.0 + w / eps) / (1.0 + w)
+
+    if p[0] < p[-1]:
+        p = p[::-1]
+        t = t[::-1]
+
+    thickness = -(287.05 / 9.80665) * np.trapezoid(t, np.log(p))
+    return thickness * units.m
 
 
 def vapor_pressure(pressure_or_dewpoint, mixing_ratio=None,
@@ -1285,32 +1420,57 @@ def geopotential_to_height(geopotential):
     return result * units.m
 
 
-def get_layer(pressure, values, p_bottom, p_top):
-    """Extract a layer from a sounding between two pressures.
+def get_layer(pressure, *args, p_bottom=None, p_top=None,
+              bottom=None, depth=None, interpolate=True):
+    """Extract one or more fields from a sounding layer.
 
-    Parameters
-    ----------
-    pressure : array Quantity (pressure)
-    values : array Quantity
-    p_bottom : Quantity (pressure)
-    p_top : Quantity (pressure)
-
-    Returns
-    -------
-    tuple of (array Quantity (hPa), array Quantity)
+    Supports both the original form ``get_layer(pressure, values, p_bottom, p_top)``
+    and the MetPy-style form ``get_layer(pressure, values..., bottom=..., depth=...)``.
     """
+    if not args:
+        raise TypeError("get_layer requires at least one value profile")
+
+    value_args = args
+    if p_bottom is None and p_top is None and len(args) >= 3:
+        tail_bottom, tail_top = args[-2], args[-1]
+        if _is_pressure_like(tail_bottom) and _is_pressure_like(tail_top):
+            value_args = args[:-2]
+            p_bottom = tail_bottom
+            p_top = tail_top
+
+    if p_bottom is None:
+        p_bottom = bottom if bottom is not None else pressure[0]
+    if p_top is None:
+        if depth is None:
+            raise TypeError("get_layer requires either p_top or depth")
+        p_top = p_bottom - depth
+
     p = _as_1d(_strip(pressure, "hPa"))
-    has_units = hasattr(values, "units")
-    v_unit = values.units if has_units else None
-    v = _as_1d(_strip(values, "")) if has_units else _as_1d(values)
     pb = _as_float(_strip(p_bottom, "hPa"))
     pt = _as_float(_strip(p_top, "hPa"))
-    p_out, v_out = _calc.get_layer(p, v, pb, pt)
-    p_result = np.asarray(p_out) * units.hPa
-    v_result = np.asarray(v_out)
-    if v_unit is not None:
-        v_result = v_result * v_unit
-    return p_result, v_result
+    p_result = None
+    value_results = []
+
+    for values in value_args:
+        has_units = hasattr(values, "units")
+        v_unit = values.units if has_units else None
+        if has_units:
+            v = _as_1d(np.asarray(values.magnitude, dtype=np.float64))
+        elif hasattr(values, "values"):
+            v = _as_1d(np.asarray(values.values, dtype=np.float64))
+        else:
+            v = _as_1d(values)
+        p_out, v_out = _calc.get_layer(p, v, pb, pt)
+        if p_result is None:
+            p_result = np.asarray(p_out) * units.hPa
+        v_result = np.asarray(v_out)
+        if v_unit is not None:
+            v_result = v_result * v_unit
+        value_results.append(v_result)
+
+    if len(value_results) == 1:
+        return p_result, value_results[0]
+    return (p_result, *value_results)
 
 
 def get_layer_heights(pressure, heights, p_bottom, p_top):
@@ -1402,24 +1562,41 @@ def mean_pressure_weighted(pressure, values):
     return _calc.mean_pressure_weighted(p, v)
 
 
-def mixed_layer(pressure, values, depth=100.0):
-    """Mixed-layer mean of a quantity.
+def mixed_layer(pressure, *args, height=None, bottom=None, depth=100.0, interpolate=True):
+    """Mixed-layer mean of one or more profiles.
 
-    Parameters
-    ----------
-    pressure : array Quantity (pressure)
-    values : array Quantity or array-like
-    depth : float
-        Depth in hPa (default 100).
-
-    Returns
-    -------
-    float
+    Supports both the original form ``mixed_layer(pressure, values, depth=...)``
+    and the MetPy-style form ``mixed_layer(pressure, values..., bottom=..., depth=...)``.
     """
-    p = _as_1d(_strip(pressure, "hPa"))
-    v = _as_1d(_strip(values, "")) if hasattr(values, "magnitude") else _as_1d(values)
+    if not args:
+        raise TypeError("mixed_layer requires at least one value profile")
+
+    p_layer = pressure
+    value_layers = args
+    if bottom is not None and abs(_as_float(_strip(bottom, "hPa")) - _as_float(_strip(pressure[0], "hPa"))) > 1e-6:
+        extracted = get_layer(pressure, *args, bottom=bottom, depth=depth, interpolate=interpolate)
+        p_layer, *value_layers = extracted
+
+    p = _as_1d(_strip(p_layer, "hPa"))
     d = _as_float(_strip(depth, "hPa")) if hasattr(depth, "magnitude") else float(depth)
-    return _calc.mixed_layer(p, v, d)
+    results = []
+    for values in value_layers:
+        has_units = hasattr(values, "units")
+        if has_units:
+            unit_obj = values.units
+            v = _as_1d(np.asarray(values.magnitude, dtype=np.float64))
+        elif hasattr(values, "values"):
+            unit_obj = None
+            v = _as_1d(np.asarray(values.values, dtype=np.float64))
+        else:
+            unit_obj = None
+            v = _as_1d(values)
+        mixed = _calc.mixed_layer(p, v, d)
+        results.append(mixed * unit_obj if unit_obj is not None else mixed)
+
+    if len(results) == 1:
+        return results[0]
+    return tuple(results)
 
 
 def mixed_layer_cape_cin(pressure, temperature, dewpoint, depth=100.0):
@@ -1486,7 +1663,7 @@ def mixing_ratio_from_specific_humidity(specific_humidity):
     return _attach(result, "kg/kg")
 
 
-def moist_lapse(pressure, t_start):
+def moist_lapse(pressure, t_start, reference_pressure=None):
     """Moist adiabatic lapse rate temperature profile.
 
     Parameters
@@ -1500,7 +1677,24 @@ def moist_lapse(pressure, t_start):
     """
     p = _as_1d(_strip(pressure, "hPa"))
     t = _as_float(_strip(t_start, "degC"))
-    result = np.asarray(_calc.moist_lapse(p, t))
+    if reference_pressure is None:
+        result = np.asarray(_calc.moist_lapse(p, t))
+    else:
+        ref_p = _as_float(_strip(reference_pressure, "hPa"))
+        if np.isclose(ref_p, p[0]):
+            p_run = np.ascontiguousarray(p)
+            reverse = False
+        elif np.isclose(ref_p, p[-1]):
+            p_run = np.ascontiguousarray(p[::-1])
+            reverse = True
+        else:
+            raise NotImplementedError(
+                "moist_lapse currently supports reference_pressure only when it matches "
+                "the first or last pressure level"
+            )
+        result = np.asarray(_calc.moist_lapse(p_run, t))
+        if reverse:
+            result = result[::-1]
     return result * units.degC
 
 
@@ -2337,7 +2531,9 @@ def divergence(u, v, dx, dy):
     return result * units("1/s")
 
 
-def vorticity(u, v, dx, dy):
+def vorticity(u, v, dx=None, dy=None, x_dim=-1, y_dim=-2,
+              parallel_scale=None, meridional_scale=None,
+              latitude=None, longitude=None, crs=None):
     """Relative vorticity on a 2-D grid.
 
     Parameters
@@ -2349,6 +2545,9 @@ def vorticity(u, v, dx, dy):
     -------
     2-D array Quantity (1/s)
     """
+    dx, dy = _resolve_dx_dy(u, dx=dx, dy=dy, latitude=latitude, longitude=longitude)
+    if dx is None or dy is None:
+        raise TypeError("vorticity requires dx/dy or inferable latitude/longitude coordinates")
     u_f = _flat(u, "m/s")
     v_f = _flat(v, "m/s")
     dx_val = _mean_spacing(dx, "m")
@@ -2357,7 +2556,8 @@ def vorticity(u, v, dx, dy):
     return result * units("1/s")
 
 
-def absolute_vorticity(u, v, lats, dx, dy):
+def absolute_vorticity(u, v, lats=None, dx=None, dy=None, latitude=None,
+                       longitude=None, x_dim=-1, y_dim=-2, crs=None):
     """Absolute vorticity on a 2-D grid.
 
     Parameters
@@ -2370,16 +2570,24 @@ def absolute_vorticity(u, v, lats, dx, dy):
     -------
     2-D array Quantity (1/s)
     """
+    lat_source = lats if lats is not None else latitude
+    dx, dy = _resolve_dx_dy(u, dx=dx, dy=dy, latitude=lat_source, longitude=longitude)
+    if lat_source is None:
+        lat_source, _ = _infer_lat_lon(u, latitude=latitude, longitude=longitude)
+    if dx is None or dy is None or lat_source is None:
+        raise TypeError("absolute_vorticity requires latitude plus dx/dy or inferable coordinates")
     u_f = _flat(u, "m/s")
     v_f = _flat(v, "m/s")
-    lats_f = _flat(lats, "degree") if hasattr(lats, "magnitude") else _flat(lats)
+    lats_f = _flat(lat_source, "degree") if hasattr(lat_source, "magnitude") else _flat(lat_source)
     dx_val = _mean_spacing(dx, "m")
     dy_val = _mean_spacing(dy, "m")
     result = np.asarray(_calc.absolute_vorticity(u_f, v_f, lats_f, dx_val, dy_val))
     return result * units("1/s")
 
 
-def advection(scalar, u, v, dx, dy):
+def advection(scalar, *args, dx=None, dy=None, dz=None, x_dim=-1, y_dim=-2,
+              vertical_dim=-3, parallel_scale=None, meridional_scale=None,
+              latitude=None, longitude=None, crs=None):
     """Advection of a scalar field by a 2-D wind.
 
     Parameters
@@ -2392,6 +2600,31 @@ def advection(scalar, u, v, dx, dy):
     -------
     2-D array Quantity (scalar_units / s)
     """
+    if len(args) == 2:
+        u, v = args
+        w = None
+    elif len(args) == 3:
+        u, v, w = args
+    elif len(args) == 4:
+        u, v, dx_pos, dy_pos = args
+        w = None
+        dx = dx_pos if dx is None else dx
+        dy = dy_pos if dy is None else dy
+    elif len(args) == 5:
+        u, v, w, dx_pos, dy_pos = args
+        dx = dx_pos if dx is None else dx
+        dy = dy_pos if dy is None else dy
+    else:
+        raise TypeError("advection expects (scalar, u, v, ...) with optional dx/dy or 3-D placeholders")
+
+    if w is not None or dz is not None:
+        raise NotImplementedError("3-D advection with w/dz is not yet supported in metrust.advection; use advection_3d")
+
+    dx, dy = _resolve_dx_dy(scalar, dx=dx, dy=dy, latitude=latitude, longitude=longitude)
+    if (dx is None or dy is None) and u is not None:
+        dx, dy = _resolve_dx_dy(u, dx=dx, dy=dy, latitude=latitude, longitude=longitude)
+    if dx is None or dy is None:
+        raise TypeError("advection requires dx/dy or inferable latitude/longitude coordinates")
     has_units = hasattr(scalar, "units")
     s_unit_str = _safe_unit_str(scalar.units) if has_units else "dimensionless"
     s_f = _flat(scalar)
