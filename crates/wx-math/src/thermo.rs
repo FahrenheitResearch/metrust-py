@@ -2166,7 +2166,9 @@ pub fn isentropic_interpolation(
                 }
             }
 
-            // Interpolate each theta level using log-pressure (MetPy-compatible)
+            // Interpolate each theta level using Newton iteration (MetPy-compatible)
+            // MetPy assumes T varies linearly with ln(p), then solves
+            // theta = T * (1000/p)^kappa for p using Newton's method.
             for (ti, &target_theta) in theta_levels.iter().enumerate() {
                 let out_idx = ti * n2d + idx2;
 
@@ -2181,14 +2183,40 @@ pub fn isentropic_interpolation(
                         if dth.abs() < 1e-10 {
                             continue;
                         }
-                        let frac = (target_theta - th_lo) / dth;
-                        // Pressure: interpolate in log-pressure space (MetPy convention)
+
                         let ln_p_lo = col_p[k].ln();
                         let ln_p_hi = col_p[k + 1].ln();
-                        output[0][out_idx] = (ln_p_lo + frac * (ln_p_hi - ln_p_lo)).exp();
-                        // Temperature: interpolate linearly with ln(p) as coordinate
-                        output[1][out_idx] = col_t[k] + frac * (col_t[k + 1] - col_t[k]);
-                        // Other fields: interpolate linearly
+                        let d_ln_p = ln_p_hi - ln_p_lo;
+
+                        if d_ln_p.abs() < 1e-10 {
+                            continue;
+                        }
+
+                        // Linear T model: T = a * ln(p) + b
+                        let a = (col_t[k + 1] - col_t[k]) / d_ln_p;
+                        let b = col_t[k] - a * ln_p_lo;
+                        let pok = 1000.0_f64.powf(ROCP);
+
+                        // Newton iteration to solve: target_theta = T(ln_p) * (1000/p)^kappa
+                        let mut ln_p = (ln_p_lo + ln_p_hi) / 2.0; // initial guess
+                        for _ in 0..50 {
+                            let exner = pok * (-ROCP * ln_p).exp();
+                            let t = a * ln_p + b;
+                            let f = target_theta - t * exner;
+                            let fp = exner * (ROCP * t - a);
+                            if fp.abs() < 1e-30 { break; }
+                            let delta = f / fp;
+                            ln_p -= delta;
+                            if delta.abs() < 1e-10 { break; }
+                        }
+
+                        let p_solved = ln_p.exp();
+                        let t_solved = a * ln_p + b;
+                        output[0][out_idx] = p_solved;
+                        output[1][out_idx] = t_solved;
+
+                        // Other fields: interpolate linearly using the fraction in theta space
+                        let frac = (target_theta - th_lo) / dth;
                         for f in 0..n_fields {
                             output[2 + f][out_idx] = col_fields[f][k]
                                 + frac * (col_fields[f][k + 1] - col_fields[f][k]);
