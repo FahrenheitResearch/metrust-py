@@ -2,16 +2,16 @@
 /// Pure math - no external dependencies. All functions are direct ports of the
 /// SHARPpy-derived implementations used in the Python codebase.
 
-// --- Physical Constants ---
-pub const RD: f64 = 287.058;       // Dry air gas constant (J/(kg*K))
-pub const RV: f64 = 461.5;         // Water vapor gas constant (J/(kg*K))
-pub const CP: f64 = 1005.7;        // Specific heat at constant pressure (J/(kg*K))
-pub const G: f64 = 9.80665;        // Gravitational acceleration (m/s^2)
-pub const ROCP: f64 = 0.28571426;  // Rd/Cp
-pub const ZEROCNK: f64 = 273.15;   // 0 Celsius in Kelvin
+// --- Physical Constants (MetPy-exact values) ---
+pub const RD: f64 = 287.04749097718457;  // Dry air gas constant (J/(kg*K))
+pub const RV: f64 = 461.52311572606084;  // Water vapor gas constant (J/(kg*K))
+pub const CP: f64 = 1004.6662184201462;  // Specific heat at constant pressure (J/(kg*K))
+pub const G: f64 = 9.80665;             // Gravitational acceleration (m/s^2)
+pub const ROCP: f64 = 0.2857142857142857; // Rd/Cp (2/7 exactly)
+pub const ZEROCNK: f64 = 273.15;        // 0 Celsius in Kelvin
 pub const MISSING: f64 = -9999.0;
-pub const EPS: f64 = 0.62197;      // Rd/Rv = Mw/Md (ratio of molecular weights)
-pub const LV: f64 = 2.501e6;         // Latent heat of vaporization (J/kg)
+pub const EPS: f64 = 0.6219569100577033; // Rd/Rv (MetPy epsilon)
+pub const LV: f64 = 2_500_840.0;        // Latent heat of vaporization (J/kg)
 pub const LAPSE_STD: f64 = 0.0065;  // Standard atmosphere lapse rate (K/m)
 pub const P0_STD: f64 = 1013.25;    // Standard sea level pressure (hPa)
 pub const T0_STD: f64 = 288.15;     // Standard sea level temperature (K)
@@ -524,114 +524,83 @@ pub fn cape_cin_core(
     let mut total_cape = 0.0_f64;
     let mut total_cin = 0.0_f64;
 
-    // --- Integrate CIN from Surface (p_start) to LCL (dry adiabat) ---
-    let mut curr_dry_p = p_start;
-    let mut dry_idx = start_idx;
+    // --- Build parcel profile using moist_lapse (MetPy-compatible) ---
+    let theta_dry_k = (t_start + ZEROCNK) * ((1000.0 / p_start).powf(ROCP));
+    let r_parcel = mixratio(p_start, td_start);
+    let w_kgkg = r_parcel / 1000.0;
 
-    while curr_dry_p > p_lcl {
-        // Find next model level
-        let mut next_p = -1.0_f64;
-        let mut temp_idx = dry_idx;
-        while temp_idx < p_prof.len() {
-            if p_prof[temp_idx] < curr_dry_p - 0.01 {
-                next_p = p_prof[temp_idx];
-                dry_idx = temp_idx;
-                break;
-            }
-            temp_idx += 1;
+    // Collect levels above LCL for moist ascent
+    let mut p_moist: Vec<f64> = vec![p_lcl];
+    for &pi in p_prof.iter() {
+        if pi < p_lcl && pi > 0.0 {
+            p_moist.push(pi);
         }
+    }
+    let moist_temps = if p_moist.len() > 1 {
+        moist_lapse(&p_moist, t_lcl)
+    } else {
+        vec![t_lcl]
+    };
 
-        let target_dry_p = if next_p == -1.0 || next_p < p_lcl {
-            p_lcl
+    // Build parcel Tv and environment Tv at each sounding level
+    let n = p_prof.len();
+    let mut tv_parc_arr = vec![f64::NAN; n];
+    let mut tv_env_arr = vec![0.0_f64; n];
+
+    for i in 0..n {
+        if p_prof[i] <= 0.0 { continue; }
+        tv_env_arr[i] = virtual_temp(t_prof[i], p_prof[i], td_prof[i]);
+
+        if p_prof[i] >= p_lcl {
+            // Below LCL: dry adiabat with moisture
+            let t_parc_k = theta_dry_k * ((p_prof[i] / 1000.0).powf(ROCP));
+            let t_parc = t_parc_k - ZEROCNK;
+            tv_parc_arr[i] = (t_parc + ZEROCNK) * (1.0 + w_kgkg / EPS) / (1.0 + w_kgkg) - ZEROCNK;
         } else {
-            next_p
-        };
+            // Above LCL: moist adiabat from moist_lapse
+            let t_parc = interp_log_p(p_prof[i], &p_moist, &moist_temps);
+            tv_parc_arr[i] = virtual_temp(t_parc, p_prof[i], t_parc);
+        }
+    }
 
-        // Standard sub-stepping for the dry layer
-        let p1 = curr_dry_p;
-        let p2 = target_dry_p;
-        let p_mid = (p1 + p2) / 2.0;
+    // Compute height using hypsometric equation
+    let mut z_calc = vec![0.0_f64; n];
+    for i in 1..n {
+        if p_prof[i] <= 0.0 || p_prof[i - 1] <= 0.0 { z_calc[i] = z_calc[i - 1]; continue; }
+        let tv_mean = (tv_env_arr[i - 1] + tv_env_arr[i]) / 2.0 + ZEROCNK;
+        z_calc[i] = z_calc[i - 1] + (RD * tv_mean / G) * (p_prof[i - 1] / p_prof[i]).ln();
+    }
+    // Use provided height_agl if available, else computed
+    let z_use: Vec<f64> = if height_agl.iter().any(|&h| h > 0.0) {
+        height_agl.clone()
+    } else {
+        z_calc
+    };
 
-        // Environment at p_mid
-        let (t_env, td_env) = get_env_at_pres(p_mid, &p_prof, &t_prof, &td_prof);
-        let tv_env = virtual_temp(t_env, p_mid, td_env);
+    // --- Integrate CAPE/CIN: g * (Tv_p - Tv_e) / Tv_e * dz (trapezoidal) ---
+    // Only integrate between surface and top limit
+    let p_top_actual = if p_top_limit > 0.0 { p_top_limit } else { p_prof[n - 1] };
 
-        // Parcel temperature via dry adiabat
-        let theta_start_k = (t_start + ZEROCNK) * ((1000.0 / p_start).powf(ROCP));
-        let t_parc_k = theta_start_k * ((p_mid / 1000.0).powf(ROCP));
-        let t_parc = t_parc_k - ZEROCNK;
+    for i in 1..n {
+        if p_prof[i] <= 0.0 || tv_parc_arr[i].is_nan() || tv_parc_arr[i - 1].is_nan() { continue; }
+        if p_prof[i] < p_top_actual { continue; }
 
-        // Parcel mixing ratio is constant (from starting dewpoint)
-        let r_parcel = mixratio(p_start, td_start);
+        let tv_e_lo = tv_env_arr[i - 1] + ZEROCNK;
+        let tv_e_hi = tv_env_arr[i] + ZEROCNK;
+        let tv_p_lo = tv_parc_arr[i - 1] + ZEROCNK;
+        let tv_p_hi = tv_parc_arr[i] + ZEROCNK;
+        let dz = z_use[i] - z_use[i - 1];
+        if dz.abs() < 1e-6 || tv_e_lo <= 0.0 || tv_e_hi <= 0.0 { continue; }
 
-        // Virtual Temp of Parcel with known W
-        let tv_parc = (t_parc + ZEROCNK) * (1.0 + 0.61 * (r_parcel / 1000.0)) - ZEROCNK;
+        let buoy_lo = (tv_p_lo - tv_e_lo) / tv_e_lo;
+        let buoy_hi = (tv_p_hi - tv_e_hi) / tv_e_hi;
+        let val = G * (buoy_lo + buoy_hi) / 2.0 * dz;
 
-        let val = RD * (tv_parc - tv_env) * (p1 / p2).ln();
-
-        // In the dry layer, only accumulate CIN
-        if val < 0.0 {
+        if val > 0.0 {
+            total_cape += val;
+        } else {
             total_cin += val;
         }
-
-        curr_dry_p = target_dry_p;
-    }
-
-    // --- Integrate from LCL to EL (moist adiabat) ---
-    let mut curr_p = p_lcl;
-    let mut idx = 0;
-    while idx < p_prof.len() && p_prof[idx] > p_lcl {
-        idx += 1;
-    }
-
-    while curr_p > p_top_limit {
-        // Find next model level
-        let mut next_model_p = -1.0_f64;
-        let mut temp_idx = idx;
-        while temp_idx < p_prof.len() {
-            if p_prof[temp_idx] < curr_p - 0.01 {
-                next_model_p = p_prof[temp_idx];
-                idx = temp_idx;
-                break;
-            }
-            temp_idx += 1;
-        }
-
-        let target_p = if next_model_p == -1.0 || next_model_p < p_top_limit {
-            p_top_limit
-        } else {
-            next_model_p
-        };
-
-        let dp_total = curr_p - target_p;
-        let n_steps = if dp_total > 10.0 {
-            (dp_total / 10.0) as usize + 1
-        } else {
-            1
-        };
-        let step_size = dp_total / n_steps as f64;
-
-        for k in 0..n_steps {
-            let p1 = curr_p - k as f64 * step_size;
-            let p2 = curr_p - (k + 1) as f64 * step_size;
-            let p_mid = (p1 + p2) / 2.0;
-
-            let (t_env, td_env) = get_env_at_pres(p_mid, &p_prof, &t_prof, &td_prof);
-            let tv_env = virtual_temp(t_env, p_mid, td_env);
-
-            let t_parc = satlift(p_mid, thetam);
-            let tv_parc = virtual_temp(t_parc, p_mid, t_parc);
-
-            let val = RD * (tv_parc - tv_env) * (p1 / p2).ln();
-
-            if val > 0.0 {
-                total_cape += val;
-            } else {
-                total_cin += val;
-            }
-        }
-
-        curr_p = target_p;
     }
 
     (total_cape, total_cin, h_lcl, h_lfc)
@@ -1797,44 +1766,88 @@ fn cape_cin_from_parcel(
     p: &[f64], t: &[f64], td: &[f64],
     p_start: f64, t_start: f64, td_start: f64,
 ) -> (f64, f64) {
+    // Compute LCL
     let (p_lcl, t_lcl) = drylift(p_start, t_start, td_start);
 
-    let theta_k = (t_lcl + ZEROCNK) * ((1000.0 / p_lcl).powf(ROCP));
-    let theta_c = theta_k - ZEROCNK;
-    let thetam = theta_c - wobf(theta_c) + wobf(t_lcl);
-
+    // Build full parcel profile using moist_lapse (MetPy-compatible RK4)
     let theta_dry_k = (t_start + ZEROCNK) * ((1000.0 / p_start).powf(ROCP));
     let r_parcel = mixratio(p_start, td_start);
 
+    // Collect pressure levels at and above LCL for moist ascent
+    let mut p_moist: Vec<f64> = Vec::new();
+    p_moist.push(p_lcl);
+    for &pi in p.iter() {
+        if pi < p_lcl && pi > 0.0 {
+            p_moist.push(pi);
+        }
+    }
+    let moist_profile = if p_moist.len() > 1 {
+        moist_lapse(&p_moist, t_lcl)
+    } else {
+        vec![t_lcl]
+    };
+
+    // Build parcel Tv at each sounding level
+    let n = p.len();
+    let mut tv_parcel = vec![0.0_f64; n];
+    for i in 0..n {
+        if p[i] <= 0.0 {
+            tv_parcel[i] = f64::NAN;
+            continue;
+        }
+        if p[i] >= p_lcl {
+            // Below LCL: dry adiabat with moisture
+            let t_parc_k = theta_dry_k * ((p[i] / 1000.0).powf(ROCP));
+            let t_parc = t_parc_k - ZEROCNK;
+            // Virtual temperature correction for moisture
+            let w_kgkg = r_parcel / 1000.0; // g/kg to kg/kg
+            tv_parcel[i] = (t_parc + ZEROCNK) * (1.0 + w_kgkg / EPS) / (1.0 + w_kgkg) - ZEROCNK;
+        } else {
+            // Above LCL: interpolate from moist_lapse profile
+            let t_parc = interp_log_p(p[i], &p_moist, &moist_profile);
+            // Saturated: dewpoint = temperature
+            tv_parcel[i] = virtual_temp(t_parc, p[i], t_parc);
+        }
+    }
+
+    // Build environment Tv at each level
+    let mut tv_env = vec![0.0_f64; n];
+    for i in 0..n {
+        tv_env[i] = virtual_temp(t[i], p[i], td[i]);
+    }
+
+    // Compute height from pressure using hypsometric equation
+    let mut z = vec![0.0_f64; n];
+    for i in 1..n {
+        if p[i] <= 0.0 || p[i - 1] <= 0.0 {
+            z[i] = z[i - 1];
+            continue;
+        }
+        let tv_mean = (tv_env[i - 1] + tv_env[i]) / 2.0 + ZEROCNK;
+        z[i] = z[i - 1] + (RD * tv_mean / G) * (p[i - 1] / p[i]).ln();
+    }
+
+    // Integrate CAPE/CIN using MetPy's formula: g * (Tv_p - Tv_e) / Tv_e * dz
+    // Trapezoidal rule
     let mut cape = 0.0_f64;
     let mut cin = 0.0_f64;
 
-    for i in 1..p.len() {
-        let p1 = p[i - 1];
-        let p2 = p[i];
-        if p1 <= 0.0 || p2 <= 0.0 {
+    for i in 1..n {
+        if p[i] <= 0.0 || tv_parcel[i].is_nan() || tv_parcel[i - 1].is_nan() {
             continue;
         }
-        let p_mid = (p1 + p2) / 2.0;
-
-        // Environment Tv
-        let td_mid = (td[i - 1] + td[i]) / 2.0;
-        let t_mid = (t[i - 1] + t[i]) / 2.0;
-        let tv_env = virtual_temp(t_mid, p_mid, td_mid);
-
-        // Parcel Tv
-        let tv_parcel = if p_mid > p_lcl {
-            // Below LCL: dry adiabat
-            let t_parc_k = theta_dry_k * ((p_mid / 1000.0).powf(ROCP));
-            let t_parc = t_parc_k - ZEROCNK;
-            (t_parc + ZEROCNK) * (1.0 + 0.61 * (r_parcel / 1000.0)) - ZEROCNK
-        } else {
-            // Above LCL: moist adiabat
-            let t_parc = satlift(p_mid, thetam);
-            virtual_temp(t_parc, p_mid, t_parc)
-        };
-
-        let val = RD * (tv_parcel - tv_env) * (p1 / p2).ln();
+        let tv_e_lo = tv_env[i - 1] + ZEROCNK;
+        let tv_e_hi = tv_env[i] + ZEROCNK;
+        let tv_p_lo = tv_parcel[i - 1] + ZEROCNK;
+        let tv_p_hi = tv_parcel[i] + ZEROCNK;
+        let dz = z[i] - z[i - 1];
+        if dz.abs() < 1e-6 || tv_e_lo <= 0.0 || tv_e_hi <= 0.0 {
+            continue;
+        }
+        // Trapezoidal: average buoyancy at top and bottom of layer
+        let buoy_lo = (tv_p_lo - tv_e_lo) / tv_e_lo;
+        let buoy_hi = (tv_p_hi - tv_e_hi) / tv_e_hi;
+        let val = G * (buoy_lo + buoy_hi) / 2.0 * dz;
         if val > 0.0 {
             cape += val;
         } else {
@@ -1843,6 +1856,24 @@ fn cape_cin_from_parcel(
     }
 
     (cape, cin)
+}
+
+/// Interpolate temperature at pressure level p_target from a profile using log-pressure.
+fn interp_log_p(p_target: f64, p_prof: &[f64], t_prof: &[f64]) -> f64 {
+    let n = p_prof.len();
+    if n == 0 { return 0.0; }
+    if p_target >= p_prof[0] { return t_prof[0]; }
+    if p_target <= p_prof[n - 1] { return t_prof[n - 1]; }
+    for i in 1..n {
+        if p_prof[i] <= p_target {
+            let log_p0 = p_prof[i - 1].ln();
+            let log_p1 = p_prof[i].ln();
+            let log_pt = p_target.ln();
+            let frac = (log_pt - log_p0) / (log_p1 - log_p0);
+            return t_prof[i - 1] + frac * (t_prof[i] - t_prof[i - 1]);
+        }
+    }
+    t_prof[n - 1]
 }
 
 /// Bunkers storm motion vectors.
