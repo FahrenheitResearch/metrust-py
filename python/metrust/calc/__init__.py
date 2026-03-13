@@ -1739,22 +1739,61 @@ def moist_static_energy(height, temperature, specific_humidity):
     return result * units("J/kg")
 
 
-def montgomery_streamfunction(theta, pressure, temperature, height):
-    """Montgomery streamfunction.
+def montgomery_streamfunction(height_or_theta, temperature_or_pressure=None,
+                              temperature=None, height=None):
+    """Montgomery streamfunction on isentropic surfaces.
+
+    MetPy form: ``montgomery_streamfunction(height, temperature)``
+    Legacy form: ``montgomery_streamfunction(theta, pressure, temperature, height)``
 
     Parameters
     ----------
-    theta : Quantity (K)
-    pressure : Quantity (pressure)
-    temperature : Quantity (K)
     height : Quantity (m)
+        Geopotential height on isentropic surface.
+    temperature : Quantity (K)
+        Temperature on isentropic surface.
 
     Returns
     -------
     Quantity (J/kg)
+        Montgomery streamfunction: M = c_p * T + g * z
     """
-    result = _vec_call(_calc.montgomery_streamfunction, _strip(theta, "K"), _strip(pressure, "hPa"), _strip(temperature, "K"), _strip(height, "m"))
-    return result * units("J/kg")
+    if temperature is not None and height is not None:
+        # Explicit keyword form
+        h = temperature_or_pressure  # actually height passed as 1st positional
+        t = temperature
+        # Hmm, ambiguous. Let's handle all cases below.
+        pass
+
+    if temperature_or_pressure is not None and temperature is None and height is None:
+        # 2-arg MetPy form: (height, temperature)
+        h_val = _strip(height_or_theta, "m")
+        t_val = _strip(temperature_or_pressure, "K")
+        # M = c_p * T + g * z  (MetPy-exact constants)
+        cp = 1004.6662184201462  # J/(kg*K), matches MetPy Cp_d
+        g = 9.80665  # m/s^2
+        h_arr = np.asarray(h_val, dtype=np.float64)
+        t_arr = np.asarray(t_val, dtype=np.float64)
+        result = cp * t_arr + g * h_arr
+        if hasattr(height_or_theta, "coords") and hasattr(height_or_theta, "dims"):
+            import xarray as xr
+            return xr.DataArray(result, coords=height_or_theta.coords,
+                                dims=height_or_theta.dims,
+                                attrs={"units": "J/kg"})
+        return result * units("J/kg")
+    elif temperature is not None and height is not None:
+        # 4-arg legacy form: (theta, pressure, temperature, height)
+        result = _vec_call(_calc.montgomery_streamfunction,
+                           _strip(height_or_theta, "K"),
+                           _strip(temperature_or_pressure, "hPa"),
+                           _strip(temperature, "K"),
+                           _strip(height, "m"))
+        return result * units("J/kg")
+    else:
+        raise TypeError(
+            "montgomery_streamfunction expects (height, temperature) or "
+            "(theta, pressure, temperature, height)"
+        )
 
 
 def most_unstable_cape_cin(pressure, temperature, dewpoint, depth=300, **kwargs):

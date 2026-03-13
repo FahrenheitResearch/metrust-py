@@ -1,6 +1,6 @@
 [package]
 name = "metrust"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
 description = "A pure-Rust drop-in replacement for MetPy — meteorological calculations, data I/O, and visualization"
 license = "MIT"
