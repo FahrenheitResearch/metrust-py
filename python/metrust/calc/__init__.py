@@ -23,6 +23,7 @@ Rust-native conventions
 """
 
 import numpy as np
+import xarray as xr
 from metrust._metrust import calc as _calc
 from metrust.units import units, _strip, _strip_or_none, _attach, _as_float, _as_1d
 
@@ -83,6 +84,16 @@ def _prep(*values):
     arrays = [np.asarray(v, dtype=np.float64) for v in values]
     if all(a.ndim == 0 for a in arrays):
         return [float(a) for a in arrays], (), False
+    target_ndim = max(a.ndim for a in arrays)
+    if target_ndim > 1:
+        leading_dim = next((a.shape[0] for a in arrays if a.ndim == target_ndim), None)
+        if leading_dim is not None:
+            promoted = []
+            for a in arrays:
+                if a.ndim == 1 and a.shape[0] == leading_dim:
+                    a = a.reshape((a.shape[0],) + (1,) * (target_ndim - 1))
+                promoted.append(a)
+            arrays = promoted
     shapes = [a.shape for a in arrays if a.ndim > 0]
     orig_shape = np.broadcast_shapes(*shapes)
     flat = [np.ascontiguousarray(np.broadcast_to(a, orig_shape).ravel()) for a in arrays]
@@ -162,6 +173,19 @@ def _resolve_dx_dy(data, dx=None, dy=None, latitude=None, longitude=None):
         return dx, dy
 
     return lat_lon_grid_deltas(lat_arr, lon_arr)
+
+
+def _wrap_result_like(template, values, unit_str=None):
+    arr = np.asarray(values, dtype=np.float64)
+    template_shape = np.asarray(template).shape
+    if arr.shape != template_shape:
+        arr = arr.reshape(template_shape)
+    if hasattr(template, "coords") and hasattr(template, "dims"):
+        result = xr.DataArray(arr, coords=template.coords, dims=template.dims)
+        if unit_str is not None:
+            result.attrs["units"] = unit_str
+        return result
+    return arr * units(unit_str) if unit_str is not None else arr
 
 
 def _vec_call(fn, *stripped_args):
@@ -2511,7 +2535,8 @@ def _safe_unit_str(unit_obj):
     return str(unit_obj)
 
 
-def divergence(u, v, dx, dy):
+def divergence(u, v, dx=None, dy=None, x_dim=-1, y_dim=-2, parallel_scale=None,
+               meridional_scale=None, latitude=None, longitude=None, crs=None):
     """Horizontal divergence on a 2-D grid.
 
     Parameters
@@ -2523,12 +2548,28 @@ def divergence(u, v, dx, dy):
     -------
     2-D array Quantity (1/s)
     """
-    u_f = _flat(u, "m/s")
-    v_f = _flat(v, "m/s")
+    dx, dy = _resolve_dx_dy(u, dx=dx, dy=dy, latitude=latitude, longitude=longitude)
+    if (dx is None or dy is None) and v is not None:
+        dx, dy = _resolve_dx_dy(v, dx=dx, dy=dy, latitude=latitude, longitude=longitude)
+    if dx is None or dy is None:
+        raise TypeError("divergence requires dx/dy or inferable latitude/longitude coordinates")
+    u_arr = np.asarray(_strip(u, "m/s"), dtype=np.float64)
+    v_arr = np.asarray(_strip(v, "m/s"), dtype=np.float64)
     dx_val = _mean_spacing(dx, "m")
     dy_val = _mean_spacing(dy, "m")
-    result = np.asarray(_calc.divergence(u_f, v_f, dx_val, dy_val))
-    return result * units("1/s")
+    if u_arr.ndim == 2:
+        result = np.asarray(_calc.divergence(np.ascontiguousarray(u_arr), np.ascontiguousarray(v_arr), dx_val, dy_val))
+        return _wrap_result_like(u, result, "1/s")
+    lead_shape = u_arr.shape[:-2]
+    ny, nx = u_arr.shape[-2:]
+    result = np.empty(u_arr.shape, dtype=np.float64)
+    u_flat = u_arr.reshape((-1, ny, nx))
+    v_flat = v_arr.reshape((-1, ny, nx))
+    for idx in range(u_flat.shape[0]):
+        result.reshape((-1, ny, nx))[idx] = np.asarray(
+            _calc.divergence(np.ascontiguousarray(u_flat[idx]), np.ascontiguousarray(v_flat[idx]), dx_val, dy_val)
+        ).reshape((ny, nx))
+    return _wrap_result_like(u, result, "1/s")
 
 
 def vorticity(u, v, dx=None, dy=None, x_dim=-1, y_dim=-2,
@@ -2626,17 +2667,20 @@ def advection(scalar, *args, dx=None, dy=None, dz=None, x_dim=-1, y_dim=-2,
     if dx is None or dy is None:
         raise TypeError("advection requires dx/dy or inferable latitude/longitude coordinates")
     has_units = hasattr(scalar, "units")
-    s_unit_str = _safe_unit_str(scalar.units) if has_units else "dimensionless"
     s_f = _flat(scalar)
     u_f = _flat(u, "m/s")
     v_f = _flat(v, "m/s")
     dx_val = _mean_spacing(dx, "m")
     dy_val = _mean_spacing(dy, "m")
     result = np.asarray(_calc.advection(s_f, u_f, v_f, dx_val, dy_val))
-    return result * units(f"({s_unit_str}) / s")
+    if has_units:
+        return result * (scalar.units / units.s)
+    return result / units.s
 
 
-def frontogenesis(theta, u, v, dx, dy):
+def frontogenesis(theta, u, v, dx=None, dy=None, x_dim=-1, y_dim=-2,
+                  parallel_scale=None, meridional_scale=None,
+                  latitude=None, longitude=None, crs=None):
     """2-D Petterssen frontogenesis function.
 
     Parameters
@@ -2649,6 +2693,11 @@ def frontogenesis(theta, u, v, dx, dy):
     -------
     2-D array Quantity (K/m/s)
     """
+    dx, dy = _resolve_dx_dy(theta, dx=dx, dy=dy, latitude=latitude, longitude=longitude)
+    if (dx is None or dy is None) and u is not None:
+        dx, dy = _resolve_dx_dy(u, dx=dx, dy=dy, latitude=latitude, longitude=longitude)
+    if dx is None or dy is None:
+        raise TypeError("frontogenesis requires dx/dy or inferable latitude/longitude coordinates")
     t_f = _flat(theta, "K")
     u_f = _flat(u, "m/s")
     v_f = _flat(v, "m/s")
@@ -2658,7 +2707,9 @@ def frontogenesis(theta, u, v, dx, dy):
     return result * units("K/m/s")
 
 
-def geostrophic_wind(heights, lats, dx, dy):
+def geostrophic_wind(heights, dx=None, dy=None, latitude=None, x_dim=-1, y_dim=-2,
+                     parallel_scale=None, meridional_scale=None,
+                     longitude=None, crs=None):
     """Geostrophic wind from geopotential height.
 
     Parameters
@@ -2671,8 +2722,21 @@ def geostrophic_wind(heights, lats, dx, dy):
     -------
     tuple of (2-D array Quantity (m/s), 2-D array Quantity (m/s))
     """
-    h_f = _flat(heights, "m")
-    lats_f = _flat(lats, "degree") if hasattr(lats, "magnitude") else _flat(lats)
+    if latitude is not None and dx is not None and dy is not None:
+        old_style = False
+        try:
+            old_style = (_can_convert(latitude, "m") and np.ndim(_coord_values(dx)) > 0)
+        except Exception:
+            old_style = False
+        if old_style:
+            latitude, dx, dy = dx, dy, latitude
+    if latitude is None:
+        latitude, _ = _infer_lat_lon(heights, latitude=latitude, longitude=longitude)
+    dx, dy = _resolve_dx_dy(heights, dx=dx, dy=dy, latitude=latitude, longitude=longitude)
+    if dx is None or dy is None or latitude is None:
+        raise TypeError("geostrophic_wind requires latitude plus dx/dy or inferable coordinates")
+    h_f = _as_2d(heights, "m")
+    lats_f = _as_2d(latitude, "degree") if hasattr(latitude, "magnitude") else _as_2d(latitude)
     dx_val = _mean_spacing(dx, "m")
     dy_val = _mean_spacing(dy, "m")
     u_g, v_g = _calc.geostrophic_wind(h_f, lats_f, dx_val, dy_val)
@@ -2712,8 +2776,9 @@ def ageostrophic_wind(u, v, heights, lats, dx, dy):
     return np.asarray(ua).reshape(orig_shape) * ms, np.asarray(va).reshape(orig_shape) * ms
 
 
-def potential_vorticity_baroclinic(potential_temp, pressure, theta_below,
-                                   theta_above, u, v, lats, dx, dy):
+def potential_vorticity_baroclinic(potential_temp, pressure, *args, dx=None, dy=None,
+                                   latitude=None, x_dim=-1, y_dim=-2, vertical_dim=-3,
+                                   longitude=None, crs=None):
     """Baroclinic (Ertel) potential vorticity on a 2-D isobaric slice.
 
     Parameters
@@ -2731,23 +2796,65 @@ def potential_vorticity_baroclinic(potential_temp, pressure, theta_below,
     -------
     2-D array Quantity (K*m^2/(kg*s))
     """
-    ny, nx = _grid_shape(potential_temp)
-    pt_f = _flat(potential_temp, "K")
-    tb_f = _flat(theta_below, "K")
-    ta_f = _flat(theta_above, "K")
-    u_f = _flat(u, "m/s")
-    v_f = _flat(v, "m/s")
-    lats_f = _flat(lats, "degree") if hasattr(lats, "magnitude") else _flat(lats)
+    if len(args) == 2:
+        u, v = args
+        dx, dy = _resolve_dx_dy(potential_temp, dx=dx, dy=dy, latitude=latitude, longitude=longitude)
+        if (dx is None or dy is None) and u is not None:
+            dx, dy = _resolve_dx_dy(u, dx=dx, dy=dy, latitude=latitude, longitude=longitude)
+        if latitude is None:
+            latitude, _ = _infer_lat_lon(potential_temp, latitude=latitude, longitude=longitude)
+            if latitude is None:
+                latitude, _ = _infer_lat_lon(u, latitude=latitude, longitude=longitude)
+        if dx is None or dy is None or latitude is None:
+            raise TypeError("potential_vorticity_baroclinic requires latitude plus dx/dy or inferable coordinates")
+        pt_arr = np.asarray(_strip(potential_temp, "K"), dtype=np.float64)
+        u_arr = np.asarray(_strip(u, "m/s"), dtype=np.float64)
+        v_arr = np.asarray(_strip(v, "m/s"), dtype=np.float64)
+        lat_arr = np.asarray(_strip(latitude, "degree"), dtype=np.float64) if hasattr(latitude, "magnitude") else np.asarray(latitude, dtype=np.float64)
+        p_arr = np.asarray(_strip(pressure, "Pa"), dtype=np.float64) if hasattr(pressure, "magnitude") else np.asarray(pressure, dtype=np.float64)
+        pt_arr = np.moveaxis(pt_arr, vertical_dim, 0)
+        u_arr = np.moveaxis(u_arr, vertical_dim, 0)
+        v_arr = np.moveaxis(v_arr, vertical_dim, 0)
+        if lat_arr.ndim == pt_arr.ndim:
+            lat_arr = np.moveaxis(lat_arr, vertical_dim, 0)
+        if p_arr.ndim == pt_arr.ndim:
+            p_levels = np.moveaxis(p_arr, vertical_dim, 0)[..., 0, 0]
+        else:
+            p_levels = p_arr.reshape(-1)
+        dx_val = _mean_spacing(dx, "m")
+        dy_val = _mean_spacing(dy, "m")
+        result = np.full(pt_arr.shape, np.nan, dtype=np.float64)
+        for idx in range(1, pt_arr.shape[0] - 1):
+            lat_slice = lat_arr[idx] if lat_arr.ndim == pt_arr.ndim else lat_arr
+            result[idx] = np.asarray(_calc.potential_vorticity_baroclinic(
+                np.ascontiguousarray(pt_arr[idx]),
+                np.asarray([p_levels[idx - 1], p_levels[idx + 1]], dtype=np.float64),
+                np.ascontiguousarray(pt_arr[idx - 1]),
+                np.ascontiguousarray(pt_arr[idx + 1]),
+                np.ascontiguousarray(u_arr[idx]),
+                np.ascontiguousarray(v_arr[idx]),
+                np.ascontiguousarray(lat_slice),
+                dx_val,
+                dy_val,
+            )).reshape(pt_arr.shape[-2:])
+        result = np.moveaxis(result, 0, vertical_dim)
+        template = potential_temp if hasattr(potential_temp, "coords") and hasattr(potential_temp, "dims") else u
+        return _wrap_result_like(template, result, "K*m**2/(kg*s)")
+    if len(args) != 7:
+        raise TypeError("potential_vorticity_baroclinic expects either (theta, pressure, u, v, ...) or the legacy 2-D form")
+    theta_below, theta_above, u, v, lats, dx_pos, dy_pos = args
+    dx = dx_pos if dx is None else dx
+    dy = dy_pos if dy is None else dy
+    pt_f = _as_2d(potential_temp, "K")
+    tb_f = _as_2d(theta_below, "K")
+    ta_f = _as_2d(theta_above, "K")
+    u_f = _as_2d(u, "m/s")
+    v_f = _as_2d(v, "m/s")
+    lats_f = _as_2d(lats, "degree") if hasattr(lats, "magnitude") else _as_2d(lats)
     dx_val = _mean_spacing(dx, "m")
     dy_val = _mean_spacing(dy, "m")
-    # Rust expects Pa for the pressure pair
-    if hasattr(pressure, "magnitude"):
-        p_arr = np.asarray(pressure.to("Pa").magnitude, dtype=np.float64)
-    else:
-        p_arr = np.asarray(pressure, dtype=np.float64)
-    result = np.asarray(_calc.potential_vorticity_baroclinic(
-        pt_f, p_arr, tb_f, ta_f, u_f, v_f, lats_f, dx_val, dy_val,
-    ))
+    p_arr = np.asarray(_strip(pressure, "Pa"), dtype=np.float64) if hasattr(pressure, "magnitude") else np.asarray(pressure, dtype=np.float64)
+    result = np.asarray(_calc.potential_vorticity_baroclinic(pt_f, p_arr, tb_f, ta_f, u_f, v_f, lats_f, dx_val, dy_val))
     return result * units("K*m**2/(kg*s)")
 
 
@@ -2886,8 +2993,9 @@ def coriolis_parameter(latitude):
     -------
     Quantity (1/s)
     """
-    lat = _as_float(_strip(latitude, "degree")) if hasattr(latitude, "magnitude") else float(latitude)
-    return _calc.coriolis_parameter(lat) * units("1/s")
+    lat_stripped = _strip(latitude, "degree") if hasattr(latitude, "magnitude") else latitude
+    result = _vec_call(_calc.coriolis_parameter, lat_stripped)
+    return _attach(result, "1/s")
 
 
 def cross_section_components(u, v, start_lat, start_lon, end_lat, end_lon):
@@ -2993,8 +3101,13 @@ def q_vector(u, v, temperature, pressure, dx=None, dy=None, **kwargs):
     -------
     tuple of (2-D array, 2-D array)
     """
+    latitude = kwargs.get("latitude")
+    longitude = kwargs.get("longitude")
+    dx, dy = _resolve_dx_dy(temperature, dx=dx, dy=dy, latitude=latitude, longitude=longitude)
+    if (dx is None or dy is None) and u is not None:
+        dx, dy = _resolve_dx_dy(u, dx=dx, dy=dy, latitude=latitude, longitude=longitude)
     if dx is None or dy is None:
-        raise TypeError("q_vector requires dx and dy grid spacings")
+        raise TypeError("q_vector requires dx/dy or inferable latitude/longitude coordinates")
     t_2d = _as_2d(temperature, "K") if _can_convert(temperature, "K") else _as_2d(temperature, "degC")
     u_2d = _as_2d(u, "m/s")
     v_2d = _as_2d(v, "m/s")
@@ -3002,7 +3115,7 @@ def q_vector(u, v, temperature, pressure, dx=None, dy=None, **kwargs):
     dx_val = _mean_spacing(dx, "m")
     dy_val = _mean_spacing(dy, "m")
     q1, q2 = _calc.q_vector(t_2d, u_2d, v_2d, p_val, dx_val, dy_val)
-    return np.asarray(q1), np.asarray(q2)
+    return _wrap_result_like(u, q1), _wrap_result_like(v, q2)
 
 
 def shear_vorticity(u, v, dx, dy):
@@ -3813,7 +3926,7 @@ def laplacian(data, dx, dy):
     return result
 
 
-def first_derivative(data, axis_spacing, axis=0):
+def first_derivative(data, axis_spacing=None, axis=0, x=None, delta=None):
     """First derivative along a chosen axis.
 
     Parameters
@@ -3828,14 +3941,22 @@ def first_derivative(data, axis_spacing, axis=0):
     """
     has_units = hasattr(data, "units")
     d_arr = np.asarray(data.magnitude if has_units else data, dtype=np.float64)
-    ds = _as_float(_strip(axis_spacing, "m"))
+    if delta is not None:
+        axis_spacing = delta
+    elif x is not None and axis_spacing is None:
+        axis_spacing = x
+    if axis_spacing is None:
+        raise TypeError("first_derivative requires axis spacing via axis_spacing, x, or delta")
+    ds = _mean_spacing(axis_spacing, "m")
     result = np.asarray(_calc.first_derivative(d_arr, ds, int(axis)))
     if has_units:
         return result * (data.units / units.m)
+    if hasattr(axis_spacing, "magnitude"):
+        return result / units.m
     return result
 
 
-def second_derivative(data, axis_spacing, axis=0):
+def second_derivative(data, axis_spacing=None, axis=0, x=None, delta=None):
     """Second derivative along a chosen axis.
 
     Parameters
@@ -3850,14 +3971,22 @@ def second_derivative(data, axis_spacing, axis=0):
     """
     has_units = hasattr(data, "units")
     d_arr = np.asarray(data.magnitude if has_units else data, dtype=np.float64)
-    ds = _as_float(_strip(axis_spacing, "m"))
+    if delta is not None:
+        axis_spacing = delta
+    elif x is not None and axis_spacing is None:
+        axis_spacing = x
+    if axis_spacing is None:
+        raise TypeError("second_derivative requires axis spacing via axis_spacing, x, or delta")
+    ds = _mean_spacing(axis_spacing, "m")
     result = np.asarray(_calc.second_derivative(d_arr, ds, int(axis)))
     if has_units:
         return result * (data.units / units.m ** 2)
+    if hasattr(axis_spacing, "magnitude"):
+        return result / units.m ** 2
     return result
 
 
-def lat_lon_grid_deltas(lats, lons):
+def lat_lon_grid_deltas(longitude, latitude, x_dim=-1, y_dim=-2, geod=None):
     """Physical grid spacings (dx, dy) in meters from lat/lon grids.
 
     Parameters
@@ -3869,10 +3998,14 @@ def lat_lon_grid_deltas(lats, lons):
     -------
     tuple of (2-D array Quantity (m), 2-D array Quantity (m))
     """
-    lat_arr = np.asarray(lats.magnitude if hasattr(lats, "magnitude") else lats,
+    lon_arr = np.asarray(longitude.magnitude if hasattr(longitude, "magnitude") else longitude,
                          dtype=np.float64)
-    lon_arr = np.asarray(lons.magnitude if hasattr(lons, "magnitude") else lons,
+    lat_arr = np.asarray(latitude.magnitude if hasattr(latitude, "magnitude") else latitude,
                          dtype=np.float64)
+    if np.nanmax(np.abs(lon_arr)) <= 90 and np.nanmax(np.abs(lat_arr)) > 90:
+        lon_arr, lat_arr = lat_arr, lon_arr
+    if lon_arr.ndim == 1 and lat_arr.ndim == 1:
+        lon_arr, lat_arr = np.meshgrid(lon_arr, lat_arr)
     dx, dy = _calc.lat_lon_grid_deltas(lat_arr, lon_arr)
     return np.asarray(dx) * units.m, np.asarray(dy) * units.m
 

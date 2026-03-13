@@ -159,3 +159,100 @@ def test_grid_deltas_can_be_inferred_from_coords():
     assert adv.shape == (3, 4)
     assert vort.units == mp_units("1/s")
     assert adv.units == mp_units("1/s")
+
+
+def test_qvector_and_frontogenesis_infer_dxdy_from_coords():
+    lat2d = np.array(
+        [
+            [35.0, 35.0, 35.0],
+            [35.5, 35.5, 35.5],
+            [36.0, 36.0, 36.0],
+        ]
+    )
+    lon2d = np.array(
+        [
+            [-98.0, -97.5, -97.0],
+            [-98.0, -97.5, -97.0],
+            [-98.0, -97.5, -97.0],
+        ]
+    )
+    coords = {
+        "latitude": (("y", "x"), lat2d),
+        "longitude": (("y", "x"), lon2d),
+    }
+    u = xr.DataArray(np.full((3, 3), 12.0), dims=("y", "x"), coords=coords)
+    v = xr.DataArray(np.full((3, 3), 6.0), dims=("y", "x"), coords=coords)
+    temperature = xr.DataArray(np.full((3, 3), 290.0), dims=("y", "x"), coords=coords)
+
+    qx, qy = mcalc.q_vector(u, v, temperature, 850 * mp_units.hPa)
+    qdiv = mcalc.divergence(qx, qy)
+    theta = mcalc.potential_temperature(850 * mp_units.hPa, temperature * mp_units.degC)
+    fronto = mcalc.frontogenesis(theta, u, v)
+
+    assert qx.dims == ("y", "x")
+    assert qy.dims == ("y", "x")
+    assert qdiv.dims == ("y", "x")
+    assert qdiv.attrs["units"] == "1/s"
+    assert fronto.shape == (3, 3)
+
+
+def test_geostrophic_coriolis_and_first_derivative_metpy_forms():
+    lats = np.linspace(35, 37, 3)
+    lons = np.linspace(-98, -96, 3)
+    lon2d, lat2d = np.meshgrid(lons, lats)
+    dx, dy = mcalc.lat_lon_grid_deltas(lons * mp_units.degrees, lats * mp_units.degrees)
+    heights = np.array(
+        [
+            [5600.0, 5610.0, 5620.0],
+            [5590.0, 5600.0, 5610.0],
+            [5580.0, 5590.0, 5600.0],
+        ]
+    ) * mp_units.meter
+
+    coriolis = mcalc.coriolis_parameter(lat2d * mp_units.degrees)
+    u_geo, v_geo = mcalc.geostrophic_wind(heights, dx=dx, dy=dy, latitude=lat2d * mp_units.degrees)
+    fd = mcalc.first_derivative(np.arange(9.0).reshape(3, 3), axis=1, delta=dx)
+
+    assert coriolis.shape == (3, 3)
+    assert u_geo.shape == v_geo.shape == (3, 3)
+    assert fd.units == 1 / mp_units.m
+
+
+def test_baroclinic_pv_metpy_signature_preserves_xarray_coords():
+    lat2d = np.array([[35.0, 35.0], [36.0, 36.0]])
+    lon2d = np.array([[-98.0, -97.0], [-98.0, -97.0]])
+    vertical = xr.DataArray(
+        np.array([850.0, 700.0, 500.0]),
+        dims=("vertical",),
+        attrs={"units": "hPa"},
+    )
+    coords = {
+        "vertical": vertical,
+        "latitude": (("y", "x"), lat2d),
+        "longitude": (("y", "x"), lon2d),
+    }
+    theta = xr.DataArray(
+        np.broadcast_to(np.array([300.0, 305.0, 310.0])[:, None, None], (3, 2, 2)),
+        dims=("vertical", "y", "x"),
+        coords=coords,
+    )
+    u = xr.DataArray(np.ones((3, 2, 2)), dims=("vertical", "y", "x"), coords=coords)
+    v = xr.DataArray(np.ones((3, 2, 2)), dims=("vertical", "y", "x"), coords=coords)
+
+    pv = mcalc.potential_vorticity_baroclinic(theta, vertical * mp_units.hPa, u, v)
+    pv_700 = pv.metpy.sel(vertical=700 * mp_units.hPa)
+
+    assert pv.dims == ("vertical", "y", "x")
+    assert pv.attrs["units"] == "K*m**2/(kg*s)"
+    assert pv_700.shape == (2, 2)
+
+
+def test_advection_handles_compound_scalar_units():
+    scalar = np.full((3, 4), 1.0) / mp_units.s
+    u = np.full((3, 4), 10.0) * mp_units("m/s")
+    v = np.full((3, 4), 5.0) * mp_units("m/s")
+
+    adv = mcalc.advection(scalar, u, v, dx=100000 * mp_units.m, dy=100000 * mp_units.m)
+
+    assert adv.shape == (3, 4)
+    assert adv.units == 1 / (mp_units.s ** 2)
