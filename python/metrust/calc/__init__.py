@@ -500,7 +500,34 @@ def cape_cin(pressure, temperature, dewpoint, parcel_profile_or_height=None,
     p = _as_1d(_strip(pressure, "hPa"))
     t = _as_1d(_strip(temperature, "degC"))
     td = _as_1d(_strip(dewpoint, "degC"))
-    h = _as_1d(_strip(parcel_profile_or_height, "m"))
+
+    # Detect whether the 4th arg is height (length units) or parcel profile (temperature units).
+    # MetPy's cape_cin signature is cape_cin(p, T, Td, parcel_profile).
+    fourth = parcel_profile_or_height
+    if fourth is not None and _is_temperature_like(fourth):
+        # MetPy calling convention: 4th arg is a parcel temperature profile.
+        # Derive height from pressure via standard atmosphere and let Rust recompute the parcel.
+        h_vals = np.array([_calc.pressure_to_height_std(float(pi)) for pi in p])
+        h = _as_1d(h_vals - h_vals[0])
+        if psfc is None:
+            psfc = pressure[0] if hasattr(pressure, '__getitem__') else pressure
+        if t2m is None:
+            t2m = temperature[0] if hasattr(temperature, '__getitem__') else temperature
+        if td2m is None:
+            td2m = dewpoint[0] if hasattr(dewpoint, '__getitem__') else dewpoint
+    elif fourth is not None:
+        h = _as_1d(_strip(fourth, "m"))
+    else:
+        # No 4th arg — derive height from standard atmosphere
+        h_vals = np.array([_calc.pressure_to_height_std(float(pi)) for pi in p])
+        h = _as_1d(h_vals - h_vals[0])
+        if psfc is None:
+            psfc = pressure[0] if hasattr(pressure, '__getitem__') else pressure
+        if t2m is None:
+            t2m = temperature[0] if hasattr(temperature, '__getitem__') else temperature
+        if td2m is None:
+            td2m = dewpoint[0] if hasattr(dewpoint, '__getitem__') else dewpoint
+
     ps = _as_float(_strip(psfc, "hPa"))
     t2 = _as_float(_strip(t2m, "degC"))
     td2 = _as_float(_strip(td2m, "degC"))
@@ -1836,7 +1863,8 @@ def get_mixed_layer_parcel(pressure, temperature, dewpoint, depth=100.0):
     return pp * units.hPa, tp * units.degC, tdp * units.degC
 
 
-def get_most_unstable_parcel(pressure, temperature, dewpoint, depth=300.0):
+def get_most_unstable_parcel(pressure, temperature, dewpoint,
+                             height=None, bottom=None, depth=300.0):
     """Get most-unstable parcel properties.
 
     Parameters
@@ -1844,20 +1872,24 @@ def get_most_unstable_parcel(pressure, temperature, dewpoint, depth=300.0):
     pressure : array Quantity (pressure)
     temperature : array Quantity (temperature)
     dewpoint : array Quantity (temperature)
-    depth : float
+    height : ignored (MetPy compat)
+    bottom : ignored (MetPy compat)
+    depth : Quantity or float
         Search depth in hPa (default 300).
 
     Returns
     -------
-    tuple of (Quantity (hPa), Quantity (degC), Quantity (degC))
-        Parcel pressure, temperature, and dewpoint.
+    tuple of (Quantity (hPa), Quantity (degC), Quantity (degC), int)
+        Parcel pressure, temperature, dewpoint, and source index.
     """
     p = _as_1d(_strip(pressure, "hPa"))
     t = _as_1d(_strip(temperature, "degC"))
     td = _as_1d(_strip(dewpoint, "degC"))
-    d = _as_float(_strip(depth, "hPa")) if hasattr(depth, "magnitude") else float(depth)
+    d = _scalar_strip(depth, "hPa") if hasattr(depth, "magnitude") else float(depth)
     pp, tp, tdp = _calc.get_most_unstable_parcel(p, t, td, d)
-    return pp * units.hPa, tp * units.degC, tdp * units.degC
+    # Find the source index (level closest to the returned parcel pressure)
+    idx = int(np.argmin(np.abs(p - pp)))
+    return pp * units.hPa, tp * units.degC, tdp * units.degC, idx
 
 
 def psychrometric_vapor_pressure(temperature, wet_bulb, pressure):
@@ -1902,14 +1934,35 @@ def frost_point(temperature, relative_humidity):
 # Aliases
 # ============================================================================
 
-def mixed_parcel(pressure, temperature, dewpoint, depth=100):
-    """Alias for :func:`get_mixed_layer_parcel`."""
-    return get_mixed_layer_parcel(pressure, temperature, dewpoint, depth)
+def mixed_parcel(pressure, temperature, dewpoint, parcel_start_pressure=None,
+                 height=None, bottom=None, depth=100, interpolate=True):
+    """Mixed-layer parcel (MetPy-compatible).
+
+    Parameters
+    ----------
+    pressure : array Quantity (pressure)
+    temperature : array Quantity (temperature)
+    dewpoint : array Quantity (temperature)
+    parcel_start_pressure : ignored (MetPy compat)
+    height : ignored (MetPy compat)
+    bottom : ignored (MetPy compat)
+    depth : Quantity or float
+        Mixing depth in hPa (default 100).
+    interpolate : ignored (MetPy compat)
+
+    Returns
+    -------
+    tuple of (Quantity (hPa), Quantity (degC), Quantity (degC))
+    """
+    d = _scalar_strip(depth, "hPa") if hasattr(depth, "magnitude") else float(depth)
+    return get_mixed_layer_parcel(pressure, temperature, dewpoint, d)
 
 
-def most_unstable_parcel(pressure, temperature, dewpoint, depth=300):
-    """Alias for :func:`get_most_unstable_parcel`."""
-    return get_most_unstable_parcel(pressure, temperature, dewpoint, depth)
+def most_unstable_parcel(pressure, temperature, dewpoint, height=None,
+                         bottom=None, depth=300):
+    """Alias for :func:`get_most_unstable_parcel` (MetPy-compatible)."""
+    return get_most_unstable_parcel(pressure, temperature, dewpoint,
+                                    height=height, bottom=bottom, depth=depth)
 
 
 def psychrometric_vapor_pressure_wet(temperature, wet_bulb, pressure):
@@ -1977,32 +2030,51 @@ def wind_components(speed, direction):
     return np.asarray(u).reshape(orig_shape) * ms, np.asarray(v).reshape(orig_shape) * ms
 
 
-def bulk_shear(pressure_or_u, u_or_v, v_or_height, height=None, bottom=None, depth=None, top=None):
+def bulk_shear(pressure_or_u, u_or_v, v_or_height=None, height=None,
+               bottom=None, depth=None, top=None):
     """Bulk wind shear over a height layer.
+
+    Supports both MetPy form ``bulk_shear(p, u, v, height=z, depth=6*km)``
+    and direct form ``bulk_shear(u, v, height, bottom, top=top)``.
 
     Parameters
     ----------
-    u, v : array Quantity (m/s)
-        Wind component profiles.
-    height : array Quantity (m)
-        Height profile.
-    bottom : Quantity (m)
-        Bottom of the layer.
-    top : Quantity (m)
-        Top of the layer.
+    pressure_or_u : array Quantity
+    u_or_v : array Quantity
+    v_or_height : array Quantity, optional
+    height : array Quantity (m), optional
+    bottom : Quantity (m), optional
+    depth : Quantity (m), optional
+    top : Quantity (m), optional
 
     Returns
     -------
     tuple of (Quantity (m/s), Quantity (m/s))
         Shear u and v components.
     """
-    u_arr = _as_1d(_strip(pressure_or_u, "m/s"))
-    v_arr = _as_1d(_strip(u_or_v, "m/s"))
-    h_arr = _as_1d(_strip(v_or_height, "m"))
-    bot = _as_float(_strip(height, "m"))
-    top_src = top if top is not None else bottom
-    top_val = _as_float(_strip(top_src, "m"))
-    su, sv = _calc.bulk_shear(u_arr, v_arr, h_arr, bot, top_val)
+    # Detect MetPy form: bulk_shear(pressure, u, v, height=z, depth=6km)
+    # vs direct form: bulk_shear(u, v, height, bottom, top=top)
+    if height is not None:
+        # MetPy form: 1st arg is pressure (ignored), 2nd=u, 3rd=v, height=keyword
+        u_arr = _as_1d(_strip(u_or_v, "m/s"))
+        v_arr = _as_1d(_strip(v_or_height, "m/s"))
+        h_arr = _as_1d(_strip(height, "m"))
+    else:
+        # Direct form: 1st=u, 2nd=v, 3rd=height
+        u_arr = _as_1d(_strip(pressure_or_u, "m/s"))
+        v_arr = _as_1d(_strip(u_or_v, "m/s"))
+        h_arr = _as_1d(_strip(v_or_height, "m"))
+
+    # Resolve bottom/top from depth
+    bot_val = _scalar_strip(bottom, "m") if bottom is not None else 0.0
+    if top is not None:
+        top_val = _scalar_strip(top, "m")
+    elif depth is not None:
+        top_val = bot_val + _scalar_strip(depth, "m")
+    else:
+        top_val = float(h_arr[-1])  # default: full profile
+
+    su, sv = _calc.bulk_shear(u_arr, v_arr, h_arr, bot_val, top_val)
     return _attach(su, "m/s"), _attach(sv, "m/s")
 
 
@@ -2028,13 +2100,16 @@ def mean_wind(u, v, height, bottom, top):
     return mu * units("m/s"), mv * units("m/s")
 
 
-def storm_relative_helicity(*args, bottom=None, storm_u=None, storm_v=None):
+def storm_relative_helicity(*args, bottom=None, depth=None, storm_u=None, storm_v=None):
     """Storm-relative helicity.
+
+    MetPy form: ``storm_relative_helicity(height, u, v, depth, *, bottom, storm_u, storm_v)``
+    Legacy form: ``storm_relative_helicity(u, v, height, depth, storm_u, storm_v)``
 
     Parameters
     ----------
-    u, v : array Quantity (m/s)
     height : array Quantity (m)
+    u, v : array Quantity (m/s)
     depth : Quantity (m)
     storm_u, storm_v : Quantity (m/s)
 
@@ -2043,18 +2118,37 @@ def storm_relative_helicity(*args, bottom=None, storm_u=None, storm_v=None):
     tuple of (Quantity (m^2/s^2), Quantity (m^2/s^2), Quantity (m^2/s^2))
         Positive, negative, and total SRH.
     """
-    if len(args) != 6:
+    if len(args) == 6:
+        # Legacy positional: (u, v, height, depth, storm_u, storm_v)
+        u, v, height_a, depth_a, storm_u, storm_v = args
+    elif len(args) == 4:
+        # MetPy form: (height, u, v, depth, *, storm_u=, storm_v=)
+        height_a, u, v, depth_a = args
+        if depth is not None:
+            depth_a = depth
+    elif len(args) == 3:
+        # Keyword form: (height, u, v, *, depth=, storm_u=, storm_v=)
+        height_a, u, v = args
+        depth_a = depth
+    else:
         raise TypeError(
-            "storm_relative_helicity expects either (height, u, v, depth, *, bottom, storm_u, storm_v) "
-            "or legacy positional (u, v, height, depth, storm_u, storm_v)"
+            "storm_relative_helicity expects (height, u, v, depth, *, storm_u, storm_v) "
+            f"— got {len(args)} positional args"
         )
-    u, v, height, depth, storm_u, storm_v = args
+
     u_arr = _as_1d(_strip(u, "m/s"))
     v_arr = _as_1d(_strip(v, "m/s"))
-    h_arr = _as_1d(_strip(height, "m"))
-    d = _as_float(_strip(depth, "m"))
-    su = _as_float(_strip(storm_u, "m/s"))
-    sv = _as_float(_strip(storm_v, "m/s"))
+    h_arr = _as_1d(_strip(height_a, "m"))
+    d = _scalar_strip(depth_a, "m")
+    if storm_u is None or storm_v is None:
+        # Auto-compute Bunkers right-mover if storm motion not provided
+        (ru, rv), _, _ = bunkers_storm_motion(u, v, height_a)
+        if storm_u is None:
+            storm_u = ru
+        if storm_v is None:
+            storm_v = rv
+    su = _scalar_strip(storm_u, "m/s")
+    sv = _scalar_strip(storm_v, "m/s")
     pos, neg, total = _calc.storm_relative_helicity(u_arr, v_arr, h_arr, d, su, sv)
     return _attach(pos, "m**2/s**2"), _attach(neg, "m**2/s**2"), _attach(total, "m**2/s**2")
 
@@ -2062,19 +2156,31 @@ def storm_relative_helicity(*args, bottom=None, storm_u=None, storm_v=None):
 def bunkers_storm_motion(pressure_or_u, u_or_v, v_or_height, height=None):
     """Bunkers storm motion (right-mover, left-mover, mean wind).
 
+    MetPy form: ``bunkers_storm_motion(pressure, u, v, height)``
+    Direct form: ``bunkers_storm_motion(u, v, height)``
+
     Parameters
     ----------
-    u, v : array Quantity (m/s)
-    height : array Quantity (m)
+    pressure_or_u : array Quantity
+    u_or_v : array Quantity
+    v_or_height : array Quantity
+    height : array Quantity (m), optional
 
     Returns
     -------
     tuple of 3 tuples, each (Quantity (m/s), Quantity (m/s))
         (right_u, right_v), (left_u, left_v), (mean_u, mean_v)
     """
-    u_arr = _as_1d(_strip(pressure_or_u, "m/s"))
-    v_arr = _as_1d(_strip(u_or_v, "m/s"))
-    h_arr = _as_1d(_strip(v_or_height, "m"))
+    if height is not None:
+        # MetPy form: (pressure, u, v, height) — ignore pressure
+        u_arr = _as_1d(_strip(u_or_v, "m/s"))
+        v_arr = _as_1d(_strip(v_or_height, "m/s"))
+        h_arr = _as_1d(_strip(height, "m"))
+    else:
+        # Direct form: (u, v, height)
+        u_arr = _as_1d(_strip(pressure_or_u, "m/s"))
+        v_arr = _as_1d(_strip(u_or_v, "m/s"))
+        h_arr = _as_1d(_strip(v_or_height, "m"))
     (ru, rv), (lu, lv), (mu, mv) = _calc.bunkers_storm_motion(u_arr, v_arr, h_arr)
     return (
         (_attach(ru, "m/s"), _attach(rv, "m/s")),
@@ -2193,6 +2299,24 @@ def _flat(data, unit=None):
     return np.ascontiguousarray(arr)
 
 
+def _mean_spacing(val, target_unit="m"):
+    """Extract a scalar grid spacing from a scalar or array Quantity.
+
+    If *val* is a 2-D array (e.g. from ``lat_lon_grid_deltas``), the mean
+    value is returned so that the Rust function receives a single float.
+    """
+    if hasattr(val, "magnitude"):
+        arr = np.asarray(val.to(target_unit).magnitude, dtype=np.float64)
+    else:
+        arr = np.asarray(val, dtype=np.float64)
+    return float(arr.mean()) if arr.ndim > 0 and arr.size > 1 else float(arr)
+
+
+def _safe_unit_str(unit_obj):
+    """Return a unit string usable with *our* registry, avoiding cross-registry ops."""
+    return str(unit_obj)
+
+
 def divergence(u, v, dx, dy):
     """Horizontal divergence on a 2-D grid.
 
@@ -2207,8 +2331,8 @@ def divergence(u, v, dx, dy):
     """
     u_f = _flat(u, "m/s")
     v_f = _flat(v, "m/s")
-    dx_val = _as_float(_strip(dx, "m"))
-    dy_val = _as_float(_strip(dy, "m"))
+    dx_val = _mean_spacing(dx, "m")
+    dy_val = _mean_spacing(dy, "m")
     result = np.asarray(_calc.divergence(u_f, v_f, dx_val, dy_val))
     return result * units("1/s")
 
@@ -2227,8 +2351,8 @@ def vorticity(u, v, dx, dy):
     """
     u_f = _flat(u, "m/s")
     v_f = _flat(v, "m/s")
-    dx_val = _as_float(_strip(dx, "m"))
-    dy_val = _as_float(_strip(dy, "m"))
+    dx_val = _mean_spacing(dx, "m")
+    dy_val = _mean_spacing(dy, "m")
     result = np.asarray(_calc.vorticity(u_f, v_f, dx_val, dy_val))
     return result * units("1/s")
 
@@ -2249,8 +2373,8 @@ def absolute_vorticity(u, v, lats, dx, dy):
     u_f = _flat(u, "m/s")
     v_f = _flat(v, "m/s")
     lats_f = _flat(lats, "degree") if hasattr(lats, "magnitude") else _flat(lats)
-    dx_val = _as_float(_strip(dx, "m"))
-    dy_val = _as_float(_strip(dy, "m"))
+    dx_val = _mean_spacing(dx, "m")
+    dy_val = _mean_spacing(dy, "m")
     result = np.asarray(_calc.absolute_vorticity(u_f, v_f, lats_f, dx_val, dy_val))
     return result * units("1/s")
 
@@ -2269,14 +2393,14 @@ def advection(scalar, u, v, dx, dy):
     2-D array Quantity (scalar_units / s)
     """
     has_units = hasattr(scalar, "units")
-    s_unit = scalar.units if has_units else units.dimensionless
+    s_unit_str = _safe_unit_str(scalar.units) if has_units else "dimensionless"
     s_f = _flat(scalar)
     u_f = _flat(u, "m/s")
     v_f = _flat(v, "m/s")
-    dx_val = _as_float(_strip(dx, "m"))
-    dy_val = _as_float(_strip(dy, "m"))
+    dx_val = _mean_spacing(dx, "m")
+    dy_val = _mean_spacing(dy, "m")
     result = np.asarray(_calc.advection(s_f, u_f, v_f, dx_val, dy_val))
-    return result * (s_unit / units.s)
+    return result * units(f"({s_unit_str}) / s")
 
 
 def frontogenesis(theta, u, v, dx, dy):
@@ -2295,8 +2419,8 @@ def frontogenesis(theta, u, v, dx, dy):
     t_f = _flat(theta, "K")
     u_f = _flat(u, "m/s")
     v_f = _flat(v, "m/s")
-    dx_val = _as_float(_strip(dx, "m"))
-    dy_val = _as_float(_strip(dy, "m"))
+    dx_val = _mean_spacing(dx, "m")
+    dy_val = _mean_spacing(dy, "m")
     result = np.asarray(_calc.frontogenesis(t_f, u_f, v_f, dx_val, dy_val))
     return result * units("K/m/s")
 
@@ -2316,8 +2440,8 @@ def geostrophic_wind(heights, lats, dx, dy):
     """
     h_f = _flat(heights, "m")
     lats_f = _flat(lats, "degree") if hasattr(lats, "magnitude") else _flat(lats)
-    dx_val = _as_float(_strip(dx, "m"))
-    dy_val = _as_float(_strip(dy, "m"))
+    dx_val = _mean_spacing(dx, "m")
+    dy_val = _mean_spacing(dy, "m")
     u_g, v_g = _calc.geostrophic_wind(h_f, lats_f, dx_val, dy_val)
     ms = units("m/s")
     return np.asarray(u_g) * ms, np.asarray(v_g) * ms
@@ -2341,8 +2465,8 @@ def ageostrophic_wind(u, v, heights, lats, dx, dy):
     v_f = _flat(v, "m/s")
     h_f = _flat(heights, "m")
     lats_f = _flat(lats, "degree") if hasattr(lats, "magnitude") else _flat(lats)
-    dx_val = _as_float(_strip(dx, "m"))
-    dy_val = _as_float(_strip(dy, "m"))
+    dx_val = _mean_spacing(dx, "m")
+    dy_val = _mean_spacing(dy, "m")
     # Compute geostrophic wind first, then ageostrophic = total - geostrophic
     u_g, v_g = _calc.geostrophic_wind(h_f, lats_f, dx_val, dy_val)
     u_g_flat = np.ascontiguousarray(np.asarray(u_g).ravel(), dtype=np.float64)
@@ -2381,8 +2505,8 @@ def potential_vorticity_baroclinic(potential_temp, pressure, theta_below,
     u_f = _flat(u, "m/s")
     v_f = _flat(v, "m/s")
     lats_f = _flat(lats, "degree") if hasattr(lats, "magnitude") else _flat(lats)
-    dx_val = _as_float(_strip(dx, "m"))
-    dy_val = _as_float(_strip(dy, "m"))
+    dx_val = _mean_spacing(dx, "m")
+    dy_val = _mean_spacing(dy, "m")
     # Rust expects Pa for the pressure pair
     if hasattr(pressure, "magnitude"):
         p_arr = np.asarray(pressure.to("Pa").magnitude, dtype=np.float64)
@@ -2412,8 +2536,8 @@ def potential_vorticity_barotropic(heights, u, v, lats, dx, dy):
     u_f = _flat(u, "m/s")
     v_f = _flat(v, "m/s")
     lats_f = _flat(lats, "degree") if hasattr(lats, "magnitude") else _flat(lats)
-    dx_val = _as_float(_strip(dx, "m"))
-    dy_val = _as_float(_strip(dy, "m"))
+    dx_val = _mean_spacing(dx, "m")
+    dy_val = _mean_spacing(dy, "m")
     result = np.asarray(_calc.potential_vorticity_barotropic(
         h_f, u_f, v_f, lats_f, dx_val, dy_val,
     ))
@@ -2486,8 +2610,8 @@ def vector_derivative(u, v, dx, dy):
     """
     u_f = _flat(u, "m/s")
     v_f = _flat(v, "m/s")
-    dx_val = _as_float(_strip(dx, "m"))
-    dy_val = _as_float(_strip(dy, "m"))
+    dx_val = _mean_spacing(dx, "m")
+    dy_val = _mean_spacing(dy, "m")
     dudx, dudy, dvdx, dvdy = _calc.vector_derivative(u_f, v_f, dx_val, dy_val)
     inv_s = units("1/s")
     return (
@@ -2572,8 +2696,8 @@ def curvature_vorticity(u, v, dx, dy):
     """
     u_2d = _as_2d(u, "m/s")
     v_2d = _as_2d(v, "m/s")
-    dx_val = _as_float(_strip(dx, "m"))
-    dy_val = _as_float(_strip(dy, "m"))
+    dx_val = _mean_spacing(dx, "m")
+    dy_val = _mean_spacing(dy, "m")
     result = np.asarray(_calc.curvature_vorticity(u_2d, v_2d, dx_val, dy_val))
     return result * units("1/s")
 
@@ -2595,8 +2719,8 @@ def inertial_advective_wind(u, v, u_geo, v_geo, dx, dy):
     v_2d = _as_2d(v, "m/s")
     ug_2d = _as_2d(u_geo, "m/s")
     vg_2d = _as_2d(v_geo, "m/s")
-    dx_val = _as_float(_strip(dx, "m"))
-    dy_val = _as_float(_strip(dy, "m"))
+    dx_val = _mean_spacing(dx, "m")
+    dy_val = _mean_spacing(dy, "m")
     u_ia, v_ia = _calc.inertial_advective_wind(u_2d, v_2d, ug_2d, vg_2d, dx_val, dy_val)
     ms = units("m/s")
     return np.asarray(u_ia) * ms, np.asarray(v_ia) * ms
@@ -2642,8 +2766,8 @@ def q_vector(u, v, temperature, pressure, dx=None, dy=None, **kwargs):
     u_2d = _as_2d(u, "m/s")
     v_2d = _as_2d(v, "m/s")
     p_val = _as_float(_strip(pressure, "hPa"))
-    dx_val = _as_float(_strip(dx, "m"))
-    dy_val = _as_float(_strip(dy, "m"))
+    dx_val = _mean_spacing(dx, "m")
+    dy_val = _mean_spacing(dy, "m")
     q1, q2 = _calc.q_vector(t_2d, u_2d, v_2d, p_val, dx_val, dy_val)
     return np.asarray(q1), np.asarray(q2)
 
@@ -2662,8 +2786,8 @@ def shear_vorticity(u, v, dx, dy):
     """
     u_2d = _as_2d(u, "m/s")
     v_2d = _as_2d(v, "m/s")
-    dx_val = _as_float(_strip(dx, "m"))
-    dy_val = _as_float(_strip(dy, "m"))
+    dx_val = _mean_spacing(dx, "m")
+    dy_val = _mean_spacing(dy, "m")
     result = np.asarray(_calc.shear_vorticity(u_2d, v_2d, dx_val, dy_val))
     return result * units("1/s")
 
@@ -2682,8 +2806,8 @@ def shearing_deformation(u, v, dx, dy):
     """
     u_2d = _as_2d(u, "m/s")
     v_2d = _as_2d(v, "m/s")
-    dx_val = _as_float(_strip(dx, "m"))
-    dy_val = _as_float(_strip(dy, "m"))
+    dx_val = _mean_spacing(dx, "m")
+    dy_val = _mean_spacing(dy, "m")
     result = np.asarray(_calc.shearing_deformation(u_2d, v_2d, dx_val, dy_val))
     return result * units("1/s")
 
@@ -2702,8 +2826,8 @@ def stretching_deformation(u, v, dx, dy):
     """
     u_2d = _as_2d(u, "m/s")
     v_2d = _as_2d(v, "m/s")
-    dx_val = _as_float(_strip(dx, "m"))
-    dy_val = _as_float(_strip(dy, "m"))
+    dx_val = _mean_spacing(dx, "m")
+    dy_val = _mean_spacing(dy, "m")
     result = np.asarray(_calc.stretching_deformation(u_2d, v_2d, dx_val, dy_val))
     return result * units("1/s")
 
@@ -2722,8 +2846,8 @@ def total_deformation(u, v, dx, dy):
     """
     u_2d = _as_2d(u, "m/s")
     v_2d = _as_2d(v, "m/s")
-    dx_val = _as_float(_strip(dx, "m"))
-    dy_val = _as_float(_strip(dy, "m"))
+    dx_val = _mean_spacing(dx, "m")
+    dy_val = _mean_spacing(dy, "m")
     result = np.asarray(_calc.total_deformation(u_2d, v_2d, dx_val, dy_val))
     return result * units("1/s")
 
@@ -2824,11 +2948,11 @@ def supercell_composite_parameter(mucape, srh_eff, bulk_shear_eff):
 def critical_angle(*args):
     """Critical angle between storm-relative inflow and 0-500m shear.
 
-    Parameters
-    ----------
-    storm_u, storm_v : Quantity (m/s)
-    u_sfc, v_sfc : Quantity (m/s)
-    u_500m, v_500m : Quantity (m/s)
+    MetPy form: ``critical_angle(pressure, u, v, height, u_storm, v_storm)``
+    Direct form: ``critical_angle(storm_u, storm_v, u_sfc, v_sfc, u_500m, v_500m)``
+
+    When called with profile data (MetPy form), surface and 500m values are
+    interpolated from the profiles automatically.
 
     Returns
     -------
@@ -2836,19 +2960,37 @@ def critical_angle(*args):
     """
     if len(args) != 6:
         raise TypeError(
-            "critical_angle expects either (pressure, u, v, height, u_storm, v_storm) "
-            "or legacy positional (storm_u, storm_v, u_sfc, v_sfc, u_500m, v_500m)"
+            "critical_angle expects 6 positional args: "
+            "(pressure, u, v, height, u_storm, v_storm) or "
+            "(storm_u, storm_v, u_sfc, v_sfc, u_500m, v_500m)"
         )
-    storm_u, storm_v, u_sfc, v_sfc, u_500m, v_500m = args
+    # Detect profile form: if 1st arg is array-like with >1 element, it's the profile form
+    first = np.asarray(args[0].magnitude if hasattr(args[0], "magnitude") else args[0])
+    if first.ndim >= 1 and first.size > 1:
+        # MetPy profile form: (pressure, u, v, height, u_storm, v_storm)
+        _p, u_prof, v_prof, h_prof, storm_u, storm_v = args
+        u_arr = _as_1d(_strip(u_prof, "m/s"))
+        v_arr = _as_1d(_strip(v_prof, "m/s"))
+        h_arr = _as_1d(_strip(h_prof, "m"))
+        # Surface values (index 0)
+        u_sfc = u_arr[0]
+        v_sfc = v_arr[0]
+        # Interpolate to 500m AGL
+        u_500 = float(np.interp(500.0, h_arr, u_arr))
+        v_500 = float(np.interp(500.0, h_arr, v_arr))
+        su = _scalar_strip(storm_u, "m/s")
+        sv = _scalar_strip(storm_v, "m/s")
+    else:
+        # Direct scalar form: (storm_u, storm_v, u_sfc, v_sfc, u_500m, v_500m)
+        storm_u, storm_v, u_sfc_q, v_sfc_q, u_500_q, v_500_q = args
+        su = _scalar_strip(storm_u, "m/s")
+        sv = _scalar_strip(storm_v, "m/s")
+        u_sfc = _scalar_strip(u_sfc_q, "m/s")
+        v_sfc = _scalar_strip(v_sfc_q, "m/s")
+        u_500 = _scalar_strip(u_500_q, "m/s")
+        v_500 = _scalar_strip(v_500_q, "m/s")
     return _attach(
-        _calc.critical_angle(
-            _as_float(_strip(storm_u, "m/s")),
-            _as_float(_strip(storm_v, "m/s")),
-            _as_float(_strip(u_sfc, "m/s")),
-            _as_float(_strip(v_sfc, "m/s")),
-            _as_float(_strip(u_500m, "m/s")),
-            _as_float(_strip(v_500m, "m/s")),
-        ),
+        _calc.critical_angle(su, sv, u_sfc, v_sfc, u_500, v_500),
         "degree",
     )
 
@@ -3388,7 +3530,7 @@ def gradient_x(data, dx):
     """
     has_units = hasattr(data, "units")
     d_arr = np.asarray(data.magnitude if has_units else data, dtype=np.float64)
-    dx_val = _as_float(_strip(dx, "m"))
+    dx_val = _mean_spacing(dx, "m")
     result = np.asarray(_calc.gradient_x(d_arr, dx_val))
     if has_units:
         return result * (data.units / units.m)
@@ -3409,7 +3551,7 @@ def gradient_y(data, dy):
     """
     has_units = hasattr(data, "units")
     d_arr = np.asarray(data.magnitude if has_units else data, dtype=np.float64)
-    dy_val = _as_float(_strip(dy, "m"))
+    dy_val = _mean_spacing(dy, "m")
     result = np.asarray(_calc.gradient_y(d_arr, dy_val))
     if has_units:
         return result * (data.units / units.m)
@@ -3430,8 +3572,8 @@ def laplacian(data, dx, dy):
     """
     has_units = hasattr(data, "units")
     d_arr = np.asarray(data.magnitude if has_units else data, dtype=np.float64)
-    dx_val = _as_float(_strip(dx, "m"))
-    dy_val = _as_float(_strip(dy, "m"))
+    dx_val = _mean_spacing(dx, "m")
+    dy_val = _mean_spacing(dy, "m")
     result = np.asarray(_calc.laplacian(d_arr, dx_val, dy_val))
     if has_units:
         return result * (data.units / units.m ** 2)
@@ -3696,13 +3838,13 @@ def advection_3d(scalar, u, v, w, dx, dy, dz):
     1-D array Quantity (scalar_units / s)
     """
     has_units = hasattr(scalar, "units")
-    s_unit = scalar.units if has_units else units.dimensionless
+    s_unit_str = _safe_unit_str(scalar.units) if has_units else "dimensionless"
     s_arr = _as_1d(_strip(scalar, "")) if has_units else _as_1d(scalar)
     u_arr = _as_1d(_strip(u, "m/s")) if hasattr(u, "magnitude") else _as_1d(u)
     v_arr = _as_1d(_strip(v, "m/s")) if hasattr(v, "magnitude") else _as_1d(v)
     w_arr = _as_1d(_strip(w, "m/s")) if hasattr(w, "magnitude") else _as_1d(w)
-    dx_val = _as_float(_strip(dx, "m")) if hasattr(dx, "magnitude") else float(dx)
-    dy_val = _as_float(_strip(dy, "m")) if hasattr(dy, "magnitude") else float(dy)
+    dx_val = _mean_spacing(dx, "m") if hasattr(dx, "magnitude") else float(np.asarray(dx).mean())
+    dy_val = _mean_spacing(dy, "m") if hasattr(dy, "magnitude") else float(np.asarray(dy).mean())
     dz_val = _as_float(_strip(dz, "m")) if hasattr(dz, "magnitude") else float(dz)
 
     # Infer nx, ny, nz from the 3D array shape if possible
@@ -3719,7 +3861,7 @@ def advection_3d(scalar, u, v, w, dx, dy, dz):
         s_arr, u_arr, v_arr, w_arr,
         nx, ny, nz, dx_val, dy_val, dz_val,
     ))
-    return result.reshape(nz, ny, nx) * (s_unit / units.s)
+    return result.reshape(nz, ny, nx) * units(f"({s_unit_str}) / s")
 
 
 # ============================================================================
