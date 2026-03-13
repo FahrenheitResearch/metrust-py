@@ -86,5 +86,11 @@ nav:
     - Atmospheric: api/atmospheric.md
     - I/O: api/io.md
     - Units & Constants: api/units.md
+  - Tutorials:
+    - Weather Data 101: tutorials/weather-101.md
+    - Your First Sounding: tutorials/first-sounding.md
+    - Your First Grid Analysis: tutorials/first-grid.md
+    - Reading the Numbers: tutorials/reading-the-numbers.md
+    - Recipes & Workflows: tutorials/recipes.md
   - Performance: performance.md
   - Compatibility: compatibility.md
