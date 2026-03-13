@@ -3733,6 +3733,17 @@ def _grid_strip(arr):
     return np.ascontiguousarray(arr, dtype=np.float64)
 
 
+def _scalar_strip(val, target_unit=None):
+    """Strip Pint unit from a scalar, optionally converting first."""
+    if val is None:
+        return None
+    if hasattr(val, "magnitude"):
+        if target_unit is not None:
+            val = val.to(target_unit)
+        return float(val.magnitude)
+    return float(val)
+
+
 def _grid_flatten_3d(arr):
     """Flatten a 3D array [nz, ny, nx] → 1D, return (flat, nx, ny, nz)."""
     a = _grid_strip(arr)
@@ -3771,7 +3782,7 @@ def compute_cape_cin(pressure_3d, temperature_c_3d, qvapor_3d,
     q2v = _grid_strip(q2).ravel()
     cape, cin, lcl, lfc = _calc.compute_cape_cin(
         p3, t3, q3, h3, ps, t2v, q2v,
-        nx, ny, nz, parcel_type, top_m,
+        nx, ny, nz, parcel_type, _scalar_strip(top_m, "m"),
     )
     shape = (ny, nx)
     return (
@@ -3793,7 +3804,7 @@ def compute_srh(u_3d, v_3d, height_agl_3d, top_m=1000.0):
     u3, nx, ny, nz = _grid_flatten_3d(u_3d)
     v3 = _grid_strip(v_3d).ravel()
     h3 = _grid_strip(height_agl_3d).ravel()
-    result = _calc.compute_srh(u3, v3, h3, nx, ny, nz, float(top_m))
+    result = _calc.compute_srh(u3, v3, h3, nx, ny, nz, _scalar_strip(top_m, "m"))
     return np.asarray(result).reshape(ny, nx) * units("m**2/s**2")
 
 
@@ -3809,7 +3820,7 @@ def compute_shear(u_3d, v_3d, height_agl_3d, bottom_m=0.0, top_m=6000.0):
     v3 = _grid_strip(v_3d).ravel()
     h3 = _grid_strip(height_agl_3d).ravel()
     result = _calc.compute_shear(
-        u3, v3, h3, nx, ny, nz, float(bottom_m), float(top_m),
+        u3, v3, h3, nx, ny, nz, _scalar_strip(bottom_m, "m"), _scalar_strip(top_m, "m"),
     )
     return np.asarray(result).reshape(ny, nx) * units("m/s")
 
@@ -3827,7 +3838,7 @@ def compute_lapse_rate(temperature_c_3d, qvapor_3d, height_agl_3d,
     q3 = _grid_strip(qvapor_3d).ravel()
     h3 = _grid_strip(height_agl_3d).ravel()
     result = _calc.compute_lapse_rate(
-        t3, q3, h3, nx, ny, nz, float(bottom_km), float(top_km),
+        t3, q3, h3, nx, ny, nz, _scalar_strip(bottom_km, "km"), _scalar_strip(top_km, "km"),
     )
     return np.asarray(result).reshape(ny, nx) * units("degC/km")
 

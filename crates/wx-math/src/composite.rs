@@ -313,7 +313,7 @@ fn compute_srh_column(
         let avg_sr_u = 0.5 * (sr_u_bot + sr_u_top);
         let avg_sr_v = 0.5 * (sr_v_bot + sr_v_top);
 
-        srh += avg_sr_u * dv - avg_sr_v * du;
+        srh += sr_u_top * sr_v_bot - sr_u_bot * sr_v_top;
     }
 
     srh
