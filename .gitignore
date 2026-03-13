@@ -10,3 +10,5 @@ build/
 .venv/
 *.pdb
 bench_results.json
+bench_hrrr_results.json
+data/
