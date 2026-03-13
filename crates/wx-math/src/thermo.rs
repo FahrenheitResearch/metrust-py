@@ -1833,6 +1833,10 @@ fn cape_cin_from_parcel(
     let mut cin = 0.0_f64;
 
     for i in 1..n {
+        // Only integrate from the starting parcel level upward
+        if p[i] > p_start || p[i - 1] > p_start {
+            continue;
+        }
         if p[i] <= 0.0 || tv_parcel[i].is_nan() || tv_parcel[i - 1].is_nan() {
             continue;
         }
@@ -1876,42 +1880,85 @@ fn interp_log_p(p_target: f64, p_prof: &[f64], t_prof: &[f64]) -> f64 {
     t_prof[n - 1]
 }
 
-/// Bunkers storm motion vectors.
+/// Pressure-weighted continuous average of a variable in a height layer.
+/// Matches MetPy's weighted_continuous_average: WCA = ∫A dp / ∫dp
+/// Uses trapezoidal integration in pressure, interpolating to layer boundaries in height.
+fn pressure_weighted_mean(comp: &[f64], p: &[f64], z: &[f64], z_bot: f64, z_top: f64) -> f64 {
+    let n = z.len();
+    if n < 2 || z_top <= z_bot { return comp[0]; }
+
+    // Interpolate any quantity to a target height
+    let interp_at = |target_z: f64, vals: &[f64]| -> f64 {
+        if target_z <= z[0] { return vals[0]; }
+        if target_z >= z[n - 1] { return vals[n - 1]; }
+        for i in 1..n {
+            if z[i] >= target_z {
+                let frac = (target_z - z[i - 1]) / (z[i] - z[i - 1]);
+                return vals[i - 1] + frac * (vals[i] - vals[i - 1]);
+            }
+        }
+        vals[n - 1]
+    };
+
+    // Build the sub-profile within the layer (including interpolated boundaries)
+    let mut layer_comp: Vec<f64> = Vec::new();
+    let mut layer_p: Vec<f64> = Vec::new();
+
+    // Bottom boundary
+    layer_comp.push(interp_at(z_bot, comp));
+    layer_p.push(interp_at(z_bot, p));
+
+    // Interior points
+    for i in 0..n {
+        if z[i] <= z_bot { continue; }
+        if z[i] >= z_top { break; }
+        layer_comp.push(comp[i]);
+        layer_p.push(p[i]);
+    }
+
+    // Top boundary
+    layer_comp.push(interp_at(z_top, comp));
+    layer_p.push(interp_at(z_top, p));
+
+    // Trapezoidal integration: ∫A dp / ∫dp
+    let m = layer_comp.len();
+    if m < 2 { return layer_comp[0]; }
+
+    let mut num = 0.0; // ∫A dp
+    let mut den = 0.0; // ∫dp
+    for i in 1..m {
+        let dp = layer_p[i] - layer_p[i - 1]; // dp is negative (pressure decreases with height)
+        let avg_val = (layer_comp[i] + layer_comp[i - 1]) / 2.0;
+        num += avg_val * dp;
+        den += dp;
+    }
+
+    if den.abs() > 1e-10 { num / den } else { layer_comp[0] }
+}
+
+/// Bunkers storm motion vectors (MetPy-compatible algorithm).
 /// Returns ((u_rm, v_rm), (u_lm, v_lm)) for right-mover and left-mover.
 /// p: pressure (hPa), u,v: wind components (m/s), z: height AGL (m). Surface first.
 pub fn bunkers_storm_motion(
-    _p: &[f64], u: &[f64], v: &[f64], z: &[f64],
+    p: &[f64], u: &[f64], v: &[f64], z: &[f64],
 ) -> ((f64, f64), (f64, f64)) {
-    // Mean wind in 0-6km layer
-    let mut sum_u = 0.0;
-    let mut sum_v = 0.0;
-    let mut count = 0.0;
-    for i in 0..z.len() {
-        if z[i] <= 6000.0 {
-            sum_u += u[i];
-            sum_v += v[i];
-            count += 1.0;
-        }
-    }
-    if count == 0.0 {
-        return ((0.0, 0.0), (0.0, 0.0));
-    }
-    let u_mean = sum_u / count;
-    let v_mean = sum_v / count;
+    let z_sfc = z[0];
 
-    // Shear vector: 0-6km
-    let (u_shr, v_shr) = {
-        // Find wind at ~6km
-        let mut u6 = u[0];
-        let mut v6 = v[0];
-        for i in 0..z.len() {
-            if z[i] <= 6000.0 {
-                u6 = u[i];
-                v6 = v[i];
-            }
-        }
-        (u6 - u[0], v6 - v[0])
-    };
+    // Pressure-weighted mean wind sfc-6km
+    let u_mean = pressure_weighted_mean(u, p, z, z_sfc, z_sfc + 6000.0);
+    let v_mean = pressure_weighted_mean(v, p, z, z_sfc, z_sfc + 6000.0);
+
+    // Pressure-weighted mean wind sfc-0.5km (tail of shear vector)
+    let u_500m = pressure_weighted_mean(u, p, z, z_sfc, z_sfc + 500.0);
+    let v_500m = pressure_weighted_mean(v, p, z, z_sfc, z_sfc + 500.0);
+
+    // Pressure-weighted mean wind 5.5-6km (head of shear vector)
+    let u_5500m = pressure_weighted_mean(u, p, z, z_sfc + 5500.0, z_sfc + 6000.0);
+    let v_5500m = pressure_weighted_mean(v, p, z, z_sfc + 5500.0, z_sfc + 6000.0);
+
+    // Shear vector = head - tail
+    let u_shr = u_5500m - u_500m;
+    let v_shr = v_5500m - v_500m;
 
     let shear_mag = (u_shr * u_shr + v_shr * v_shr).sqrt();
     let d = 7.5; // Bunkers deviation magnitude (m/s)
@@ -1920,9 +1967,10 @@ pub fn bunkers_storm_motion(
         return ((u_mean, v_mean), (u_mean, v_mean));
     }
 
-    // Perpendicular to shear: rotate 90 degrees
-    let u_perp = -v_shr / shear_mag * d;
-    let v_perp = u_shr / shear_mag * d;
+    // Cross product with k-hat: rotate shear 90 degrees clockwise
+    // shear_cross = [shear_v, -shear_u] (MetPy convention)
+    let u_perp = v_shr / shear_mag * d;
+    let v_perp = -u_shr / shear_mag * d;
 
     let u_rm = u_mean + u_perp;
     let v_rm = v_mean + v_perp;

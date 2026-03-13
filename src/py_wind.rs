@@ -93,11 +93,13 @@ fn mean_wind(
 
 #[pyfunction]
 fn bunkers_storm_motion(
+    p_prof: PyReadonlyArray1<f64>,
     u_prof: PyReadonlyArray1<f64>,
     v_prof: PyReadonlyArray1<f64>,
     height_prof: PyReadonlyArray1<f64>,
 ) -> ((f64, f64), (f64, f64), (f64, f64)) {
     metrust::calc::bunkers_storm_motion(
+        p_prof.as_slice().unwrap(),
         u_prof.as_slice().unwrap(),
         v_prof.as_slice().unwrap(),
         height_prof.as_slice().unwrap(),

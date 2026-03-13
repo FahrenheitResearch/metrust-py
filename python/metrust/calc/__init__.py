@@ -2431,16 +2431,18 @@ def bunkers_storm_motion(pressure_or_u, u_or_v, v_or_height, height=None):
         (right_u, right_v), (left_u, left_v), (mean_u, mean_v)
     """
     if height is not None:
-        # MetPy form: (pressure, u, v, height) — ignore pressure
+        # MetPy form: (pressure, u, v, height)
+        p_arr = _as_1d(_strip(pressure_or_u, "hPa"))
         u_arr = _as_1d(_strip(u_or_v, "m/s"))
         v_arr = _as_1d(_strip(v_or_height, "m/s"))
         h_arr = _as_1d(_strip(height, "m"))
     else:
-        # Direct form: (u, v, height)
+        # Direct form: (u, v, height) — derive pressure from std atmosphere
         u_arr = _as_1d(_strip(pressure_or_u, "m/s"))
         v_arr = _as_1d(_strip(u_or_v, "m/s"))
         h_arr = _as_1d(_strip(v_or_height, "m"))
-    (ru, rv), (lu, lv), (mu, mv) = _calc.bunkers_storm_motion(u_arr, v_arr, h_arr)
+        p_arr = np.array([_calc.height_to_pressure_std(float(hi)) for hi in h_arr])
+    (ru, rv), (lu, lv), (mu, mv) = _calc.bunkers_storm_motion(p_arr, u_arr, v_arr, h_arr)
     return (
         (_attach(ru, "m/s"), _attach(rv, "m/s")),
         (_attach(lu, "m/s"), _attach(lv, "m/s")),
