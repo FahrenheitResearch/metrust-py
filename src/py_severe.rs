@@ -295,7 +295,7 @@ fn sweat_index(
 /// - psfc, t2, q2: flattened [ny][nx] surface fields
 /// - parcel_type: "surface", "mixed_layer", or "most_unstable"
 #[pyfunction]
-#[pyo3(text_signature = "(pressure_3d, temperature_c_3d, qvapor_3d, height_agl_3d, psfc, t2, q2, nx, ny, nz, parcel_type)")]
+#[pyo3(signature = (pressure_3d, temperature_c_3d, qvapor_3d, height_agl_3d, psfc, t2, q2, nx, ny, nz, parcel_type, top_m=None))]
 fn compute_cape_cin<'py>(
     py: Python<'py>,
     pressure_3d: PyReadonlyArray1<f64>,
@@ -309,6 +309,7 @@ fn compute_cape_cin<'py>(
     ny: usize,
     nz: usize,
     parcel_type: &str,
+    top_m: Option<f64>,
 ) -> (
     Bound<'py, PyArray1<f64>>,
     Bound<'py, PyArray1<f64>>,
@@ -327,6 +328,7 @@ fn compute_cape_cin<'py>(
         ny,
         nz,
         parcel_type,
+        top_m,
     );
     (
         cape.into_pyarray(py),

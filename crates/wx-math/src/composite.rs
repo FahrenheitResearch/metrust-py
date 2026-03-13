@@ -90,6 +90,7 @@ pub fn compute_cape_cin(
     ny: usize,
     nz: usize,
     parcel_type: &str,
+    top_m: Option<f64>,
 ) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
     let n2d = ny * nx;
     let parcel_type_owned = parcel_type.to_string();
@@ -130,7 +131,7 @@ pub fn compute_cape_cin(
                 return metfuncs::cape_cin_core(
                     &p_hpa, &t_c, &td_c, &h_agl,
                     psfc_hpa, t2m_c, td2m_c,
-                    &parcel_type_owned, 100.0, 300.0, None,
+                    &parcel_type_owned, 100.0, 300.0, top_m,
                 );
             }
 

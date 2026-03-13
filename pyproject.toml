@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "metrust"
-version = "0.1.3"
+version = "0.1.4"
 description = "Rust-powered meteorology toolkit for Python"
 requires-python = ">=3.9"
 dependencies = ["numpy>=1.20", "pint>=0.20"]
