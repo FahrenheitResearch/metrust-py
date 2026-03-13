@@ -89,6 +89,18 @@ def _prep(*values):
     return flat, orig_shape, True
 
 
+def _vec_call(fn, *stripped_args):
+    """Call scalar Rust fn element-wise over array args; return scalar or reshaped array."""
+    vals, shape, is_arr = _prep(*stripped_args)
+    if not is_arr:
+        return fn(*vals)
+    n = vals[0].size
+    result = np.empty(n, dtype=np.float64)
+    for i in range(n):
+        result[i] = fn(*[v[i] for v in vals])
+    return result.reshape(shape)
+
+
 def _is_pressure_like(value):
     return _can_convert(value, "hPa")
 
@@ -267,9 +279,9 @@ def lfc(pressure, temperature, dewpoint):
     Quantity (hPa)
         LFC pressure.
     """
-    p = _as_float(_strip(pressure, "hPa"))
-    t = _as_float(_strip(temperature, "degC"))
-    td = _as_float(_strip(dewpoint, "degC"))
+    p = _as_1d(_strip(pressure, "hPa"))
+    t = _as_1d(_strip(temperature, "degC"))
+    td = _as_1d(_strip(dewpoint, "degC"))
     result = _calc.lfc(p, t, td)
     return result * units.hPa
 
@@ -288,9 +300,9 @@ def el(pressure, temperature, dewpoint):
     Quantity (hPa)
         EL pressure.
     """
-    p = _as_float(_strip(pressure, "hPa"))
-    t = _as_float(_strip(temperature, "degC"))
-    td = _as_float(_strip(dewpoint, "degC"))
+    p = _as_1d(_strip(pressure, "hPa"))
+    t = _as_1d(_strip(temperature, "degC"))
+    td = _as_1d(_strip(dewpoint, "degC"))
     result = _calc.el(p, t, td)
     return result * units.hPa
 
@@ -389,12 +401,13 @@ def virtual_temperature(temperature, pressure_or_mixing_ratio, dewpoint=None,
     """
     if dewpoint is None:
         # MetPy-compatible path: T * (1 + w/eps) / (1 + w)
-        t = _as_float(_strip(temperature, "degC"))
-        w = _as_float(_strip(pressure_or_mixing_ratio, "kg/kg")) if hasattr(pressure_or_mixing_ratio, "magnitude") else float(pressure_or_mixing_ratio)
+        t = np.asarray(_strip(temperature, "degC"), dtype=np.float64)
+        w = np.asarray(_strip(pressure_or_mixing_ratio, "kg/kg") if hasattr(pressure_or_mixing_ratio, "magnitude") else pressure_or_mixing_ratio, dtype=np.float64)
         eps = molecular_weight_ratio
         t_k = t + 273.15
         tv_k = t_k * (1.0 + w / eps) / (1.0 + w)
-        return _attach(tv_k - 273.15, "degC")
+        result = tv_k - 273.15
+        return _attach(float(result) if np.ndim(result) == 0 else result, "degC")
     vals, shape, is_arr = _prep(
         _strip(temperature, "degC"),
         _strip(pressure_or_mixing_ratio, "hPa"),
@@ -425,10 +438,16 @@ def virtual_temperature_from_dewpoint(pressure, temperature, dewpoint,
     -------
     Quantity (degC)
     """
-    p = _as_float(_strip(pressure, "hPa"))
-    t = _as_float(_strip(temperature, "degC"))
-    td = _as_float(_strip(dewpoint, "degC"))
-    return _calc.virtual_temperature_from_dewpoint(t, td, p) * units.degC
+    vals, shape, is_arr = _prep(
+        _strip(temperature, "degC"),
+        _strip(dewpoint, "degC"),
+        _strip(pressure, "hPa"),
+    )
+    if is_arr:
+        result = np.asarray(_calc.virtual_temperature_from_dewpoint_array(vals[0], vals[1], vals[2])).reshape(shape)
+    else:
+        result = _calc.virtual_temperature_from_dewpoint(vals[0], vals[1], vals[2])
+    return result * units.degC
 
 
 def cape_cin(pressure, temperature, dewpoint, parcel_profile_or_height=None,
@@ -779,8 +798,8 @@ def moist_air_gas_constant(mixing_ratio_kgkg):
     -------
     Quantity (J/(kg*K))
     """
-    w = _as_float(_strip(mixing_ratio_kgkg, "kg/kg")) if hasattr(mixing_ratio_kgkg, "magnitude") else float(mixing_ratio_kgkg)
-    return _calc.moist_air_gas_constant(w) * units("J/(kg*K)")
+    result = _vec_call(_calc.moist_air_gas_constant, _strip(mixing_ratio_kgkg, "kg/kg") if hasattr(mixing_ratio_kgkg, "magnitude") else mixing_ratio_kgkg)
+    return result * units("J/(kg*K)")
 
 
 def moist_air_specific_heat_pressure(mixing_ratio_kgkg):
@@ -794,8 +813,8 @@ def moist_air_specific_heat_pressure(mixing_ratio_kgkg):
     -------
     Quantity (J/(kg*K))
     """
-    w = _as_float(_strip(mixing_ratio_kgkg, "kg/kg")) if hasattr(mixing_ratio_kgkg, "magnitude") else float(mixing_ratio_kgkg)
-    return _calc.moist_air_specific_heat_pressure(w) * units("J/(kg*K)")
+    result = _vec_call(_calc.moist_air_specific_heat_pressure, _strip(mixing_ratio_kgkg, "kg/kg") if hasattr(mixing_ratio_kgkg, "magnitude") else mixing_ratio_kgkg)
+    return result * units("J/(kg*K)")
 
 
 def moist_air_poisson_exponent(mixing_ratio_kgkg):
@@ -809,8 +828,8 @@ def moist_air_poisson_exponent(mixing_ratio_kgkg):
     -------
     Quantity (dimensionless)
     """
-    w = _as_float(_strip(mixing_ratio_kgkg, "kg/kg")) if hasattr(mixing_ratio_kgkg, "magnitude") else float(mixing_ratio_kgkg)
-    return _calc.moist_air_poisson_exponent(w) * units.dimensionless
+    result = _vec_call(_calc.moist_air_poisson_exponent, _strip(mixing_ratio_kgkg, "kg/kg") if hasattr(mixing_ratio_kgkg, "magnitude") else mixing_ratio_kgkg)
+    return result * units.dimensionless
 
 
 def water_latent_heat_vaporization(temperature):
@@ -824,8 +843,8 @@ def water_latent_heat_vaporization(temperature):
     -------
     Quantity (J/kg)
     """
-    t = _as_float(_strip(temperature, "degC"))
-    return _calc.water_latent_heat_vaporization(t) * units("J/kg")
+    result = _vec_call(_calc.water_latent_heat_vaporization, _strip(temperature, "degC"))
+    return result * units("J/kg")
 
 
 def water_latent_heat_melting(temperature):
@@ -839,8 +858,8 @@ def water_latent_heat_melting(temperature):
     -------
     Quantity (J/kg)
     """
-    t = _as_float(_strip(temperature, "degC"))
-    return _calc.water_latent_heat_melting(t) * units("J/kg")
+    result = _vec_call(_calc.water_latent_heat_melting, _strip(temperature, "degC"))
+    return result * units("J/kg")
 
 
 def water_latent_heat_sublimation(temperature):
@@ -854,8 +873,8 @@ def water_latent_heat_sublimation(temperature):
     -------
     Quantity (J/kg)
     """
-    t = _as_float(_strip(temperature, "degC"))
-    return _calc.water_latent_heat_sublimation(t) * units("J/kg")
+    result = _vec_call(_calc.water_latent_heat_sublimation, _strip(temperature, "degC"))
+    return result * units("J/kg")
 
 
 def relative_humidity_wet_psychrometric(temperature, wet_bulb, pressure):
@@ -871,10 +890,8 @@ def relative_humidity_wet_psychrometric(temperature, wet_bulb, pressure):
     -------
     Quantity (percent)
     """
-    t = _as_float(_strip(temperature, "degC"))
-    tw = _as_float(_strip(wet_bulb, "degC"))
-    p = _as_float(_strip(pressure, "hPa"))
-    return _calc.relative_humidity_wet_psychrometric(t, tw, p) * units.percent
+    result = _vec_call(_calc.relative_humidity_wet_psychrometric, _strip(temperature, "degC"), _strip(wet_bulb, "degC"), _strip(pressure, "hPa"))
+    return result * units.percent
 
 
 def weighted_continuous_average(values, weights):
@@ -930,9 +947,8 @@ def add_height_to_pressure(pressure, delta_height):
     -------
     Quantity (hPa)
     """
-    p = _as_float(_strip(pressure, "hPa"))
-    dh = _as_float(_strip(delta_height, "m"))
-    return _calc.add_height_to_pressure(p, dh) * units.hPa
+    result = _vec_call(_calc.add_height_to_pressure, _strip(pressure, "hPa"), _strip(delta_height, "m"))
+    return result * units.hPa
 
 
 def add_pressure_to_height(height, delta_pressure):
@@ -947,9 +963,8 @@ def add_pressure_to_height(height, delta_pressure):
     -------
     Quantity (m)
     """
-    h = _as_float(_strip(height, "m"))
-    dp = _as_float(_strip(delta_pressure, "hPa"))
-    return _calc.add_pressure_to_height(h, dp) * units.m
+    result = _vec_call(_calc.add_pressure_to_height, _strip(height, "m"), _strip(delta_pressure, "hPa"))
+    return result * units.m
 
 
 def thickness_hydrostatic(p_bottom, p_top, t_mean):
@@ -965,10 +980,8 @@ def thickness_hydrostatic(p_bottom, p_top, t_mean):
     -------
     Quantity (m)
     """
-    pb = _as_float(_strip(p_bottom, "hPa"))
-    pt = _as_float(_strip(p_top, "hPa"))
-    tm = _as_float(_strip(t_mean, "K"))
-    return _calc.thickness_hydrostatic(pb, pt, tm) * units.m
+    result = _vec_call(_calc.thickness_hydrostatic, _strip(p_bottom, "hPa"), _strip(p_top, "hPa"), _strip(t_mean, "K"))
+    return result * units.m
 
 
 def vapor_pressure(pressure_or_dewpoint, mixing_ratio=None,
@@ -1007,8 +1020,12 @@ def specific_humidity_from_mixing_ratio(mixing_ratio):
     -------
     Quantity (dimensionless, kg/kg)
     """
-    w = _as_float(_strip(mixing_ratio, "kg/kg"))
-    return _calc.specific_humidity_from_mixing_ratio(w) * units("kg/kg")
+    vals, shape, is_arr = _prep(_strip(mixing_ratio, "kg/kg"))
+    if is_arr:
+        result = np.asarray(_calc.specific_humidity_from_mixing_ratio_array(vals[0])).reshape(shape)
+    else:
+        result = _calc.specific_humidity_from_mixing_ratio(vals[0])
+    return result * units("kg/kg")
 
 
 def thickness_hydrostatic_from_relative_humidity(pressure, temperature,
@@ -1123,8 +1140,12 @@ def dewpoint(vapor_pressure_val):
     -------
     Quantity (degC)
     """
-    e = _as_float(_strip(vapor_pressure_val, "hPa"))
-    return _calc.dewpoint(e) * units.degC
+    vals, shape, is_arr = _prep(_strip(vapor_pressure_val, "hPa"))
+    if is_arr:
+        result = np.asarray(_calc.dewpoint_array(vals[0])).reshape(shape)
+    else:
+        result = _calc.dewpoint(vals[0])
+    return result * units.degC
 
 
 def dewpoint_from_specific_humidity(pressure, specific_humidity):
@@ -1139,9 +1160,15 @@ def dewpoint_from_specific_humidity(pressure, specific_humidity):
     -------
     Quantity (degC)
     """
-    p = _as_float(_strip(pressure, "hPa"))
-    q = _as_float(_strip(specific_humidity, "kg/kg")) if hasattr(specific_humidity, "magnitude") else float(specific_humidity)
-    return _calc.dewpoint_from_specific_humidity(p, q) * units.degC
+    vals, shape, is_arr = _prep(
+        _strip(pressure, "hPa"),
+        _strip(specific_humidity, "kg/kg") if hasattr(specific_humidity, "magnitude") else specific_humidity,
+    )
+    if is_arr:
+        result = np.asarray(_calc.dewpoint_from_specific_humidity_array(vals[0], vals[1])).reshape(shape)
+    else:
+        result = _calc.dewpoint_from_specific_humidity(vals[0], vals[1])
+    return result * units.degC
 
 
 def dry_lapse(pressure, t_surface):
@@ -1174,9 +1201,8 @@ def dry_static_energy(height, temperature):
     -------
     Quantity (J/kg)
     """
-    z = _as_float(_strip(height, "m"))
-    t_k = _as_float(_strip(temperature, "K"))
-    return _calc.dry_static_energy(z, t_k) * units("J/kg")
+    result = _vec_call(_calc.dry_static_energy, _strip(height, "m"), _strip(temperature, "K"))
+    return result * units("J/kg")
 
 
 def exner_function(pressure):
@@ -1227,8 +1253,8 @@ def geopotential_to_height(geopotential):
     -------
     Quantity (m)
     """
-    gp = _as_float(_strip(geopotential, "m**2/s**2")) if hasattr(geopotential, "magnitude") else float(geopotential)
-    return _calc.geopotential_to_height(gp) * units.m
+    result = _vec_call(_calc.geopotential_to_height, _strip(geopotential, "m**2/s**2") if hasattr(geopotential, "magnitude") else geopotential)
+    return result * units.m
 
 
 def get_layer(pressure, values, p_bottom, p_top):
@@ -1292,8 +1318,8 @@ def height_to_geopotential(height):
     -------
     Quantity (m^2/s^2)
     """
-    h = _as_float(_strip(height, "m"))
-    return _calc.height_to_geopotential(h) * units("m**2/s**2")
+    result = _vec_call(_calc.height_to_geopotential, _strip(height, "m"))
+    return result * units("m**2/s**2")
 
 
 def isentropic_interpolation(theta_levels, pressure_3d, temperature_3d,
@@ -1404,11 +1430,13 @@ def mixing_ratio_from_relative_humidity(pressure, temperature, relative_humidity
     -------
     Quantity (dimensionless, kg/kg)
     """
-    p = _as_float(_strip(pressure, "hPa"))
-    t = _as_float(_strip(temperature, "degC"))
     rh = _rh_to_percent(relative_humidity)
-    # Rust returns g/kg; MetPy convention is dimensionless kg/kg
-    return _attach(_calc.mixing_ratio_from_relative_humidity(p, t, rh) / 1000.0, "kg/kg")
+    vals, shape, is_arr = _prep(_strip(pressure, "hPa"), _strip(temperature, "degC"), rh)
+    if is_arr:
+        result = np.asarray(_calc.mixing_ratio_from_relative_humidity_array(vals[0], vals[1], vals[2])).reshape(shape) / 1000.0
+    else:
+        result = _calc.mixing_ratio_from_relative_humidity(vals[0], vals[1], vals[2]) / 1000.0
+    return _attach(result, "kg/kg")
 
 
 def mixing_ratio_from_specific_humidity(specific_humidity):
@@ -1422,9 +1450,12 @@ def mixing_ratio_from_specific_humidity(specific_humidity):
     -------
     Quantity (dimensionless, kg/kg)
     """
-    q = _as_float(_strip(specific_humidity, "kg/kg")) if hasattr(specific_humidity, "magnitude") else float(specific_humidity)
-    # Rust returns g/kg; MetPy convention is dimensionless kg/kg
-    return _attach(_calc.mixing_ratio_from_specific_humidity(q) / 1000.0, "kg/kg")
+    vals, shape, is_arr = _prep(_strip(specific_humidity, "kg/kg") if hasattr(specific_humidity, "magnitude") else specific_humidity)
+    if is_arr:
+        result = np.asarray(_calc.mixing_ratio_from_specific_humidity_array(vals[0])).reshape(shape) / 1000.0
+    else:
+        result = _calc.mixing_ratio_from_specific_humidity(vals[0]) / 1000.0
+    return _attach(result, "kg/kg")
 
 
 def moist_lapse(pressure, t_start):
@@ -1458,10 +1489,8 @@ def moist_static_energy(height, temperature, specific_humidity):
     -------
     Quantity (J/kg)
     """
-    z = _as_float(_strip(height, "m"))
-    t_k = _as_float(_strip(temperature, "K"))
-    q = _as_float(_strip(specific_humidity, "kg/kg")) if hasattr(specific_humidity, "magnitude") else float(specific_humidity)
-    return _calc.moist_static_energy(z, t_k, q) * units("J/kg")
+    result = _vec_call(_calc.moist_static_energy, _strip(height, "m"), _strip(temperature, "K"), _strip(specific_humidity, "kg/kg") if hasattr(specific_humidity, "magnitude") else specific_humidity)
+    return result * units("J/kg")
 
 
 def montgomery_streamfunction(theta, pressure, temperature, height):
@@ -1478,11 +1507,8 @@ def montgomery_streamfunction(theta, pressure, temperature, height):
     -------
     Quantity (J/kg)
     """
-    th = _as_float(_strip(theta, "K"))
-    p = _as_float(_strip(pressure, "hPa"))
-    t_k = _as_float(_strip(temperature, "K"))
-    z = _as_float(_strip(height, "m"))
-    return _calc.montgomery_streamfunction(th, p, t_k, z) * units("J/kg")
+    result = _vec_call(_calc.montgomery_streamfunction, _strip(theta, "K"), _strip(pressure, "hPa"), _strip(temperature, "K"), _strip(height, "m"))
+    return result * units("J/kg")
 
 
 def most_unstable_cape_cin(pressure, temperature, dewpoint):
@@ -1557,11 +1583,15 @@ def relative_humidity_from_mixing_ratio(pressure, temperature, mixing_ratio_val)
     -------
     Quantity (dimensionless, 0-1)
     """
-    p = _as_float(_strip(pressure, "hPa"))
-    t = _as_float(_strip(temperature, "degC"))
-    w = _as_float(_strip(mixing_ratio_val, "g/kg")) if _can_convert(mixing_ratio_val, "g/kg") else _as_float(_strip(mixing_ratio_val, "kg/kg")) * 1000.0
-    # Rust returns percent; MetPy returns dimensionless fraction
-    return _attach(_calc.relative_humidity_from_mixing_ratio(p, t, w) / 100.0, "")
+    p_raw = _strip(pressure, "hPa")
+    t_raw = _strip(temperature, "degC")
+    w_raw = _strip(mixing_ratio_val, "g/kg") if _can_convert(mixing_ratio_val, "g/kg") else np.asarray(_strip(mixing_ratio_val, "kg/kg"), dtype=np.float64) * 1000.0
+    vals, shape, is_arr = _prep(p_raw, t_raw, w_raw)
+    if is_arr:
+        result = np.asarray(_calc.relative_humidity_from_mixing_ratio_array(vals[0], vals[1], vals[2])).reshape(shape) / 100.0
+    else:
+        result = _calc.relative_humidity_from_mixing_ratio(vals[0], vals[1], vals[2]) / 100.0
+    return _attach(result, "")
 
 
 def relative_humidity_from_specific_humidity(pressure, temperature, specific_humidity):
@@ -1577,11 +1607,16 @@ def relative_humidity_from_specific_humidity(pressure, temperature, specific_hum
     -------
     Quantity (dimensionless, 0-1)
     """
-    p = _as_float(_strip(pressure, "hPa"))
-    t = _as_float(_strip(temperature, "degC"))
-    q = _as_float(_strip(specific_humidity, "kg/kg")) if hasattr(specific_humidity, "magnitude") else float(specific_humidity)
-    # Rust returns percent; MetPy returns dimensionless fraction
-    return _attach(_calc.relative_humidity_from_specific_humidity(p, t, q) / 100.0, "")
+    vals, shape, is_arr = _prep(
+        _strip(pressure, "hPa"),
+        _strip(temperature, "degC"),
+        _strip(specific_humidity, "kg/kg") if hasattr(specific_humidity, "magnitude") else specific_humidity,
+    )
+    if is_arr:
+        result = np.asarray(_calc.relative_humidity_from_specific_humidity_array(vals[0], vals[1], vals[2])).reshape(shape) / 100.0
+    else:
+        result = _calc.relative_humidity_from_specific_humidity(vals[0], vals[1], vals[2]) / 100.0
+    return _attach(result, "")
 
 
 def saturation_equivalent_potential_temperature(pressure, temperature):
@@ -1596,9 +1631,12 @@ def saturation_equivalent_potential_temperature(pressure, temperature):
     -------
     Quantity (K)
     """
-    p = _as_float(_strip(pressure, "hPa"))
-    t = _as_float(_strip(temperature, "degC"))
-    return _calc.saturation_equivalent_potential_temperature(p, t) * units.K
+    vals, shape, is_arr = _prep(_strip(pressure, "hPa"), _strip(temperature, "degC"))
+    if is_arr:
+        result = np.asarray(_calc.saturation_equivalent_potential_temperature_array(vals[0], vals[1])).reshape(shape)
+    else:
+        result = _calc.saturation_equivalent_potential_temperature(vals[0], vals[1])
+    return result * units.K
 
 
 def scale_height(temperature):
@@ -1612,8 +1650,8 @@ def scale_height(temperature):
     -------
     Quantity (m)
     """
-    t_k = _as_float(_strip(temperature, "K"))
-    return _calc.scale_height(t_k) * units.m
+    result = _vec_call(_calc.scale_height, _strip(temperature, "K"))
+    return result * units.m
 
 
 def specific_humidity_from_dewpoint(pressure, dewpoint_val):
@@ -1628,9 +1666,12 @@ def specific_humidity_from_dewpoint(pressure, dewpoint_val):
     -------
     Quantity (dimensionless, kg/kg)
     """
-    p = _as_float(_strip(pressure, "hPa"))
-    td = _as_float(_strip(dewpoint_val, "degC"))
-    return _calc.specific_humidity_from_dewpoint(p, td) * units("kg/kg")
+    vals, shape, is_arr = _prep(_strip(pressure, "hPa"), _strip(dewpoint_val, "degC"))
+    if is_arr:
+        result = np.asarray(_calc.specific_humidity_from_dewpoint_array(vals[0], vals[1])).reshape(shape)
+    else:
+        result = _calc.specific_humidity_from_dewpoint(vals[0], vals[1])
+    return result * units("kg/kg")
 
 
 def static_stability(pressure, temperature):
@@ -1683,9 +1724,12 @@ def temperature_from_potential_temperature(pressure, theta):
     -------
     Quantity (K)
     """
-    p = _as_float(_strip(pressure, "hPa"))
-    th = _as_float(_strip(theta, "K"))
-    return _calc.temperature_from_potential_temperature(p, th) * units.K
+    vals, shape, is_arr = _prep(_strip(pressure, "hPa"), _strip(theta, "K"))
+    if is_arr:
+        result = np.asarray(_calc.temperature_from_potential_temperature_array(vals[0], vals[1])).reshape(shape)
+    else:
+        result = _calc.temperature_from_potential_temperature(vals[0], vals[1])
+    return result * units.K
 
 
 def vertical_velocity(omega, pressure, temperature):
@@ -1701,10 +1745,8 @@ def vertical_velocity(omega, pressure, temperature):
     -------
     Quantity (m/s)
     """
-    o = _as_float(_strip(omega, "Pa/s"))
-    p = _as_float(_strip(pressure, "hPa"))
-    t = _as_float(_strip(temperature, "degC"))
-    return _calc.vertical_velocity(o, p, t) * units("m/s")
+    result = _vec_call(_calc.vertical_velocity, _strip(omega, "Pa/s"), _strip(pressure, "hPa"), _strip(temperature, "degC"))
+    return result * units("m/s")
 
 
 def vertical_velocity_pressure(w, pressure, temperature):
@@ -1720,10 +1762,8 @@ def vertical_velocity_pressure(w, pressure, temperature):
     -------
     Quantity (Pa/s)
     """
-    w_val = _as_float(_strip(w, "m/s"))
-    p = _as_float(_strip(pressure, "hPa"))
-    t = _as_float(_strip(temperature, "degC"))
-    return _calc.vertical_velocity_pressure(w_val, p, t) * units("Pa/s")
+    result = _vec_call(_calc.vertical_velocity_pressure, _strip(w, "m/s"), _strip(pressure, "hPa"), _strip(temperature, "degC"))
+    return result * units("Pa/s")
 
 
 def virtual_potential_temperature(pressure, temperature, mixing_ratio_val):
@@ -1739,10 +1779,15 @@ def virtual_potential_temperature(pressure, temperature, mixing_ratio_val):
     -------
     Quantity (K)
     """
-    p = _as_float(_strip(pressure, "hPa"))
-    t = _as_float(_strip(temperature, "degC"))
-    w = _as_float(_strip(mixing_ratio_val, "g/kg")) if _can_convert(mixing_ratio_val, "g/kg") else _as_float(_strip(mixing_ratio_val, "kg/kg")) * 1000.0
-    return _calc.virtual_potential_temperature(p, t, w) * units.K
+    p_raw = _strip(pressure, "hPa")
+    t_raw = _strip(temperature, "degC")
+    w_raw = _strip(mixing_ratio_val, "g/kg") if _can_convert(mixing_ratio_val, "g/kg") else np.asarray(_strip(mixing_ratio_val, "kg/kg"), dtype=np.float64) * 1000.0
+    vals, shape, is_arr = _prep(p_raw, t_raw, w_raw)
+    if is_arr:
+        result = np.asarray(_calc.virtual_potential_temperature_array(vals[0], vals[1], vals[2])).reshape(shape)
+    else:
+        result = _calc.virtual_potential_temperature(vals[0], vals[1], vals[2])
+    return result * units.K
 
 
 def wet_bulb_potential_temperature(pressure, temperature, dewpoint):
@@ -1758,10 +1803,12 @@ def wet_bulb_potential_temperature(pressure, temperature, dewpoint):
     -------
     Quantity (K)
     """
-    p = _as_float(_strip(pressure, "hPa"))
-    t = _as_float(_strip(temperature, "degC"))
-    td = _as_float(_strip(dewpoint, "degC"))
-    return _calc.wet_bulb_potential_temperature(p, t, td) * units.K
+    vals, shape, is_arr = _prep(_strip(pressure, "hPa"), _strip(temperature, "degC"), _strip(dewpoint, "degC"))
+    if is_arr:
+        result = np.asarray(_calc.wet_bulb_potential_temperature_array(vals[0], vals[1], vals[2])).reshape(shape)
+    else:
+        result = _calc.wet_bulb_potential_temperature(vals[0], vals[1], vals[2])
+    return result * units.K
 
 
 def get_mixed_layer_parcel(pressure, temperature, dewpoint, depth=100.0):
@@ -1825,10 +1872,8 @@ def psychrometric_vapor_pressure(temperature, wet_bulb, pressure):
     -------
     Quantity (hPa)
     """
-    t = _as_float(_strip(temperature, "degC"))
-    tw = _as_float(_strip(wet_bulb, "degC"))
-    p = _as_float(_strip(pressure, "hPa"))
-    return _calc.psychrometric_vapor_pressure(t, tw, p) * units.hPa
+    result = _vec_call(_calc.psychrometric_vapor_pressure, _strip(temperature, "degC"), _strip(wet_bulb, "degC"), _strip(pressure, "hPa"))
+    return result * units.hPa
 
 
 def frost_point(temperature, relative_humidity):
@@ -1843,9 +1888,13 @@ def frost_point(temperature, relative_humidity):
     -------
     Quantity (degC)
     """
-    t = _as_float(_strip(temperature, "degC"))
     rh = _rh_to_percent(relative_humidity)
-    return _calc.frost_point(t, rh) * units.degC
+    vals, shape, is_arr = _prep(_strip(temperature, "degC"), rh)
+    if is_arr:
+        result = np.asarray(_calc.frost_point_array(vals[0], vals[1])).reshape(shape)
+    else:
+        result = _calc.frost_point(vals[0], vals[1])
+    return result * units.degC
 
 
 # ============================================================================
@@ -3120,9 +3169,8 @@ def heat_index(temperature, relative_humidity):
     -------
     Quantity (degC)
     """
-    t = _as_float(_strip(temperature, "degC"))
-    rh = _as_float(_strip(relative_humidity, "percent")) if hasattr(relative_humidity, "magnitude") else float(relative_humidity)
-    return _calc.heat_index(t, rh) * units.degC
+    result = _vec_call(_calc.heat_index, _strip(temperature, "degC"), _strip(relative_humidity, "percent") if hasattr(relative_humidity, "magnitude") else relative_humidity)
+    return result * units.degC
 
 
 def windchill(temperature, wind_speed_val):
@@ -3137,9 +3185,8 @@ def windchill(temperature, wind_speed_val):
     -------
     Quantity (degC)
     """
-    t = _as_float(_strip(temperature, "degC"))
-    ws = _as_float(_strip(wind_speed_val, "m/s"))
-    return _calc.windchill(t, ws) * units.degC
+    result = _vec_call(_calc.windchill, _strip(temperature, "degC"), _strip(wind_speed_val, "m/s"))
+    return result * units.degC
 
 
 def apparent_temperature(temperature, relative_humidity, wind_speed_val):
@@ -3155,10 +3202,8 @@ def apparent_temperature(temperature, relative_humidity, wind_speed_val):
     -------
     Quantity (degC)
     """
-    t = _as_float(_strip(temperature, "degC"))
-    rh = _as_float(_strip(relative_humidity, "percent")) if hasattr(relative_humidity, "magnitude") else float(relative_humidity)
-    ws = _as_float(_strip(wind_speed_val, "m/s"))
-    return _calc.apparent_temperature(t, rh, ws) * units.degC
+    result = _vec_call(_calc.apparent_temperature, _strip(temperature, "degC"), _strip(relative_humidity, "percent") if hasattr(relative_humidity, "magnitude") else relative_humidity, _strip(wind_speed_val, "m/s"))
+    return result * units.degC
 
 
 # ============================================================================

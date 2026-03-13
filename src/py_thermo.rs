@@ -1096,6 +1096,254 @@ fn exner_function_array<'py>(
     Ok(result.into_pyarray(py))
 }
 
+/// Mixing ratio from relative humidity — array version.
+#[pyfunction]
+fn mixing_ratio_from_relative_humidity_array<'py>(
+    py: Python<'py>,
+    pressure: PyReadonlyArray1<f64>,
+    temperature: PyReadonlyArray1<f64>,
+    rh: PyReadonlyArray1<f64>,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let p = pressure.as_slice()?;
+    let t = temperature.as_slice()?;
+    let r = rh.as_slice()?;
+    let result: Vec<f64> = p.iter().zip(t.iter().zip(r.iter()))
+        .map(|(&p, (&t, &r))| metrust::calc::thermo::mixing_ratio_from_relative_humidity(p, t, r))
+        .collect();
+    Ok(result.into_pyarray(py))
+}
+
+/// Relative humidity from mixing ratio — array version.
+#[pyfunction]
+fn relative_humidity_from_mixing_ratio_array<'py>(
+    py: Python<'py>,
+    pressure: PyReadonlyArray1<f64>,
+    temperature: PyReadonlyArray1<f64>,
+    mixing_ratio: PyReadonlyArray1<f64>,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let p = pressure.as_slice()?;
+    let t = temperature.as_slice()?;
+    let w = mixing_ratio.as_slice()?;
+    let result: Vec<f64> = p.iter().zip(t.iter().zip(w.iter()))
+        .map(|(&p, (&t, &w))| metrust::calc::thermo::relative_humidity_from_mixing_ratio(p, t, w))
+        .collect();
+    Ok(result.into_pyarray(py))
+}
+
+/// Relative humidity from specific humidity — array version.
+#[pyfunction]
+fn relative_humidity_from_specific_humidity_array<'py>(
+    py: Python<'py>,
+    pressure: PyReadonlyArray1<f64>,
+    temperature: PyReadonlyArray1<f64>,
+    specific_humidity: PyReadonlyArray1<f64>,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let p = pressure.as_slice()?;
+    let t = temperature.as_slice()?;
+    let q = specific_humidity.as_slice()?;
+    let result: Vec<f64> = p.iter().zip(t.iter().zip(q.iter()))
+        .map(|(&p, (&t, &q))| metrust::calc::thermo::relative_humidity_from_specific_humidity(p, t, q))
+        .collect();
+    Ok(result.into_pyarray(py))
+}
+
+/// Specific humidity from dewpoint — array version.
+#[pyfunction]
+fn specific_humidity_from_dewpoint_array<'py>(
+    py: Python<'py>,
+    pressure: PyReadonlyArray1<f64>,
+    dewpoint: PyReadonlyArray1<f64>,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let p = pressure.as_slice()?;
+    let td = dewpoint.as_slice()?;
+    let result: Vec<f64> = p.iter().zip(td.iter())
+        .map(|(&p, &td)| metrust::calc::thermo::specific_humidity_from_dewpoint(p, td))
+        .collect();
+    Ok(result.into_pyarray(py))
+}
+
+/// Dewpoint from specific humidity — array version.
+#[pyfunction]
+fn dewpoint_from_specific_humidity_array<'py>(
+    py: Python<'py>,
+    pressure: PyReadonlyArray1<f64>,
+    specific_humidity: PyReadonlyArray1<f64>,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let p = pressure.as_slice()?;
+    let q = specific_humidity.as_slice()?;
+    let result: Vec<f64> = p.iter().zip(q.iter())
+        .map(|(&p, &q)| metrust::calc::thermo::dewpoint_from_specific_humidity(p, q))
+        .collect();
+    Ok(result.into_pyarray(py))
+}
+
+/// Specific humidity from pressure and mixing ratio — array version.
+#[pyfunction]
+fn specific_humidity_array<'py>(
+    py: Python<'py>,
+    pressure: PyReadonlyArray1<f64>,
+    mixing_ratio: PyReadonlyArray1<f64>,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let p = pressure.as_slice()?;
+    let w = mixing_ratio.as_slice()?;
+    let result: Vec<f64> = p.iter().zip(w.iter())
+        .map(|(&p, &w)| metrust::calc::thermo::specific_humidity(p, w))
+        .collect();
+    Ok(result.into_pyarray(py))
+}
+
+/// Mixing ratio from specific humidity — array version.
+#[pyfunction]
+fn mixing_ratio_from_specific_humidity_array<'py>(
+    py: Python<'py>,
+    specific_humidity: PyReadonlyArray1<f64>,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let q = specific_humidity.as_slice()?;
+    let result: Vec<f64> = q.iter()
+        .map(|&q| metrust::calc::thermo::mixing_ratio_from_specific_humidity(q))
+        .collect();
+    Ok(result.into_pyarray(py))
+}
+
+/// Specific humidity from mixing ratio — array version.
+#[pyfunction]
+fn specific_humidity_from_mixing_ratio_array<'py>(
+    py: Python<'py>,
+    mixing_ratio: PyReadonlyArray1<f64>,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let w = mixing_ratio.as_slice()?;
+    let result: Vec<f64> = w.iter()
+        .map(|&w| metrust::calc::thermo::specific_humidity_from_mixing_ratio(w))
+        .collect();
+    Ok(result.into_pyarray(py))
+}
+
+/// Dewpoint from vapor pressure — array version.
+#[pyfunction]
+fn dewpoint_array<'py>(
+    py: Python<'py>,
+    vp: PyReadonlyArray1<f64>,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let e = vp.as_slice()?;
+    let result: Vec<f64> = e.iter()
+        .map(|&e| metrust::calc::thermo::dewpoint_from_vapor_pressure(e))
+        .collect();
+    Ok(result.into_pyarray(py))
+}
+
+/// Virtual potential temperature — array version.
+#[pyfunction]
+fn virtual_potential_temperature_array<'py>(
+    py: Python<'py>,
+    pressure: PyReadonlyArray1<f64>,
+    temperature: PyReadonlyArray1<f64>,
+    mixing_ratio: PyReadonlyArray1<f64>,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let p = pressure.as_slice()?;
+    let t = temperature.as_slice()?;
+    let w = mixing_ratio.as_slice()?;
+    let result: Vec<f64> = p.iter().zip(t.iter().zip(w.iter()))
+        .map(|(&p, (&t, &w))| metrust::calc::thermo::virtual_potential_temperature(p, t, w))
+        .collect();
+    Ok(result.into_pyarray(py))
+}
+
+/// Temperature from potential temperature — array version.
+#[pyfunction]
+fn temperature_from_potential_temperature_array<'py>(
+    py: Python<'py>,
+    pressure: PyReadonlyArray1<f64>,
+    theta: PyReadonlyArray1<f64>,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let p = pressure.as_slice()?;
+    let th = theta.as_slice()?;
+    let result: Vec<f64> = p.iter().zip(th.iter())
+        .map(|(&p, &th)| metrust::calc::thermo::temperature_from_potential_temperature(p, th))
+        .collect();
+    Ok(result.into_pyarray(py))
+}
+
+/// LCL pressure — array version.
+#[pyfunction]
+fn lcl_pressure_array<'py>(
+    py: Python<'py>,
+    pressure: PyReadonlyArray1<f64>,
+    temperature: PyReadonlyArray1<f64>,
+    dewpoint: PyReadonlyArray1<f64>,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let p = pressure.as_slice()?;
+    let t = temperature.as_slice()?;
+    let td = dewpoint.as_slice()?;
+    let result: Vec<f64> = p.iter().zip(t.iter().zip(td.iter()))
+        .map(|(&p, (&t, &td))| metrust::calc::thermo::lcl_pressure(p, t, td))
+        .collect();
+    Ok(result.into_pyarray(py))
+}
+
+/// Saturation equivalent potential temperature — array version.
+#[pyfunction]
+fn saturation_equivalent_potential_temperature_array<'py>(
+    py: Python<'py>,
+    pressure: PyReadonlyArray1<f64>,
+    temperature: PyReadonlyArray1<f64>,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let p = pressure.as_slice()?;
+    let t = temperature.as_slice()?;
+    let result: Vec<f64> = p.iter().zip(t.iter())
+        .map(|(&p, &t)| metrust::calc::thermo::saturation_equivalent_potential_temperature(p, t))
+        .collect();
+    Ok(result.into_pyarray(py))
+}
+
+/// Wet bulb potential temperature — array version.
+#[pyfunction]
+fn wet_bulb_potential_temperature_array<'py>(
+    py: Python<'py>,
+    pressure: PyReadonlyArray1<f64>,
+    temperature: PyReadonlyArray1<f64>,
+    dewpoint: PyReadonlyArray1<f64>,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let p = pressure.as_slice()?;
+    let t = temperature.as_slice()?;
+    let td = dewpoint.as_slice()?;
+    let result: Vec<f64> = p.iter().zip(t.iter().zip(td.iter()))
+        .map(|(&p, (&t, &td))| metrust::calc::thermo::wet_bulb_potential_temperature(p, t, td))
+        .collect();
+    Ok(result.into_pyarray(py))
+}
+
+/// Frost point — array version.
+#[pyfunction]
+fn frost_point_array<'py>(
+    py: Python<'py>,
+    temperature: PyReadonlyArray1<f64>,
+    rh: PyReadonlyArray1<f64>,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let t = temperature.as_slice()?;
+    let r = rh.as_slice()?;
+    let result: Vec<f64> = t.iter().zip(r.iter())
+        .map(|(&t, &r)| metrust::calc::thermo::frost_point(t, r))
+        .collect();
+    Ok(result.into_pyarray(py))
+}
+
+/// Virtual temperature from dewpoint — array version.
+#[pyfunction]
+fn virtual_temperature_from_dewpoint_array<'py>(
+    py: Python<'py>,
+    temperature: PyReadonlyArray1<f64>,
+    dewpoint: PyReadonlyArray1<f64>,
+    pressure: PyReadonlyArray1<f64>,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let t = temperature.as_slice()?;
+    let td = dewpoint.as_slice()?;
+    let p = pressure.as_slice()?;
+    let result: Vec<f64> = t.iter().zip(td.iter().zip(p.iter()))
+        .map(|(&t, (&td, &p))| metrust::calc::thermo::virtual_temperature_from_dewpoint(t, td, p))
+        .collect();
+    Ok(result.into_pyarray(py))
+}
+
 // =============================================================================
 // Registration
 // =============================================================================
@@ -1220,6 +1468,22 @@ pub fn register(_py: Python, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     parent.add_function(wrap_pyfunction!(vapor_pressure_array, parent)?)?;
     parent.add_function(wrap_pyfunction!(density_array, parent)?)?;
     parent.add_function(wrap_pyfunction!(exner_function_array, parent)?)?;
+    parent.add_function(wrap_pyfunction!(mixing_ratio_from_relative_humidity_array, parent)?)?;
+    parent.add_function(wrap_pyfunction!(relative_humidity_from_mixing_ratio_array, parent)?)?;
+    parent.add_function(wrap_pyfunction!(relative_humidity_from_specific_humidity_array, parent)?)?;
+    parent.add_function(wrap_pyfunction!(specific_humidity_from_dewpoint_array, parent)?)?;
+    parent.add_function(wrap_pyfunction!(dewpoint_from_specific_humidity_array, parent)?)?;
+    parent.add_function(wrap_pyfunction!(specific_humidity_array, parent)?)?;
+    parent.add_function(wrap_pyfunction!(mixing_ratio_from_specific_humidity_array, parent)?)?;
+    parent.add_function(wrap_pyfunction!(specific_humidity_from_mixing_ratio_array, parent)?)?;
+    parent.add_function(wrap_pyfunction!(dewpoint_array, parent)?)?;
+    parent.add_function(wrap_pyfunction!(virtual_potential_temperature_array, parent)?)?;
+    parent.add_function(wrap_pyfunction!(temperature_from_potential_temperature_array, parent)?)?;
+    parent.add_function(wrap_pyfunction!(lcl_pressure_array, parent)?)?;
+    parent.add_function(wrap_pyfunction!(saturation_equivalent_potential_temperature_array, parent)?)?;
+    parent.add_function(wrap_pyfunction!(wet_bulb_potential_temperature_array, parent)?)?;
+    parent.add_function(wrap_pyfunction!(frost_point_array, parent)?)?;
+    parent.add_function(wrap_pyfunction!(virtual_temperature_from_dewpoint_array, parent)?)?;
 
     Ok(())
 }
