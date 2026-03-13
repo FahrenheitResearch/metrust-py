@@ -12,3 +12,4 @@ build/
 bench_results.json
 bench_hrrr_results.json
 data/
+site/

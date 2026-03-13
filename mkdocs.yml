@@ -1,0 +1,87 @@
+site_name: metrust
+site_description: Rust-powered meteorology toolkit — drop-in replacement for MetPy
+site_url: https://fahrenheitresearch.github.io/metrust-py/
+repo_url: https://github.com/FahrenheitResearch/metrust-py
+repo_name: FahrenheitResearch/metrust-py
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: deep purple
+      accent: amber
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: deep purple
+      accent: amber
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  font:
+    text: Inter
+    code: JetBrains Mono
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+    - toc.follow
+  icon:
+    repo: fontawesome/brands/github
+
+plugins:
+  - search
+
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.details
+  - pymdownx.mark
+  - admonition
+  - tables
+  - attr_list
+  - md_in_html
+  - toc:
+      permalink: true
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/FahrenheitResearch/metrust-py
+
+nav:
+  - Home: index.md
+  - Getting Started:
+    - Installation: guides/installation.md
+    - Migration from MetPy: guides/migration.md
+    - Array Support: guides/arrays.md
+  - API Reference:
+    - Thermodynamics: api/thermodynamics.md
+    - Moisture & Humidity: api/moisture.md
+    - Wind: api/wind.md
+    - Kinematics: api/kinematics.md
+    - Severe Weather: api/severe.md
+    - Grid Composites: api/grid-composites.md
+    - Smoothing & Interpolation: api/smoothing.md
+    - Atmospheric: api/atmospheric.md
+    - I/O: api/io.md
+    - Units & Constants: api/units.md
+  - Performance: performance.md
+  - Compatibility: compatibility.md
