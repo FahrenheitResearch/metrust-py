@@ -1,8 +1,15 @@
-"""metrust -- Drop-in replacement for MetPy, powered by Rust."""
+"""metrust -- Rust-powered meteorology toolkit for Python."""
 
 from metrust import calc
-from metrust import io
-from metrust import interpolate
 from metrust import constants
+from metrust import interpolate
+from metrust import io
 from metrust import units
-from metrust import plots
+
+__all__ = [
+    "calc",
+    "constants",
+    "interpolate",
+    "io",
+    "units",
+]

@@ -87,6 +87,42 @@ fn advection<'py>(
     Ok(PyArray2::from_vec2(py, &to_2d(&result, ny, nx))?)
 }
 
+/// Advection of a scalar field by a 3-D wind: -u(ds/dx) - v(ds/dy) - w(ds/dz).
+///
+/// The scalar, u, v, and w fields are 3-D arrays flattened in level-major
+/// order: index = k * ny * nx + j * nx + i.
+///
+/// Parameters
+/// ----------
+/// scalar : 1-D array [nz*ny*nx]
+/// u, v, w : 1-D array [nz*ny*nx]
+/// nx, ny, nz : int
+/// dx, dy, dz : float (meters)
+#[pyfunction]
+fn advection_3d<'py>(
+    py: Python<'py>,
+    scalar: PyReadonlyArray1<f64>,
+    u: PyReadonlyArray1<f64>,
+    v: PyReadonlyArray1<f64>,
+    w: PyReadonlyArray1<f64>,
+    nx: usize,
+    ny: usize,
+    nz: usize,
+    dx: f64,
+    dy: f64,
+    dz: f64,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let result = metrust::calc::advection_3d(
+        scalar.as_slice()?,
+        u.as_slice()?,
+        v.as_slice()?,
+        w.as_slice()?,
+        nx, ny, nz,
+        dx, dy, dz,
+    );
+    Ok(result.into_pyarray(py))
+}
+
 /// 2D Petterssen frontogenesis function.
 #[pyfunction]
 fn frontogenesis<'py>(
@@ -688,6 +724,7 @@ pub fn register(_py: Python, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     parent.add_function(wrap_pyfunction!(vorticity, parent)?)?;
     parent.add_function(wrap_pyfunction!(absolute_vorticity, parent)?)?;
     parent.add_function(wrap_pyfunction!(advection, parent)?)?;
+    parent.add_function(wrap_pyfunction!(advection_3d, parent)?)?;
     parent.add_function(wrap_pyfunction!(frontogenesis, parent)?)?;
     parent.add_function(wrap_pyfunction!(geostrophic_wind, parent)?)?;
     parent.add_function(wrap_pyfunction!(ageostrophic_wind, parent)?)?;

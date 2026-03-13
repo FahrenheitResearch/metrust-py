@@ -7,7 +7,7 @@
 use std::f64::consts::PI;
 
 /// Earth's angular velocity (rad/s).
-const OMEGA: f64 = 7.2921e-5;
+const OMEGA: f64 = 7.2921159e-5;
 
 /// Specific gas constant for dry air (J/(kg·K)).
 const RD: f64 = 287.058;
@@ -28,7 +28,7 @@ fn idx(j: usize, i: usize, nx: usize) -> usize {
 // Finite-difference derivatives
 // ─────────────────────────────────────────────
 
-/// ∂f/∂x using centered differences (forward/backward at boundaries).
+/// ∂f/∂x using centered differences (2nd-order one-sided at boundaries).
 pub fn gradient_x(values: &[f64], nx: usize, ny: usize, dx: f64) -> Vec<f64> {
     assert_eq!(values.len(), nx * ny);
     let mut out = vec![0.0; nx * ny];
@@ -39,12 +39,16 @@ pub fn gradient_x(values: &[f64], nx: usize, ny: usize, dx: f64) -> Vec<f64> {
         for i in 0..nx {
             let grad = if nx < 2 {
                 0.0
-            } else if i == 0 {
-                // forward difference
+            } else if nx == 2 {
                 (values[idx(j, 1, nx)] - values[idx(j, 0, nx)]) * inv_dx
+            } else if i == 0 {
+                // 2nd-order forward: (-3f[0] + 4f[1] - f[2]) / (2dx)
+                (-3.0 * values[idx(j, 0, nx)] + 4.0 * values[idx(j, 1, nx)]
+                    - values[idx(j, 2, nx)]) * inv_2dx
             } else if i == nx - 1 {
-                // backward difference
-                (values[idx(j, nx - 1, nx)] - values[idx(j, nx - 2, nx)]) * inv_dx
+                // 2nd-order backward: (3f[n] - 4f[n-1] + f[n-2]) / (2dx)
+                (3.0 * values[idx(j, nx - 1, nx)] - 4.0 * values[idx(j, nx - 2, nx)]
+                    + values[idx(j, nx - 3, nx)]) * inv_2dx
             } else {
                 // centered difference
                 (values[idx(j, i + 1, nx)] - values[idx(j, i - 1, nx)]) * inv_2dx
@@ -55,7 +59,7 @@ pub fn gradient_x(values: &[f64], nx: usize, ny: usize, dx: f64) -> Vec<f64> {
     out
 }
 
-/// ∂f/∂y using centered differences (forward/backward at boundaries).
+/// ∂f/∂y using centered differences (2nd-order one-sided at boundaries).
 pub fn gradient_y(values: &[f64], nx: usize, ny: usize, dy: f64) -> Vec<f64> {
     assert_eq!(values.len(), nx * ny);
     let mut out = vec![0.0; nx * ny];
@@ -66,10 +70,16 @@ pub fn gradient_y(values: &[f64], nx: usize, ny: usize, dy: f64) -> Vec<f64> {
         for i in 0..nx {
             let grad = if ny < 2 {
                 0.0
-            } else if j == 0 {
+            } else if ny == 2 {
                 (values[idx(1, i, nx)] - values[idx(0, i, nx)]) * inv_dy
+            } else if j == 0 {
+                // 2nd-order forward: (-3f[0] + 4f[1] - f[2]) / (2dy)
+                (-3.0 * values[idx(0, i, nx)] + 4.0 * values[idx(1, i, nx)]
+                    - values[idx(2, i, nx)]) * inv_2dy
             } else if j == ny - 1 {
-                (values[idx(ny - 1, i, nx)] - values[idx(ny - 2, i, nx)]) * inv_dy
+                // 2nd-order backward: (3f[n] - 4f[n-1] + f[n-2]) / (2dy)
+                (3.0 * values[idx(ny - 1, i, nx)] - 4.0 * values[idx(ny - 2, i, nx)]
+                    + values[idx(ny - 3, i, nx)]) * inv_2dy
             } else {
                 (values[idx(j + 1, i, nx)] - values[idx(j - 1, i, nx)]) * inv_2dy
             };
@@ -680,9 +690,9 @@ mod tests {
 
     #[test]
     fn test_coriolis_parameter() {
-        // At 45°N: f = 2 * 7.2921e-5 * sin(45°) ≈ 1.0313e-4
+        // At 45°N: f = 2 * 7.2921159e-5 * sin(45°) ≈ 1.0313e-4
         let f = coriolis_parameter(45.0);
-        let expected = 2.0 * 7.2921e-5 * (45.0_f64 * PI / 180.0).sin();
+        let expected = 2.0 * 7.2921159e-5 * (45.0_f64 * PI / 180.0).sin();
         assert!((f - expected).abs() < 1e-12);
 
         // At equator: f = 0

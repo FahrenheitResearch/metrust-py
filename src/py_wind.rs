@@ -121,6 +121,52 @@ fn corfidi_storm_motion(
     )
 }
 
+// ─── Boundary-layer turbulence functions ──────────────────────────────
+
+/// Friction velocity (m/s) from u and w time series (m/s).
+#[pyfunction]
+fn friction_velocity(
+    u: PyReadonlyArray1<f64>,
+    w: PyReadonlyArray1<f64>,
+) -> f64 {
+    metrust::calc::friction_velocity(
+        u.as_slice().unwrap(),
+        w.as_slice().unwrap(),
+    )
+}
+
+/// Turbulent kinetic energy (m^2/s^2) from u, v, w time series (m/s).
+#[pyfunction]
+fn tke(
+    u: PyReadonlyArray1<f64>,
+    v: PyReadonlyArray1<f64>,
+    w: PyReadonlyArray1<f64>,
+) -> f64 {
+    metrust::calc::tke(
+        u.as_slice().unwrap(),
+        v.as_slice().unwrap(),
+        w.as_slice().unwrap(),
+    )
+}
+
+/// Gradient Richardson number at each level.
+#[pyfunction]
+fn gradient_richardson_number<'py>(
+    py: Python<'py>,
+    height: PyReadonlyArray1<f64>,
+    theta: PyReadonlyArray1<f64>,
+    u: PyReadonlyArray1<f64>,
+    v: PyReadonlyArray1<f64>,
+) -> Bound<'py, PyArray1<f64>> {
+    let result = metrust::calc::gradient_richardson_number(
+        height.as_slice().unwrap(),
+        theta.as_slice().unwrap(),
+        u.as_slice().unwrap(),
+        v.as_slice().unwrap(),
+    );
+    result.into_pyarray(py)
+}
+
 // ─── Module registration ─────────────────────────────────────────────
 
 pub fn register(_py: Python, parent: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -132,5 +178,8 @@ pub fn register(_py: Python, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     parent.add_function(wrap_pyfunction!(mean_wind, parent)?)?;
     parent.add_function(wrap_pyfunction!(bunkers_storm_motion, parent)?)?;
     parent.add_function(wrap_pyfunction!(corfidi_storm_motion, parent)?)?;
+    parent.add_function(wrap_pyfunction!(friction_velocity, parent)?)?;
+    parent.add_function(wrap_pyfunction!(tke, parent)?)?;
+    parent.add_function(wrap_pyfunction!(gradient_richardson_number, parent)?)?;
     Ok(())
 }

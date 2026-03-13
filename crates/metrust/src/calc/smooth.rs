@@ -173,8 +173,12 @@ pub fn smooth_gaussian(data: &[f64], nx: usize, ny: usize, sigma: f64) -> Vec<f6
 /// Apply a rectangular (box / uniform) smoothing filter.
 ///
 /// Each output value is the unweighted mean of the `size x size`
-/// neighborhood centered on that grid point. NaN values are excluded.
-/// At edges, the window is truncated to the available grid points.
+/// neighborhood centered on that grid point. NaN values propagate:
+/// if any neighbor in the kernel is NaN, the output is NaN.
+///
+/// **Boundary handling (MetPy-compatible):** edge points where the full
+/// kernel does not fit are left with their original values. The
+/// unsmoothed border is `size / 2` grid points wide on each side.
 ///
 /// # Arguments
 ///
@@ -183,6 +187,7 @@ pub fn smooth_gaussian(data: &[f64], nx: usize, ny: usize, sigma: f64) -> Vec<f6
 /// * `ny` - Number of rows.
 /// * `size` - Side length of the square kernel (should be odd; if even, the
 ///   effective half-width is `size / 2`).
+/// * `passes` - Number of times to apply the filter (default 1).
 ///
 /// # Panics
 ///
@@ -194,43 +199,59 @@ pub fn smooth_gaussian(data: &[f64], nx: usize, ny: usize, sigma: f64) -> Vec<f6
 /// use metrust::calc::smooth::smooth_rectangular;
 ///
 /// let data = vec![1.0; 9];
-/// let out = smooth_rectangular(&data, 3, 3, 3);
+/// let out = smooth_rectangular(&data, 3, 3, 3, 1);
 /// assert!((out[4] - 1.0).abs() < 1e-10);
 /// ```
-pub fn smooth_rectangular(data: &[f64], nx: usize, ny: usize, size: usize) -> Vec<f64> {
+pub fn smooth_rectangular(data: &[f64], nx: usize, ny: usize, size: usize, passes: usize) -> Vec<f64> {
     let n = nx * ny;
     assert_eq!(data.len(), n, "data length must equal nx * ny");
     assert!(size > 0, "kernel size must be > 0");
 
     let half = size / 2;
-    let mut out = vec![f64::NAN; n];
 
-    for j in 0..ny {
-        let j_lo = if j >= half { j - half } else { 0 };
-        let j_hi = (j + half).min(ny - 1);
+    let mut current = data.to_vec();
 
-        for i in 0..nx {
-            let i_lo = if i >= half { i - half } else { 0 };
-            let i_hi = (i + half).min(nx - 1);
+    for _ in 0..passes {
+        let mut out = current.clone();
 
-            let mut sum = 0.0;
-            let mut count = 0u32;
+        for j in half..ny.saturating_sub(half) {
+            for i in half..nx.saturating_sub(half) {
+                let j_lo = j - half;
+                let j_hi = j + half;
+                let i_lo = i - half;
+                let i_hi = i + half;
 
-            for jj in j_lo..=j_hi {
-                for ii in i_lo..=i_hi {
-                    let val = data[idx(jj, ii, nx)];
-                    if !val.is_nan() {
+                let mut sum = 0.0;
+                let mut has_nan = false;
+                let mut count = 0u32;
+
+                for jj in j_lo..=j_hi {
+                    for ii in i_lo..=i_hi {
+                        let val = current[idx(jj, ii, nx)];
+                        if val.is_nan() {
+                            has_nan = true;
+                            break;
+                        }
                         sum += val;
                         count += 1;
                     }
+                    if has_nan { break; }
                 }
-            }
 
-            out[idx(j, i, nx)] = if count > 0 { sum / count as f64 } else { f64::NAN };
+                out[idx(j, i, nx)] = if has_nan {
+                    f64::NAN
+                } else if count > 0 {
+                    sum / count as f64
+                } else {
+                    f64::NAN
+                };
+            }
         }
+
+        current = out;
     }
 
-    out
+    current
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -243,7 +264,12 @@ pub fn smooth_rectangular(data: &[f64], nx: usize, ny: usize, size: usize) -> Ve
 /// `radius` grid-point units of the center. The distance check uses
 /// Euclidean distance: `sqrt(di^2 + dj^2) <= radius`.
 ///
-/// NaN values are excluded from the average.
+/// NaN values propagate: if any point in the disk is NaN, the output
+/// is NaN.
+///
+/// **Boundary handling (MetPy-compatible):** edge points where the full
+/// disk kernel does not fit are left with their original values. The
+/// unsmoothed border is `radius` (ceiled) grid points wide on each side.
 ///
 /// # Arguments
 ///
@@ -251,6 +277,7 @@ pub fn smooth_rectangular(data: &[f64], nx: usize, ny: usize, size: usize) -> Ve
 /// * `nx` - Number of columns.
 /// * `ny` - Number of rows.
 /// * `radius` - Radius of the disk kernel in grid-point units.
+/// * `passes` - Number of times to apply the filter (default 1).
 ///
 /// # Panics
 ///
@@ -262,16 +289,17 @@ pub fn smooth_rectangular(data: &[f64], nx: usize, ny: usize, size: usize) -> Ve
 /// use metrust::calc::smooth::smooth_circular;
 ///
 /// let data = vec![1.0; 25];
-/// let out = smooth_circular(&data, 5, 5, 2.0);
+/// let out = smooth_circular(&data, 5, 5, 2.0, 1);
 /// assert!((out[12] - 1.0).abs() < 1e-10);
 /// ```
-pub fn smooth_circular(data: &[f64], nx: usize, ny: usize, radius: f64) -> Vec<f64> {
+pub fn smooth_circular(data: &[f64], nx: usize, ny: usize, radius: f64, passes: usize) -> Vec<f64> {
     let n = nx * ny;
     assert_eq!(data.len(), n, "data length must equal nx * ny");
     assert!(radius > 0.0, "radius must be positive, got {}", radius);
 
     // Pre-compute the kernel offsets (dj, di) that fall within the radius
     let half = radius.ceil() as isize;
+    let half_u = half as usize;
     let r2 = radius * radius;
     let mut offsets = Vec::new();
     for dj in -half..=half {
@@ -283,48 +311,61 @@ pub fn smooth_circular(data: &[f64], nx: usize, ny: usize, radius: f64) -> Vec<f
         }
     }
 
-    let mut out = vec![f64::NAN; n];
+    let mut current = data.to_vec();
 
-    for j in 0..ny {
-        for i in 0..nx {
-            let mut sum = 0.0;
-            let mut count = 0u32;
+    for _ in 0..passes {
+        let mut out = current.clone();
 
-            for &(dj, di) in &offsets {
-                let jj = j as isize + dj;
-                let ii = i as isize + di;
-                if jj < 0 || jj >= ny as isize || ii < 0 || ii >= nx as isize {
-                    continue;
-                }
-                let val = data[idx(jj as usize, ii as usize, nx)];
-                if !val.is_nan() {
+        for j in half_u..ny.saturating_sub(half_u) {
+            for i in half_u..nx.saturating_sub(half_u) {
+                let mut sum = 0.0;
+                let mut count = 0u32;
+                let mut has_nan = false;
+
+                for &(dj, di) in &offsets {
+                    let jj = (j as isize + dj) as usize;
+                    let ii = (i as isize + di) as usize;
+                    let val = current[idx(jj, ii, nx)];
+                    if val.is_nan() {
+                        has_nan = true;
+                        break;
+                    }
                     sum += val;
                     count += 1;
                 }
-            }
 
-            out[idx(j, i, nx)] = if count > 0 { sum / count as f64 } else { f64::NAN };
+                out[idx(j, i, nx)] = if has_nan {
+                    f64::NAN
+                } else if count > 0 {
+                    sum / count as f64
+                } else {
+                    f64::NAN
+                };
+            }
         }
+
+        current = out;
     }
 
-    out
+    current
 }
 
 // ─────────────────────────────────────────────────────────────────────
 // N-point smoothing (5-point and 9-point)
 // ─────────────────────────────────────────────────────────────────────
 
-/// Apply a 5-point or 9-point smoother.
+/// Apply a 5-point or 9-point smoother (MetPy-compatible).
 ///
-/// This replicates MetPy's `smooth_n_point` filter:
+/// This replicates MetPy's `smooth_n_point` filter exactly. It delegates
+/// to [`smooth_window`] with the same normalized weights MetPy uses:
 ///
-/// * **n = 5**: The center gets weight 1.0 and the four cardinal neighbors
-///   (N, S, E, W) each get weight 0.5. The weights are normalized.
-/// * **n = 9**: The center gets weight 1.0 and all eight surrounding
-///   neighbors each get weight 0.5. The weights are normalized.
+/// * **n = 9**: `[[0.0625, 0.125, 0.0625], [0.125, 0.25, 0.125],
+///   [0.0625, 0.125, 0.0625]]`
+/// * **n = 5**: `[[0, 0.125, 0], [0.125, 0.5, 0.125], [0, 0.125, 0]]`
 ///
-/// At grid edges only the available neighbors are included, and the weights
-/// are re-normalized. NaN values are excluded from the average.
+/// **Boundary handling:** edge points where the full 3x3 kernel does not
+/// fit are left with their original values (border of 1 on each side).
+/// NaN values propagate.
 ///
 /// # Arguments
 ///
@@ -332,6 +373,7 @@ pub fn smooth_circular(data: &[f64], nx: usize, ny: usize, radius: f64) -> Vec<f
 /// * `nx` - Number of columns.
 /// * `ny` - Number of rows.
 /// * `n` - Number of points: must be 5 or 9.
+/// * `passes` - Number of times to apply the filter (default 1).
 ///
 /// # Panics
 ///
@@ -343,81 +385,52 @@ pub fn smooth_circular(data: &[f64], nx: usize, ny: usize, radius: f64) -> Vec<f
 /// use metrust::calc::smooth::smooth_n_point;
 ///
 /// let data = vec![1.0; 25];
-/// let out = smooth_n_point(&data, 5, 5, 5);
+/// let out = smooth_n_point(&data, 5, 5, 5, 1);
 /// assert!((out[12] - 1.0).abs() < 1e-10);
 /// ```
-pub fn smooth_n_point(data: &[f64], nx: usize, ny: usize, n: usize) -> Vec<f64> {
+pub fn smooth_n_point(data: &[f64], nx: usize, ny: usize, n: usize, passes: usize) -> Vec<f64> {
     let len = nx * ny;
     assert_eq!(data.len(), len, "data length must equal nx * ny");
     assert!(n == 5 || n == 9, "n must be 5 or 9, got {}", n);
 
-    // Center always has weight 1.0; neighbors have weight 0.5.
-    let neighbor_weight = 0.5;
-    let center_weight = 1.0;
-
-    let neighbors: &[(isize, isize)] = if n == 5 {
-        // Cardinal: N, S, E, W
-        &[(-1, 0), (1, 0), (0, 1), (0, -1)]
+    // MetPy-exact normalized weights (normalize_weights=False in MetPy,
+    // meaning these are used directly as convolution weights, not as
+    // a weighted average).
+    let window: Vec<f64> = if n == 9 {
+        vec![
+            0.0625, 0.125, 0.0625,
+            0.125,  0.25,  0.125,
+            0.0625, 0.125, 0.0625,
+        ]
     } else {
-        // All 8 surrounding
-        &[
-            (-1, -1), (-1, 0), (-1, 1),
-            ( 0, -1),          ( 0, 1),
-            ( 1, -1), ( 1, 0), ( 1, 1),
+        vec![
+            0.0,   0.125, 0.0,
+            0.125, 0.5,   0.125,
+            0.0,   0.125, 0.0,
         ]
     };
 
-    let mut out = vec![f64::NAN; len];
-
-    for j in 0..ny {
-        for i in 0..nx {
-            let center_val = data[idx(j, i, nx)];
-            let mut wsum = 0.0;
-            let mut vsum = 0.0;
-
-            // Center contribution
-            if !center_val.is_nan() {
-                wsum += center_weight;
-                vsum += center_weight * center_val;
-            }
-
-            // Neighbor contributions
-            for &(dj, di) in neighbors {
-                let jj = j as isize + dj;
-                let ii = i as isize + di;
-                if jj < 0 || jj >= ny as isize || ii < 0 || ii >= nx as isize {
-                    continue;
-                }
-                let val = data[idx(jj as usize, ii as usize, nx)];
-                if !val.is_nan() {
-                    wsum += neighbor_weight;
-                    vsum += neighbor_weight * val;
-                }
-            }
-
-            out[idx(j, i, nx)] = if wsum > 0.0 { vsum / wsum } else { f64::NAN };
-        }
-    }
-
-    out
+    smooth_window(data, nx, ny, &window, 3, 3, passes, false)
 }
 
 // ─────────────────────────────────────────────────────────────────────
 // Generic window (custom kernel) smoothing
 // ─────────────────────────────────────────────────────────────────────
 
-/// Apply a generic 2D convolution with a user-supplied kernel.
+/// Apply a generic 2D convolution with a user-supplied kernel
+/// (MetPy-compatible).
 ///
 /// This is the equivalent of MetPy's `smooth_window`, which accepts any
 /// custom kernel (e.g., a manually constructed Gaussian, Laplacian, or
 /// sharpening filter).
 ///
 /// The kernel is a flattened row-major array of size `window_nx * window_ny`.
-/// It is applied as a weighted average: at each grid point the kernel is
-/// centered on that point, and the output is `sum(w * val) / sum(w)` over
-/// the valid (non-NaN) neighbors that fall within the grid.  At edges the
-/// kernel is truncated to the available grid points and the weights are
-/// re-normalized.
+///
+/// **Boundary handling:** edge points where the full kernel does not fit
+/// are left with their original values. The unsmoothed border is
+/// `(window_nx - 1) / 2` on left/right and `(window_ny - 1) / 2` on
+/// top/bottom. NaN values propagate: if any value in the kernel footprint
+/// is NaN, the output for that point is NaN.
 ///
 /// # Arguments
 ///
@@ -428,6 +441,9 @@ pub fn smooth_n_point(data: &[f64], nx: usize, ny: usize, n: usize) -> Vec<f64> 
 ///   `window_nx * window_ny`.
 /// * `window_nx` - Number of columns in the kernel.
 /// * `window_ny` - Number of rows in the kernel.
+/// * `passes` - Number of times to apply the filter.
+/// * `normalize_weights` - If true, divide weights by their sum before
+///   applying. If false, use weights directly.
 ///
 /// # Panics
 ///
@@ -442,7 +458,7 @@ pub fn smooth_n_point(data: &[f64], nx: usize, ny: usize, n: usize) -> Vec<f64> 
 /// // 3x3 uniform kernel (equivalent to smooth_rectangular with size 3)
 /// let kernel = vec![1.0; 9];
 /// let data = vec![1.0; 25];
-/// let out = smooth_window(&data, 5, 5, &kernel, 3, 3);
+/// let out = smooth_window(&data, 5, 5, &kernel, 3, 3, 1, true);
 /// assert!((out[12] - 1.0).abs() < 1e-10);
 /// ```
 pub fn smooth_window(
@@ -452,6 +468,8 @@ pub fn smooth_window(
     window: &[f64],
     window_nx: usize,
     window_ny: usize,
+    passes: usize,
+    normalize_weights: bool,
 ) -> Vec<f64> {
     let n = nx * ny;
     assert_eq!(data.len(), n, "data length must equal nx * ny");
@@ -466,43 +484,51 @@ pub fn smooth_window(
     let half_x = window_nx / 2;
     let half_y = window_ny / 2;
 
-    let mut out = vec![f64::NAN; n];
-
-    for j in 0..ny {
-        for i in 0..nx {
-            let mut wsum = 0.0;
-            let mut vsum = 0.0;
-
-            for wj in 0..window_ny {
-                let dj = wj as isize - half_y as isize;
-                let jj = j as isize + dj;
-                if jj < 0 || jj >= ny as isize {
-                    continue;
-                }
-
-                for wi in 0..window_nx {
-                    let di = wi as isize - half_x as isize;
-                    let ii = i as isize + di;
-                    if ii < 0 || ii >= nx as isize {
-                        continue;
-                    }
-
-                    let val = data[idx(jj as usize, ii as usize, nx)];
-                    if val.is_nan() {
-                        continue;
-                    }
-
-                    let w = window[wj * window_nx + wi];
-                    wsum += w;
-                    vsum += w * val;
-                }
-            }
-
-            out[idx(j, i, nx)] = if wsum > 0.0 { vsum / wsum } else { f64::NAN };
+    // Optionally normalize weights
+    let weights: Vec<f64> = if normalize_weights {
+        let wsum: f64 = window.iter().sum();
+        if wsum.abs() > 1e-30 {
+            window.iter().map(|&w| w / wsum).collect()
+        } else {
+            window.to_vec()
         }
+    } else {
+        window.to_vec()
+    };
+
+    let mut current = data.to_vec();
+
+    for _ in 0..passes {
+        let mut out = current.clone();
+
+        // Only smooth interior points where the full kernel fits.
+        for j in half_y..ny.saturating_sub(half_y) {
+            for i in half_x..nx.saturating_sub(half_x) {
+                let mut vsum = 0.0;
+                let mut has_nan = false;
+
+                for wj in 0..window_ny {
+                    let jj = j + wj - half_y;
+                    for wi in 0..window_nx {
+                        let ii = i + wi - half_x;
+                        let val = current[idx(jj, ii, nx)];
+                        if val.is_nan() {
+                            has_nan = true;
+                            break;
+                        }
+                        vsum += weights[wj * window_nx + wi] * val;
+                    }
+                    if has_nan { break; }
+                }
+
+                out[idx(j, i, nx)] = if has_nan { f64::NAN } else { vsum };
+            }
+        }
+
+        current = out;
     }
 
-    out
+    current
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -639,7 +665,7 @@ mod tests {
     #[test]
     fn test_rectangular_constant_field() {
         let data = vec![7.0; 25];
-        let out = smooth_rectangular(&data, 5, 5, 3);
+        let out = smooth_rectangular(&data, 5, 5, 3, 1);
         for val in &out {
             approx(*val, 7.0, 1e-10);
         }
@@ -654,48 +680,52 @@ mod tests {
         let mut data = vec![1.0; 9];
         data[idx(1, 1, nx)] = 10.0;
 
-        let out = smooth_rectangular(&data, nx, ny, 3);
+        let out = smooth_rectangular(&data, nx, ny, 3, 1);
         approx(out[idx(1, 1, nx)], 2.0, 1e-10);
     }
 
     #[test]
-    fn test_rectangular_edge_handling() {
-        // 3x3 grid of ones, size 3. Corner (0,0) only sees a 2x2 window.
-        let data = vec![1.0; 9];
-        let out = smooth_rectangular(&data, 3, 3, 3);
-        // All should be 1.0 since all values are the same
-        for val in &out {
-            approx(*val, 1.0, 1e-10);
-        }
+    fn test_rectangular_edge_preserved() {
+        // With MetPy-compatible boundary handling, edge points are
+        // preserved (copied from original).
+        let data: Vec<f64> = (1..=25).map(|x| x as f64).collect();
+        let out = smooth_rectangular(&data, 5, 5, 3, 1);
+        // Corners should be original values
+        approx(out[0], 1.0, 1e-10);   // (0,0)
+        approx(out[4], 5.0, 1e-10);   // (0,4)
+        approx(out[20], 21.0, 1e-10); // (4,0)
+        approx(out[24], 25.0, 1e-10); // (4,4)
     }
 
     #[test]
     fn test_rectangular_size_1() {
-        // Box of size 1 = identity filter
+        // Box of size 1 = identity filter (half=0, all points are interior)
         let data: Vec<f64> = (0..12).map(|x| x as f64).collect();
-        let out = smooth_rectangular(&data, 4, 3, 1);
+        let out = smooth_rectangular(&data, 4, 3, 1, 1);
         for k in 0..12 {
             approx(out[k], data[k], 1e-10);
         }
     }
 
     #[test]
-    fn test_rectangular_nan_handling() {
+    fn test_rectangular_nan_propagation() {
+        // NaN in the kernel footprint propagates to output.
         let nx = 3;
         let ny = 3;
         let mut data = vec![4.0; 9];
         data[idx(1, 1, nx)] = f64::NAN;
 
-        let out = smooth_rectangular(&data, nx, ny, 3);
+        let out = smooth_rectangular(&data, nx, ny, 3, 1);
 
-        // Center (1,1) with size 3: 8 valid neighbors of value 4 => avg = 4.0
-        approx(out[idx(1, 1, nx)], 4.0, 1e-10);
+        // Center (1,1) is the only interior point for a 3x3 grid with size=3.
+        // It has a NaN in its footprint (itself), so it should be NaN.
+        assert!(out[idx(1, 1, nx)].is_nan());
     }
 
     #[test]
     fn test_rectangular_all_nan() {
         let data = vec![f64::NAN; 9];
-        let out = smooth_rectangular(&data, 3, 3, 3);
+        let out = smooth_rectangular(&data, 3, 3, 3, 1);
         for val in &out {
             assert!(val.is_nan());
         }
@@ -705,17 +735,16 @@ mod tests {
     #[should_panic(expected = "kernel size must be > 0")]
     fn test_rectangular_zero_size_panics() {
         let data = vec![1.0; 4];
-        let _ = smooth_rectangular(&data, 2, 2, 0);
+        let _ = smooth_rectangular(&data, 2, 2, 0, 1);
     }
 
     #[test]
     fn test_rectangular_large_window() {
-        // Window larger than grid => each point sees entire grid => all equal to global mean
+        // Window larger than grid => all points are edges => all preserved.
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
-        let out = smooth_rectangular(&data, 3, 3, 99);
-        let global_mean = 5.0;
-        for val in &out {
-            approx(*val, global_mean, 1e-10);
+        let out = smooth_rectangular(&data, 3, 3, 99, 1);
+        for k in 0..9 {
+            approx(out[k], data[k], 1e-10);
         }
     }
 
@@ -725,26 +754,27 @@ mod tests {
 
     #[test]
     fn test_circular_constant_field() {
-        let data = vec![3.14; 25];
-        let out = smooth_circular(&data, 5, 5, 2.0);
+        let data = vec![3.14; 49];
+        let out = smooth_circular(&data, 7, 7, 2.0, 1);
         for val in &out {
             approx(*val, 3.14, 1e-10);
         }
     }
 
     #[test]
-    fn test_circular_radius_0_5_is_identity() {
-        // Radius 0.5 means only the center point (dist=0) is included.
-        // dist to cardinal neighbors = 1.0 > 0.5
-        let data: Vec<f64> = (0..9).map(|x| x as f64).collect();
-        let out = smooth_circular(&data, 3, 3, 0.5);
-        for k in 0..9 {
-            approx(out[k], data[k], 1e-10);
-        }
+    fn test_circular_edge_preserved() {
+        // Edges (within `radius` of the border) should be original values.
+        let data: Vec<f64> = (1..=25).map(|x| x as f64).collect();
+        let out = smooth_circular(&data, 5, 5, 1.0, 1);
+        // With radius=1, border is 1 wide. Corners are edges.
+        approx(out[0], 1.0, 1e-10);   // (0,0)
+        approx(out[4], 5.0, 1e-10);   // (0,4)
+        approx(out[20], 21.0, 1e-10); // (4,0)
+        approx(out[24], 25.0, 1e-10); // (4,4)
     }
 
     #[test]
-    fn test_circular_radius_1_includes_cardinals() {
+    fn test_circular_radius_1_interior() {
         // Radius 1.0 includes center (dist 0) and 4 cardinal neighbors (dist 1)
         // = 5-point stencil with equal weights
         let nx = 5;
@@ -753,64 +783,56 @@ mod tests {
         let mut data = vec![0.0; n];
         data[idx(2, 2, nx)] = 5.0;
 
-        let out = smooth_circular(&data, nx, ny, 1.0);
+        let out = smooth_circular(&data, nx, ny, 1.0, 1);
 
-        // Center: only the center has a nonzero value among the 5 points
-        // avg = 5.0 / 5 = 1.0
+        // Center: 5-point average = 5.0 / 5 = 1.0
         approx(out[idx(2, 2, nx)], 1.0, 1e-10);
-
-        // Cardinal neighbors: they see center (5.0) + themselves (0.0) + 3 other
-        // cardinals of the neighbor (0.0) = 5.0 / 5 = 1.0
-        approx(out[idx(1, 2, nx)], 1.0, 1e-10);
-        approx(out[idx(3, 2, nx)], 1.0, 1e-10);
-        approx(out[idx(2, 1, nx)], 1.0, 1e-10);
-        approx(out[idx(2, 3, nx)], 1.0, 1e-10);
     }
 
     #[test]
-    fn test_circular_nan_handling() {
+    fn test_circular_nan_propagation() {
         let nx = 5;
         let ny = 5;
         let n = nx * ny;
         let mut data = vec![2.0; n];
         data[idx(2, 2, nx)] = f64::NAN;
 
-        let out = smooth_circular(&data, nx, ny, 1.5);
+        let out = smooth_circular(&data, nx, ny, 1.0, 1);
 
-        // Center should not be NaN (neighbors are valid)
-        assert!(!out[idx(2, 2, nx)].is_nan());
+        // Interior neighbors that see the NaN should be NaN
+        assert!(out[idx(2, 2, nx)].is_nan());
     }
 
     #[test]
     fn test_circular_symmetry() {
-        let nx = 9;
-        let ny = 9;
+        let nx = 11;
+        let ny = 11;
         let n = nx * ny;
         let mut data = vec![0.0; n];
-        data[idx(4, 4, nx)] = 100.0;
+        data[idx(5, 5, nx)] = 100.0;
 
-        let out = smooth_circular(&data, nx, ny, 2.5);
+        let out = smooth_circular(&data, nx, ny, 2.0, 1);
 
-        // 4-fold symmetry
-        approx(out[idx(3, 4, nx)], out[idx(5, 4, nx)], 1e-10);
-        approx(out[idx(4, 3, nx)], out[idx(4, 5, nx)], 1e-10);
+        // 4-fold symmetry at interior points
+        approx(out[idx(4, 5, nx)], out[idx(6, 5, nx)], 1e-10);
+        approx(out[idx(5, 4, nx)], out[idx(5, 6, nx)], 1e-10);
     }
 
     #[test]
     #[should_panic(expected = "radius must be positive")]
     fn test_circular_nonpositive_radius_panics() {
         let data = vec![1.0; 4];
-        let _ = smooth_circular(&data, 2, 2, 0.0);
+        let _ = smooth_circular(&data, 2, 2, 0.0, 1);
     }
 
     // =========================================================
-    // N-point smoothing
+    // N-point smoothing (MetPy-compatible)
     // =========================================================
 
     #[test]
     fn test_5point_constant_field() {
         let data = vec![5.0; 25];
-        let out = smooth_n_point(&data, 5, 5, 5);
+        let out = smooth_n_point(&data, 5, 5, 5, 1);
         for val in &out {
             approx(*val, 5.0, 1e-10);
         }
@@ -819,97 +841,97 @@ mod tests {
     #[test]
     fn test_9point_constant_field() {
         let data = vec![5.0; 25];
-        let out = smooth_n_point(&data, 5, 5, 9);
+        let out = smooth_n_point(&data, 5, 5, 9, 1);
         for val in &out {
             approx(*val, 5.0, 1e-10);
         }
     }
 
     #[test]
-    fn test_5point_known_result() {
-        // 3x3 grid, center = 10, rest = 0
-        // At center: w_center=1.0, 4 cardinal neighbors w=0.5 each
-        // sum = 1.0*10 + 0.5*0*4 = 10, wsum = 1.0 + 4*0.5 = 3.0
-        // result = 10/3
-        let nx = 3;
-        let ny = 3;
-        let mut data = vec![0.0; 9];
-        data[idx(1, 1, nx)] = 10.0;
+    fn test_9point_metpy_exact() {
+        // Exact MetPy test: 5x5 grid 1..25, smooth_n_point(9, 1)
+        // MetPy leaves edges untouched, center (2,2) = 13.0
+        let data: Vec<f64> = (1..=25).map(|x| x as f64).collect();
+        let out = smooth_n_point(&data, 5, 5, 9, 1);
 
-        let out = smooth_n_point(&data, nx, ny, 5);
-        approx(out[idx(1, 1, nx)], 10.0 / 3.0, 1e-10);
+        // Edges preserved
+        approx(out[0], 1.0, 1e-10);   // (0,0)
+        approx(out[4], 5.0, 1e-10);   // (0,4)
+        approx(out[20], 21.0, 1e-10); // (4,0)
+        approx(out[24], 25.0, 1e-10); // (4,4)
+
+        // Center: 9-point weighted average of a linear field = same as original
+        approx(out[idx(2, 2, 5)], 13.0, 1e-10);
+    }
+
+    #[test]
+    fn test_5point_known_result() {
+        // 5x5 grid, center = 10, rest = 0
+        // 5-point weights: [[0,0.125,0],[0.125,0.5,0.125],[0,0.125,0]]
+        // At center (2,2): 0.5*10 + 0.125*0*4 = 5.0
+        let nx = 5;
+        let ny = 5;
+        let n = nx * ny;
+        let mut data = vec![0.0; n];
+        data[idx(2, 2, nx)] = 10.0;
+
+        let out = smooth_n_point(&data, nx, ny, 5, 1);
+        approx(out[idx(2, 2, nx)], 5.0, 1e-10);
     }
 
     #[test]
     fn test_9point_known_result() {
-        // 3x3 grid, center = 9, rest = 0
-        // At center: w_center=1.0, 8 neighbors w=0.5 each
-        // sum = 1.0*9, wsum = 1.0 + 8*0.5 = 5.0
-        // result = 9/5 = 1.8
-        let nx = 3;
-        let ny = 3;
-        let mut data = vec![0.0; 9];
-        data[idx(1, 1, nx)] = 9.0;
-
-        let out = smooth_n_point(&data, nx, ny, 9);
-        approx(out[idx(1, 1, nx)], 9.0 / 5.0, 1e-10);
-    }
-
-    #[test]
-    fn test_5point_corner() {
-        // At corner (0,0) of a 3x3, only 2 cardinal neighbors are available
-        // center weight=1.0, right (0,1) w=0.5, down (1,0) w=0.5
-        // If all values = 1.0: sum = 1*1 + 0.5*1 + 0.5*1 = 2, wsum = 2 => result = 1.0
-        let data = vec![1.0; 9];
-        let out = smooth_n_point(&data, 3, 3, 5);
-        approx(out[0], 1.0, 1e-10);
-    }
-
-    #[test]
-    fn test_9point_corner() {
-        // At corner (0,0) of a 3x3, only 3 of 8 neighbors exist: (0,1), (1,0), (1,1)
-        // center weight=1.0, 3 neighbors each 0.5 => wsum = 1.0 + 3*0.5 = 2.5
-        // If all = 2.0: sum = 1*2 + 3*0.5*2 = 2+3 = 5, result = 5/2.5 = 2.0
-        let data = vec![2.0; 9];
-        let out = smooth_n_point(&data, 3, 3, 9);
-        approx(out[0], 2.0, 1e-10);
-    }
-
-    #[test]
-    fn test_5point_nan_center() {
-        // Center is NaN, but neighbors are valid.
-        let nx = 3;
-        let ny = 3;
-        let mut data = vec![4.0; 9];
-        data[idx(1, 1, nx)] = f64::NAN;
-
-        let out = smooth_n_point(&data, nx, ny, 5);
-        // 4 cardinal neighbors each 4.0, weight 0.5 => sum = 8, wsum = 2
-        approx(out[idx(1, 1, nx)], 4.0, 1e-10);
-    }
-
-    #[test]
-    fn test_9point_nan_handling() {
+        // 5x5 grid, center (2,2) = 8, rest = 0
+        // 9-point weights: sum = 1.0; center weight = 0.25
+        // At center: 0.25 * 8 = 2.0
         let nx = 5;
         let ny = 5;
         let n = nx * ny;
-        let mut data = vec![6.0; n];
+        let mut data = vec![0.0; n];
+        data[idx(2, 2, nx)] = 8.0;
+
+        let out = smooth_n_point(&data, nx, ny, 9, 1);
+        approx(out[idx(2, 2, nx)], 0.25 * 8.0, 1e-10);
+    }
+
+    #[test]
+    fn test_n_point_edge_preserved() {
+        // Corners and edges are preserved with original values.
+        let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0];
+        let out = smooth_n_point(&data, 5, 3, 5, 1);
+        // Top edge (j=0) all preserved
+        approx(out[0], 1.0, 1e-10);
+        approx(out[1], 2.0, 1e-10);
+        approx(out[4], 5.0, 1e-10);
+        // Bottom edge (j=2) all preserved
+        approx(out[10], 11.0, 1e-10);
+        approx(out[14], 15.0, 1e-10);
+    }
+
+    #[test]
+    fn test_5point_nan_propagation() {
+        // NaN in the kernel footprint propagates to the output.
+        let nx = 5;
+        let ny = 5;
+        let n = nx * ny;
+        let mut data = vec![4.0; n];
         data[idx(2, 2, nx)] = f64::NAN;
 
-        let out = smooth_n_point(&data, nx, ny, 9);
-
-        // Center NaN but all 8 neighbors valid: each 0.5*6, sum=24, wsum=4 => 6.0
-        approx(out[idx(2, 2, nx)], 6.0, 1e-10);
-
-        // Neighbors of center should still produce finite values
-        assert!(!out[idx(1, 1, nx)].is_nan());
+        let out = smooth_n_point(&data, nx, ny, 5, 1);
+        // Center (2,2) sees itself (NaN) => propagates
+        assert!(out[idx(2, 2, nx)].is_nan());
+        // Cardinal neighbors of center also see the NaN
+        assert!(out[idx(1, 2, nx)].is_nan());
+        assert!(out[idx(3, 2, nx)].is_nan());
+        assert!(out[idx(2, 1, nx)].is_nan());
+        assert!(out[idx(2, 3, nx)].is_nan());
     }
 
     #[test]
     fn test_n_point_all_nan() {
-        let data = vec![f64::NAN; 9];
-        let out5 = smooth_n_point(&data, 3, 3, 5);
-        let out9 = smooth_n_point(&data, 3, 3, 9);
+        let data = vec![f64::NAN; 25];
+        let out5 = smooth_n_point(&data, 5, 5, 5, 1);
+        let out9 = smooth_n_point(&data, 5, 5, 9, 1);
         for val in out5.iter().chain(out9.iter()) {
             assert!(val.is_nan());
         }
@@ -919,18 +941,7 @@ mod tests {
     #[should_panic(expected = "n must be 5 or 9")]
     fn test_n_point_invalid_n_panics() {
         let data = vec![1.0; 9];
-        let _ = smooth_n_point(&data, 3, 3, 7);
-    }
-
-    #[test]
-    fn test_5point_edge_row() {
-        // At edge (0,2) of a 5x3 grid: center + left (0,1) + right (0,3) + below (1,2)
-        // = 3 cardinal neighbors available
-        // wsum = 1.0 + 3*0.5 = 2.5
-        // All values 10 => result = 10
-        let data = vec![10.0; 15];
-        let out = smooth_n_point(&data, 5, 3, 5);
-        approx(out[idx(0, 2, 5)], 10.0, 1e-10);
+        let _ = smooth_n_point(&data, 3, 3, 7, 1);
     }
 
     #[test]
@@ -946,7 +957,7 @@ mod tests {
                 data[j * nx + i] = (i + j) as f64;
             }
         }
-        let out = smooth_n_point(&data, nx, ny, 5);
+        let out = smooth_n_point(&data, nx, ny, 5, 1);
         // Interior points
         for j in 1..ny - 1 {
             for i in 1..nx - 1 {
@@ -967,9 +978,8 @@ mod tests {
                 data[j * nx + i] = 2.0 * i as f64 + 3.0 * j as f64;
             }
         }
-        let out = smooth_n_point(&data, nx, ny, 9);
-        // Interior: the 9-point stencil with equal neighbor weights also preserves
-        // linear fields because symmetric neighbors cancel.
+        let out = smooth_n_point(&data, nx, ny, 9, 1);
+        // Interior: the 9-point stencil preserves linear fields.
         for j in 1..ny - 1 {
             for i in 1..nx - 1 {
                 let k = j * nx + i;
@@ -987,7 +997,7 @@ mod tests {
         // Any kernel on a constant field should return that constant.
         let kernel = vec![1.0, 2.0, 1.0, 2.0, 4.0, 2.0, 1.0, 2.0, 1.0];
         let data = vec![7.0; 25];
-        let out = smooth_window(&data, 5, 5, &kernel, 3, 3);
+        let out = smooth_window(&data, 5, 5, &kernel, 3, 3, 1, true);
         for val in &out {
             approx(*val, 7.0, 1e-10);
         }
@@ -995,46 +1005,63 @@ mod tests {
 
     #[test]
     fn test_window_uniform_kernel_matches_rectangular() {
-        // A uniform kernel should produce the same result as smooth_rectangular.
-        let nx = 5;
-        let ny = 5;
-        let data: Vec<f64> = (0..25).map(|k| (k as f64 * 3.7).sin() * 10.0).collect();
+        // A uniform kernel should produce the same result as smooth_rectangular
+        // for interior points and edges.
+        let nx = 7;
+        let ny = 7;
+        let n = nx * ny;
+        let data: Vec<f64> = (0..n).map(|k| (k as f64 * 3.7).sin() * 10.0).collect();
         let kernel = vec![1.0; 9]; // 3x3 uniform
-        let from_window = smooth_window(&data, nx, ny, &kernel, 3, 3);
-        let from_rect = smooth_rectangular(&data, nx, ny, 3);
-        for k in 0..25 {
+        let from_window = smooth_window(&data, nx, ny, &kernel, 3, 3, 1, true);
+        let from_rect = smooth_rectangular(&data, nx, ny, 3, 1);
+        for k in 0..n {
             approx(from_window[k], from_rect[k], 1e-10);
         }
     }
 
     #[test]
+    fn test_window_edge_preserved() {
+        // Edges should preserve original values.
+        let kernel = vec![1.0; 9];
+        let data: Vec<f64> = (1..=25).map(|x| x as f64).collect();
+        let out = smooth_window(&data, 5, 5, &kernel, 3, 3, 1, true);
+        // Corners preserved
+        approx(out[0], 1.0, 1e-10);
+        approx(out[4], 5.0, 1e-10);
+        approx(out[20], 21.0, 1e-10);
+        approx(out[24], 25.0, 1e-10);
+    }
+
+    #[test]
     fn test_window_single_center_weight() {
-        // Kernel with weight only at center acts as identity.
+        // Kernel with weight only at center acts as identity at interior points,
+        // edges are preserved.
         let kernel = vec![0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0];
-        let data: Vec<f64> = (0..9).map(|k| k as f64).collect();
-        let out = smooth_window(&data, 3, 3, &kernel, 3, 3);
-        for k in 0..9 {
+        let data: Vec<f64> = (0..25).map(|k| k as f64).collect();
+        let out = smooth_window(&data, 5, 5, &kernel, 3, 3, 1, false);
+        for k in 0..25 {
             approx(out[k], data[k], 1e-10);
         }
     }
 
     #[test]
-    fn test_window_nan_exclusion() {
-        let nx = 3;
-        let ny = 3;
-        let mut data = vec![4.0; 9];
-        data[idx(1, 1, nx)] = f64::NAN;
+    fn test_window_nan_propagation() {
+        let nx = 5;
+        let ny = 5;
+        let n = nx * ny;
+        let mut data = vec![4.0; n];
+        data[idx(2, 2, nx)] = f64::NAN;
         let kernel = vec![1.0; 9]; // 3x3 uniform
-        let out = smooth_window(&data, nx, ny, &kernel, 3, 3);
-        // Center should average the 8 valid neighbors = 4.0
-        approx(out[idx(1, 1, nx)], 4.0, 1e-10);
+        let out = smooth_window(&data, nx, ny, &kernel, 3, 3, 1, true);
+        // Center and neighbors that see NaN should be NaN
+        assert!(out[idx(2, 2, nx)].is_nan());
     }
 
     #[test]
     fn test_window_all_nan() {
-        let data = vec![f64::NAN; 9];
+        let data = vec![f64::NAN; 25];
         let kernel = vec![1.0, 2.0, 1.0, 2.0, 4.0, 2.0, 1.0, 2.0, 1.0];
-        let out = smooth_window(&data, 3, 3, &kernel, 3, 3);
+        let out = smooth_window(&data, 5, 5, &kernel, 3, 3, 1, true);
         for val in &out {
             assert!(val.is_nan());
         }
@@ -1042,10 +1069,10 @@ mod tests {
 
     #[test]
     fn test_window_1x1_kernel() {
-        // 1x1 kernel = identity.
-        let kernel = vec![5.0]; // weight value doesn't matter, just 1 element
+        // 1x1 kernel = identity (half=0, all points are interior).
+        let kernel = vec![5.0];
         let data: Vec<f64> = (0..12).map(|k| k as f64).collect();
-        let out = smooth_window(&data, 4, 3, &kernel, 1, 1);
+        let out = smooth_window(&data, 4, 3, &kernel, 1, 1, 1, true);
         for k in 0..12 {
             approx(out[k], data[k], 1e-10);
         }
@@ -1054,28 +1081,31 @@ mod tests {
     #[test]
     fn test_window_asymmetric_kernel() {
         // 1x3 horizontal kernel (row-only smoothing)
+        // Normalized: [0.25, 0.5, 0.25]
         let kernel = vec![1.0, 2.0, 1.0]; // window_nx=3, window_ny=1
         let nx = 5;
         let ny = 1;
         let data = vec![0.0, 0.0, 4.0, 0.0, 0.0];
-        let out = smooth_window(&data, nx, ny, &kernel, 3, 1);
-        // Center (index 2): w = 1*0 + 2*4 + 1*0 = 8, wsum = 4, out = 2.0
+        let out = smooth_window(&data, nx, ny, &kernel, 3, 1, 1, true);
+        // Center (index 2): (0.25*0 + 0.5*4 + 0.25*0) = 2.0
         approx(out[2], 2.0, 1e-10);
-        // Index 1: w = 1*0 + 2*0 + 1*4 = 4, wsum = 4, out = 1.0
+        // Index 1: (0.25*0 + 0.5*0 + 0.25*4) = 1.0
         approx(out[1], 1.0, 1e-10);
         // Index 3: same as index 1 by symmetry
         approx(out[3], 1.0, 1e-10);
+        // Index 0 and 4 are edges => preserved
+        approx(out[0], 0.0, 1e-10);
+        approx(out[4], 0.0, 1e-10);
     }
 
     #[test]
-    fn test_window_edge_truncation() {
-        // 5x5 kernel on a 3x3 grid: edges must be handled by truncation.
+    fn test_window_large_kernel_on_small_grid() {
+        // 5x5 kernel on a 3x3 grid: all edges => all preserved.
         let kernel = vec![1.0; 25];
-        let data = vec![1.0; 9];
-        let out = smooth_window(&data, 3, 3, &kernel, 5, 5);
-        // Every point should still be 1.0
-        for val in &out {
-            approx(*val, 1.0, 1e-10);
+        let data: Vec<f64> = (1..=9).map(|x| x as f64).collect();
+        let out = smooth_window(&data, 3, 3, &kernel, 5, 5, 1, true);
+        for k in 0..9 {
+            approx(out[k], data[k], 1e-10);
         }
     }
 
@@ -1084,12 +1114,13 @@ mod tests {
     fn test_window_mismatched_kernel_panics() {
         let data = vec![1.0; 9];
         let kernel = vec![1.0; 4]; // 4 != 3*3
-        let _ = smooth_window(&data, 3, 3, &kernel, 3, 3);
+        let _ = smooth_window(&data, 3, 3, &kernel, 3, 3, 1, true);
     }
 
     #[test]
     fn test_window_reduces_variance() {
-        // Any reasonable smoothing kernel should reduce variance on noisy data.
+        // Any reasonable smoothing kernel should reduce variance on noisy data
+        // (at least for interior points which get smoothed).
         let nx = 9;
         let ny = 9;
         let n = nx * ny;
@@ -1101,7 +1132,7 @@ mod tests {
 
         // Gaussian-like 3x3 kernel
         let kernel = vec![1.0, 2.0, 1.0, 2.0, 4.0, 2.0, 1.0, 2.0, 1.0];
-        let out = smooth_window(&data, nx, ny, &kernel, 3, 3);
+        let out = smooth_window(&data, nx, ny, &kernel, 3, 3, 1, true);
         let m = out.iter().sum::<f64>() / n as f64;
         let var_out: f64 = out.iter().map(|v| (v - m).powi(2)).sum::<f64>() / n as f64;
         assert!(
@@ -1112,14 +1143,32 @@ mod tests {
     }
 
     // =========================================================
+    // Multi-pass tests
+    // =========================================================
+
+    #[test]
+    fn test_n_point_multiple_passes() {
+        // Multiple passes should produce more smoothing
+        let data: Vec<f64> = (1..=25).map(|x| x as f64).collect();
+        let out1 = smooth_n_point(&data, 5, 5, 9, 1);
+        let out3 = smooth_n_point(&data, 5, 5, 9, 3);
+
+        // Interior point (2,2) with more passes should still preserve
+        // a linear field (but NaN propagation would make it different
+        // on fields with NaN).
+        approx(out1[idx(2, 2, 5)], 13.0, 1e-10);
+        approx(out3[idx(2, 2, 5)], 13.0, 1e-10);
+    }
+
+    // =========================================================
     // Cross-filter consistency checks
     // =========================================================
 
     #[test]
     fn test_smoothers_reduce_variance() {
         // Any smoother applied to a noisy field should reduce variance.
-        let nx = 9;
-        let ny = 9;
+        let nx = 11;
+        let ny = 11;
         let n = nx * ny;
         // Deterministic "noisy" field
         let data: Vec<f64> = (0..n)
@@ -1130,10 +1179,10 @@ mod tests {
         let var_in: f64 = data.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n as f64;
 
         let gauss = smooth_gaussian(&data, nx, ny, 1.0);
-        let rect = smooth_rectangular(&data, nx, ny, 3);
-        let circ = smooth_circular(&data, nx, ny, 1.5);
-        let s5 = smooth_n_point(&data, nx, ny, 5);
-        let s9 = smooth_n_point(&data, nx, ny, 9);
+        let rect = smooth_rectangular(&data, nx, ny, 3, 1);
+        let circ = smooth_circular(&data, nx, ny, 1.5, 1);
+        let s5 = smooth_n_point(&data, nx, ny, 5, 1);
+        let s9 = smooth_n_point(&data, nx, ny, 9, 1);
 
         for (name, out) in [
             ("gaussian", &gauss),

@@ -1,197 +1,163 @@
 # metrust
 
-**A Rust-powered drop-in replacement for [MetPy](https://unidata.github.io/MetPy/) in Python.**
+Rust-powered meteorology toolkit with MetPy-compatible Python APIs.
 
-metrust wraps a pure-Rust meteorological calculation library via PyO3, giving you the same API as MetPy with dramatically better performance. Swap `from metpy` to `from metrust` and your code runs 15-15,000x faster depending on the operation.
+`metrust` uses a Rust backend for core meteorological calculations and exposes a Python surface that aims to feel familiar to MetPy users. The core `metrust.calc` module covers the large majority of `metpy.calc` with native Rust — no MetPy dependency required for typical calc workflows. A handful of MetPy-specific surfaces (`plots`, `xarray` accessor, `Level2File`) optionally forward to MetPy when it is installed.
 
 ```python
 # Before
 from metpy.calc import cape_cin, potential_temperature
 from metpy.units import units
 
-# After — same code, same Pint units, same numpy arrays
+# After
 from metrust.calc import cape_cin, potential_temperature
 from metrust.units import units
 
 p = [1000, 925, 850, 700, 500] * units.hPa
 T = [25, 20, 15, 5, -15] * units.degC
+Td = [20, 15, 10, -5, -25] * units.degC
 ```
 
 ## Installation
+
+Core install:
 
 ```bash
 pip install metrust
 ```
 
-That's it. Pre-built wheels for Linux, macOS (Intel + Apple Silicon), and Windows. No Rust toolchain needed.
+For optional features (plots, xarray accessor, Level2File), install MetPy separately:
 
-**From source** (if you want to build it yourself):
 ```bash
-pip install maturin
+pip install metpy
+```
+
+From source:
+
+```bash
 git clone https://github.com/FahrenheitResearch/metrust-py
 cd metrust-py
-maturin develop --release
+python -m pip install -e .
 ```
+
+## What Works Well Today
+
+Native Rust implementations cover a large portion of the day-to-day meteorology surface:
+
+- Thermodynamics: potential temperature, equivalent potential temperature, CAPE/CIN, parcel profiles, LCL/LFC/EL, virtual temperature, wet bulb, precipitable water, thickness, stability indices
+- Wind and severe weather: wind components, bulk shear, storm-relative helicity, Bunkers storm motion, Corfidi vectors, STP, SCP, critical angle
+- Kinematics: divergence, vorticity, advection, frontogenesis, geostrophic and ageostrophic wind, potential vorticity, deformation
+- Smoothing and interpolation: Gaussian, rectangular, circular, n-point, generic window convolution, 1-D interpolation, log interpolation, NaN fill, isosurface, IDW, natural neighbor
+- I/O: Level-III, METAR parsing, station lookup, GINI, GEMPAK grid/sounding/surface, WPC surface bulletin parsing
+- Constants: the core meteorological constants used by the calculation layer
+
+On the Python side, `metrust` now also normalizes several wrapper mismatches that previously blocked MetPy-style use:
+
+- Offset temperatures now work with Pint quantities like `20 * units.degC`
+- `saturation_vapor_pressure()` returns `Pa`
+- `saturation_mixing_ratio()` returns dimensionless `kg/kg`
+- `relative_humidity_from_dewpoint()` returns a dimensionless fraction
+- Common MetPy signatures such as `cape_cin(p, t, td, parcel_profile=...)` are accepted
+
+## Compatibility Model
+
+`metrust` is best thought of as:
+
+- A fast Rust-backed replacement for much of `metpy.calc`
+- A MetPy-compatible Python package for common workflows
+- A partial shim over MetPy for surfaces that are still Python-specific
+
+That last point is important. Some compatibility paths intentionally delegate to MetPy when it is installed. This keeps the public API usable while the native Rust/PyO3 surface catches up.
+
+Current shimmed surfaces:
+
+- `metrust.io.Level2File` forwards to MetPy when available
+- `metrust.plots` forwards to `metpy.plots`
+- `metrust.xarray` forwards to `metpy.xarray`
+- Core `metrust.calc` functions are 100% native Rust with no MetPy fallback
 
 ## Performance
 
-Benchmarked on the same hardware, same inputs:
+The Rust-backed paths are substantially faster than MetPy on scalar-heavy workloads and still meaningfully faster on many array operations.
+
+Representative numbers from the repo benchmarks:
 
 | Operation | MetPy | metrust | Speedup |
 |---|---|---|---|
-| `potential_temperature` (scalar) | 0.145 ms | 0.0000092 ms | **15,700x** |
-| `saturation_vapor_pressure` (scalar) | 0.039 ms | 0.0000025 ms | **15,800x** |
-| `equivalent_potential_temperature` | 0.323 ms | 0.0000363 ms | **8,900x** |
-| `cape_cin` (100-level sounding) | 1.70 ms | 0.025 ms | **68x** |
-| `divergence` (100x100 grid) | 1.01 ms | 0.027 ms | **37x** |
-| `divergence` (500x500 grid) | 15.93 ms | 0.92 ms | **17x** |
-| `interpolate_1d` (1000 points) | 0.047 ms | 0.003 ms | **15x** |
+| `potential_temperature` (scalar) | 0.145 ms | 0.0000092 ms | 15,700x |
+| `saturation_vapor_pressure` (scalar) | 0.039 ms | 0.0000025 ms | 15,800x |
+| `equivalent_potential_temperature` | 0.323 ms | 0.0000363 ms | 8,900x |
+| `cape_cin` (100-level sounding) | 1.70 ms | 0.025 ms | 68x |
+| `divergence` (100x100 grid) | 1.01 ms | 0.027 ms | 37x |
+| `divergence` (500x500 grid) | 15.93 ms | 0.92 ms | 17x |
+| `interpolate_1d` (1000 points) | 0.047 ms | 0.003 ms | 15x |
 
-Scalar functions see the biggest gains because MetPy's Pint unit machinery adds ~0.1ms overhead per call. Array operations are 15-70x faster. The gap narrows for large grids where numpy's vectorized C code becomes more efficient.
+Scalar gains are especially large because MetPy pays more Python and Pint overhead per call. The exact speedup depends on how much of your workflow stays on the native Rust path.
 
-**Exception:** Gaussian smoothing is one area where MetPy is actually faster — it delegates to scipy's highly optimized separable convolution. Our implementation is a naive nested loop without SIMD.
+## Known Limits
 
-## API Coverage
+This is not a full package-level replacement for all of MetPy yet.
 
-### What works (89% of metpy.calc)
+- `metrust.plots` and `metrust.xarray` are compatibility shims, not native reimplementations
+- Level-II access currently relies on MetPy from the Python surface
+- Numerical agreement is close for most shared calculations, but not bit-identical
+- `moist_lapse` still needs more scrutiny before being treated as high-confidence parity work
 
-142 of 159 MetPy calc functions have equivalents. This includes all the functions most people actually use:
+Known numerical differences include:
 
-- **Thermodynamics:** potential_temperature, equivalent_potential_temperature, saturation_vapor_pressure, CAPE/CIN, LCL/LFC/EL, mixing ratio, virtual temperature, wet bulb, stability indices (K-index, Showalter, Total Totals, SWEAT), Brunt-Vaisala, precipitable water, parcel profiles, thickness
-- **Wind:** wind_speed, wind_direction, wind_components, bulk_shear, storm_relative_helicity, mean_wind, Bunkers storm motion, Corfidi storm motion
-- **Kinematics:** divergence, vorticity, absolute_vorticity, advection, frontogenesis, geostrophic/ageostrophic wind, potential vorticity (baroclinic + barotropic), Q-vectors, deformation
-- **Severe:** STP, SCP, critical angle, plus extras MetPy doesn't have (Boyden, Fosberg, Haines, HDW, freezing rain composite, dendritic growth zone)
-- **Atmosphere:** standard atmosphere conversions, altimeter pressure, heat index, wind chill, apparent temperature
-- **Smoothing:** Gaussian, rectangular, circular, n-point, generic window convolution, all gradient/derivative operators
-- **Interpolation:** 1-D linear, log, NaN-fill, isosurface, IDW, natural neighbor
-- **I/O:** GRIB2, NEXRAD Level-II, Level-III (NIDS), METAR parser, station lookup
-- **Constants:** All core physical constants with MetPy-compatible aliases
-
-### What's missing (be honest with yourself before depending on this)
-
-**17 missing calc functions:**
-- `specific_humidity_from_mixing_ratio` — trivial one-liner, just not wired up yet
-- `gradient_richardson_number` — boundary layer
-- `thickness_hydrostatic_from_relative_humidity`
-- `tke`, `friction_velocity` — turbulence/boundary layer
-- `find_peaks`, `peak_persistence` — signal analysis
-- `azimuth_range_to_lat_lon` — radar coordinate conversion
-- Several others (see `tests/api_audit_calc.md` for the full list)
-
-**I/O gaps:**
-- No GEMPAK readers (GempakGrid, GempakSounding, GempakSurface) — legacy UCAR formats
-- No GINI reader — legacy satellite format
-- No `parse_metar_to_dataframe` — returns our own Metar struct instead of pandas DataFrame
-- No WPC surface bulletin parser
-
-**15 missing constants:** ice properties (Cp_i, rho_i), orbital/planetary (G, GM, earth_mass, solar_irradiance), reference values (sat_pressure_0c, water_triple_point_temperature, P0/pot_temp_ref_press)
-
-**Not implemented at all:**
-- `metpy.plots` — MetPy's plotting is matplotlib wrappers. metrust has its own native Rust renderer (PNG + ANSI terminal). If you need matplotlib, keep using `from metpy.plots import SkewT` and feed it data from `metrust.calc`.
-- `metpy.xarray` accessor — the `.metpy` accessor on xarray DataArrays/Datasets. This is a convenience layer, not computation.
-
-## Known Numerical Differences
-
-This is the section you should read carefully. metrust does NOT produce bit-identical results to MetPy for every function. Here's where and why they differ.
-
-### Differences that matter
-
-| Area | What's different | How much | Why |
-|---|---|---|---|
-| **Saturation vapor pressure** | Bolton (1980) vs MetPy's Buck (1981) coefficients | ~0.01 hPa at 0C, ~0.22 hPa at 35C | Different empirical fits. Both are within observational uncertainty. |
-| **LCL / wet bulb** | SHARPpy polynomial approx vs MetPy's iterative Bolton | 2-5 hPa for LCL, 1-2C for wet bulb | Speed vs precision tradeoff. Both are operationally acceptable. |
-| **moist_lapse** | RK4 integration producing less cooling than expected | **Significant** — needs investigation | This is likely a bug in the underlying wx_math integration. Do not rely on moist_lapse for precision work until this is fixed. |
-| **Cp_d constant** | 1005.7 vs 1004.666 J/(kg*K) | ~0.1% | Different textbook sources. Propagates to ~300 J/kg in energy calcs. |
-| **STP/SCP** | MetPy zeros shear below cutoffs (12.5/10 m/s); metrust doesn't | Different results in weak-shear environments | MetPy follows Thompson et al. (2003) more strictly. |
-
-### Differences that probably don't matter
-
-| Area | What's different | How much |
-|---|---|---|
-| OMEGA constant | 7.2921e-5 vs 7.292115e-5 rad/s | ~2e-6 relative error in Coriolis-dependent functions |
-| Standard atmosphere | ICAO T0=288.15K vs MetPy T0=288.0K | ~0.06% in pressure-height conversions |
-| Altimeter formula | Direct barometric vs Smithsonian iterative | Within ~2 hPa at typical elevations |
-| Windchill range | metrust returns air temp outside valid range; MetPy always computes | Behavioral, not numerical |
-| T0 vs T_freeze | 273.16K (triple point) vs 273.15K (ice point) | 0.01K — different physical quantities |
-
-### Boundary/edge behavior differences
-
-| Area | MetPy | metrust |
-|---|---|---|
-| Smoothing boundaries | Leaves edges untouched | Renormalizes at boundaries |
-| Derivative boundaries | 2nd-order stencils at edges | 1st-order stencils at edges |
-| `interpolate_1d` extrapolation | Returns NaN outside range | Clamps to boundary values |
-| `relative_humidity` | Returns fraction (0-1) | Returns percent (0-100) |
-| `saturation_vapor_pressure` | Returns Pa | Returns hPa |
-| `saturation_mixing_ratio` | Returns kg/kg | Returns g/kg |
-
-**The Python wrapper layer handles these unit convention differences** — when you call `metrust.calc.saturation_vapor_pressure()` from Python, it converts to Pa before returning, matching MetPy's behavior. But if you use the Rust crate directly, be aware of these conventions.
+- Saturation vapor pressure and saturation mixing ratio use different empirical fits than MetPy on the native Rust path
+- LCL and wet-bulb calculations use different approximations than MetPy
+- STP and SCP cutoff behavior is not identical in every weak-shear environment
+- Some constants come from slightly different textbook/reference values
 
 ## Verification
 
-573 automated tests verify numerical accuracy against MetPy 1.7.1:
+The repo currently verifies two different things:
 
-| Test Suite | Tests | Status |
-|---|---|---|
-| Thermo accuracy vs MetPy | 151 | All pass |
-| Severe + atmo accuracy vs MetPy | 100 | All pass |
-| Edge cases (NaN, empty, extremes) | 96 | All pass |
-| Smooth + interpolation vs MetPy | 73 | All pass |
-| Unit conversions vs Pint | 42 | All pass |
-| Real-world scenarios | 34 | All pass |
-| Constants vs MetPy | 32 | All pass |
-| Wind accuracy vs MetPy | 27 | All pass |
-| Kinematics accuracy vs MetPy | 18 | All pass |
+1. The Rust workspace itself via `cargo test --workspace`
+2. Python compatibility expectations via `tests/test_python_compat.py`
 
-Where the underlying formulas are identical (heat index, Fosberg, Boyden, BRN, critical angle, Haines, divergence, vorticity, advection), metrust matches MetPy to **machine precision**.
+The Python compatibility tests cover the specific wrapper issues that most affect "drop-in" use:
 
-See `tests/api_audit_calc.md` and `tests/api_audit_other.md` for the full function-by-function coverage audit.
+- Offset temperature handling
+- Wrapper return units for key thermodynamic functions
+- MetPy-style function signatures such as `cape_cin(..., parcel_profile=...)`
+- Public I/O exports
+- `plots` and `xarray` shim forwarding
 
-## Architecture
+The older `tests/verify_*.py` scripts are still useful for exploratory comparisons, but they are reference scripts, not the authoritative CI gate.
 
-```
-metrust-py/
-  src/           # Rust PyO3 bindings (10 modules, ~200 #[pyfunction] bindings)
-  python/
-    metrust/
-      __init__.py
-      units.py          # Pint UnitRegistry + unit stripping helpers
-      calc/__init__.py   # 97 Python wrappers with Pint unit handling
-      io/__init__.py     # Level3File, Metar, StationLookup
-      interpolate/__init__.py
-      constants/__init__.py
-      plots/__init__.py  # Placeholder — native Rust renderer, not matplotlib
+## Running Checks
 
-metrust/           # Pure Rust crate (the actual implementation)
-  src/calc/        # thermo, wind, kinematics, severe, atmo, smooth, utils
-  src/io/          # GRIB2, Level-II, Level-III, METAR, station
-  src/interpolate/ # IDW, natural neighbor, 1-D, isosurface
-  src/constants.rs # Physical constants
-  src/units.rs     # Unit conversion
-  src/projections.rs # Map projections
+```bash
+cargo test --workspace
+python -m pytest tests/test_python_compat.py -q
 ```
 
-The Python layer is thin — it strips Pint units from inputs (converting to SI), calls the Rust function, and reattaches Pint units to the output. All computation happens in Rust.
+Optional exploratory comparisons:
 
-## Should you use this?
+```bash
+python tests/verify_thermo.py
+python tests/verify_wind.py
+python tests/verify_kinematics.py
+python tests/verify_severe_atmo.py
+python tests/verify_smooth_interp.py
+```
 
-**Yes, if:**
-- You need MetPy's calculations but performance matters (real-time processing, large grids, batch analysis)
-- You're doing operational meteorology and need fast CAPE/CIN, shear, STP/SCP over many soundings
-- You want the same API without learning a new library
-- You're building Rust applications and need meteorological calculations
+## Should You Use It
 
-**Maybe not, if:**
-- You depend on MetPy's matplotlib integration (`SkewT`, `Hodograph`, `StationPlot` classes)
-- You need the `.metpy` xarray accessor
-- You need GEMPAK/GINI I/O format support
-- You need bit-identical results with MetPy (see numerical differences above)
-- You need `moist_lapse` to be accurate (known issue — use MetPy's for now)
+Use `metrust` if:
+
+- You want MetPy-style calculations with much lower runtime overhead
+- Your workload is dominated by `metpy.calc`-type operations
+- You are comfortable with a project that is converging toward broader MetPy compatibility
+
+Keep MetPy in the loop if:
+
+- You depend heavily on the full plotting stack
+- You rely on the xarray accessor layer
+- You need exact behavioral parity rather than close compatibility
 
 ## License
 
 MIT
-
-## Acknowledgments
-
-Built on top of the rustmet ecosystem (rustmet-core, wx-math, wx-field, wx-radar). MetPy by Unidata is the reference implementation this project aims to match.

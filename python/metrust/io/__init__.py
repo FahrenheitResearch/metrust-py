@@ -1,59 +1,56 @@
-"""metrust.io -- Drop-in replacement for metpy.io
+"""metrust.io -- Rust-native meteorological file I/O."""
 
-Provides Level3File, Metar, StationInfo, StationLookup, and METAR parsing
-functions backed by the Rust metrust engine.
-"""
 from metrust._metrust import io as _io
 
-# ── Classes ──────────────────────────────────────────────────────────────
-
-Level3File = _io.Level3File
-Metar = _io.Metar
-StationInfo = _io.StationInfo
-StationLookup = _io.StationLookup
-
-# ── Functions ────────────────────────────────────────────────────────────
-
-def parse_metar(text):
-    """Parse a single METAR observation string.
-
-    Parameters
-    ----------
-    text : str
-        Raw METAR text (may start with "METAR" or "SPECI").
-
-    Returns
-    -------
-    Metar
-        Parsed observation with attributes for station, wind, visibility,
-        temperature, dewpoint, altimeter, sky cover, and weather phenomena.
-    """
-    return _io.parse_metar(text)
-
-
-def parse_metar_file(content):
-    """Parse a multi-line string containing one METAR per line.
-
-    Blank lines and lines starting with '#' are skipped.  Returns all
-    successfully parsed METARs (silently ignoring unparseable lines).
-
-    Parameters
-    ----------
-    content : str
-        Multi-line string with one METAR per line.
-
-    Returns
-    -------
-    list of Metar
-    """
-    return _io.parse_metar_file(content)
-
-
-__all__ = [
+_RUST_EXPORTS = [
     "Level3File",
     "Metar",
     "StationInfo",
     "StationLookup",
+    "GiniFile",
+    "GempakGrid",
+    "GempakGridRecord",
+    "GempakSounding",
+    "GempakSoundingStation",
+    "SoundingData",
+    "GempakSurface",
+    "GempakSurfaceStation",
+    "SurfaceObs",
+    "SurfaceBulletinFeature",
     "parse_metar",
     "parse_metar_file",
+    "parse_wpc_surface_bulletin",
+    "is_precip_mode",
 ]
+
+for _name in _RUST_EXPORTS:
+    if hasattr(_io, _name):
+        globals()[_name] = getattr(_io, _name)
+
+
+def __getattr__(name):
+    if hasattr(_io, name):
+        return getattr(_io, name)
+    # Level2File is not yet implemented in Rust -- lazy-load from MetPy
+    if name == "Level2File":
+        try:
+            import metpy.io as _metpy_io  # type: ignore
+            if hasattr(_metpy_io, "Level2File"):
+                globals()["Level2File"] = _metpy_io.Level2File
+                return _metpy_io.Level2File
+        except ImportError:
+            pass
+        raise ImportError(
+            "Level2File is not yet implemented natively. "
+            "Install MetPy for Level2 radar support: pip install metpy"
+        )
+    raise AttributeError(f"module 'metrust.io' has no attribute {name!r}")
+
+
+__all__ = sorted(
+    set(_RUST_EXPORTS).union({"Level2File"})
+)
+
+
+def __dir__():
+    return sorted(set(globals()).union(__all__))

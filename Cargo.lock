@@ -627,6 +627,7 @@ name = "metrust"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "flate2",
  "rayon",
  "rustmet-core",
  "wx-field",

@@ -43,10 +43,17 @@ pub fn first_derivative(
             for i in 0..nx {
                 let d = if nx < 2 {
                     0.0
-                } else if i == 0 {
+                } else if nx == 2 {
+                    // Only 2 points: first-order is all we can do
                     (values[idx(j, 1, nx)] - values[idx(j, 0, nx)]) * inv_h
+                } else if i == 0 {
+                    // 2nd-order forward: (-3f[0] + 4f[1] - f[2]) / (2h)
+                    (-3.0 * values[idx(j, 0, nx)] + 4.0 * values[idx(j, 1, nx)]
+                        - values[idx(j, 2, nx)]) * inv_2h
                 } else if i == nx - 1 {
-                    (values[idx(j, nx - 1, nx)] - values[idx(j, nx - 2, nx)]) * inv_h
+                    // 2nd-order backward: (3f[n] - 4f[n-1] + f[n-2]) / (2h)
+                    (3.0 * values[idx(j, nx - 1, nx)] - 4.0 * values[idx(j, nx - 2, nx)]
+                        + values[idx(j, nx - 3, nx)]) * inv_2h
                 } else {
                     (values[idx(j, i + 1, nx)] - values[idx(j, i - 1, nx)]) * inv_2h
                 };
@@ -59,10 +66,16 @@ pub fn first_derivative(
             for i in 0..nx {
                 let d = if ny < 2 {
                     0.0
-                } else if j == 0 {
+                } else if ny == 2 {
                     (values[idx(1, i, nx)] - values[idx(0, i, nx)]) * inv_h
+                } else if j == 0 {
+                    // 2nd-order forward: (-3f[0] + 4f[1] - f[2]) / (2h)
+                    (-3.0 * values[idx(0, i, nx)] + 4.0 * values[idx(1, i, nx)]
+                        - values[idx(2, i, nx)]) * inv_2h
                 } else if j == ny - 1 {
-                    (values[idx(ny - 1, i, nx)] - values[idx(ny - 2, i, nx)]) * inv_h
+                    // 2nd-order backward: (3f[n] - 4f[n-1] + f[n-2]) / (2h)
+                    (3.0 * values[idx(ny - 1, i, nx)] - 4.0 * values[idx(ny - 2, i, nx)]
+                        + values[idx(ny - 3, i, nx)]) * inv_2h
                 } else {
                     (values[idx(j + 1, i, nx)] - values[idx(j - 1, i, nx)]) * inv_2h
                 };
@@ -234,10 +247,16 @@ pub fn geospatial_gradient(
             let dx_m = local_dx[k];
             if dx_m < 1e-10 || nx < 2 {
                 dfdx[k] = 0.0;
-            } else if i == 0 {
+            } else if nx == 2 {
                 dfdx[k] = (values[idx(j, 1, nx)] - values[idx(j, 0, nx)]) / dx_m;
+            } else if i == 0 {
+                // 2nd-order forward: (-3f[0] + 4f[1] - f[2]) / (2dx)
+                dfdx[k] = (-3.0 * values[idx(j, 0, nx)] + 4.0 * values[idx(j, 1, nx)]
+                    - values[idx(j, 2, nx)]) / (2.0 * dx_m);
             } else if i == nx - 1 {
-                dfdx[k] = (values[idx(j, nx - 1, nx)] - values[idx(j, nx - 2, nx)]) / dx_m;
+                // 2nd-order backward: (3f[n] - 4f[n-1] + f[n-2]) / (2dx)
+                dfdx[k] = (3.0 * values[idx(j, nx - 1, nx)] - 4.0 * values[idx(j, nx - 2, nx)]
+                    + values[idx(j, nx - 3, nx)]) / (2.0 * dx_m);
             } else {
                 // centered: dx_m is the average spacing, difference spans 2*dx_m
                 dfdx[k] = (values[idx(j, i + 1, nx)] - values[idx(j, i - 1, nx)]) / (2.0 * dx_m);
@@ -252,10 +271,16 @@ pub fn geospatial_gradient(
             let dy_m = local_dy[k];
             if dy_m < 1e-10 || ny < 2 {
                 dfdy[k] = 0.0;
-            } else if j == 0 {
+            } else if ny == 2 {
                 dfdy[k] = (values[idx(1, i, nx)] - values[idx(0, i, nx)]) / dy_m;
+            } else if j == 0 {
+                // 2nd-order forward: (-3f[0] + 4f[1] - f[2]) / (2dy)
+                dfdy[k] = (-3.0 * values[idx(0, i, nx)] + 4.0 * values[idx(1, i, nx)]
+                    - values[idx(2, i, nx)]) / (2.0 * dy_m);
             } else if j == ny - 1 {
-                dfdy[k] = (values[idx(ny - 1, i, nx)] - values[idx(ny - 2, i, nx)]) / dy_m;
+                // 2nd-order backward: (3f[n] - 4f[n-1] + f[n-2]) / (2dy)
+                dfdy[k] = (3.0 * values[idx(ny - 1, i, nx)] - 4.0 * values[idx(ny - 2, i, nx)]
+                    + values[idx(ny - 3, i, nx)]) / (2.0 * dy_m);
             } else {
                 dfdy[k] = (values[idx(j + 1, i, nx)] - values[idx(j - 1, i, nx)]) / (2.0 * dy_m);
             }

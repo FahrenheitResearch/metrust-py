@@ -1,18 +1,32 @@
-"""metrust.plots -- Plotting utilities.
+"""metrust.plots -- forwarding to MetPy's plotting module.
 
-Note: MetPy's plots module relies heavily on matplotlib.  metrust provides
-rendering primitives (skew-T, hodograph, colormaps, contours) but the actual
-rendering happens in Rust.  The Python interface to these is provided as
-utility functions rather than matplotlib-integrated classes.
+Plotting is MetPy's domain. This module provides access to MetPy's plotting
+classes (StationPlot, SkewT, Hodograph, etc.) when MetPy is installed.
 
-Users who need full matplotlib integration should use metpy.plots directly
-and feed it data computed by metrust.calc.
+Install MetPy separately if you need plotting:
+
+    pip install metpy
 """
 
 
 def __getattr__(name):
-    raise AttributeError(
-        f"metrust.plots.{name} is not available. "
-        f"metrust performs rendering natively in Rust. "
-        f"For matplotlib-based plots, use metpy.plots with data from metrust.calc."
+    # Lazy-import metpy.plots only when an attribute is actually requested
+    try:
+        import metpy.plots as _metpy_plots  # type: ignore
+        if hasattr(_metpy_plots, name):
+            return getattr(_metpy_plots, name)
+    except ImportError:
+        pass
+    raise ImportError(
+        f"metrust.plots requires MetPy for matplotlib integration. "
+        f"Install it with: pip install metpy"
     )
+
+
+def __dir__():
+    try:
+        import metpy.plots as _metpy_plots  # type: ignore
+        names = [n for n in dir(_metpy_plots) if not n.startswith("_")]
+    except ImportError:
+        names = []
+    return sorted(set(globals()).union(names))

@@ -15,5 +15,6 @@ wx-radar = { path = "../wx-radar" }
 # Minimal external deps
 chrono = "0.4"
 rayon = "1"
+flate2 = "1"
 
 [dev-dependencies]

@@ -364,6 +364,209 @@ pub fn corfidi_storm_motion(
 }
 
 // ─────────────────────────────────────────────
+// Boundary-layer turbulence functions
+// ─────────────────────────────────────────────
+
+/// Friction velocity from time series of wind components.
+///
+/// Computes `u* = (mean(u'w')^2)^(1/4) = sqrt(|mean(u'w')|)` where primes denote
+/// perturbations from the mean.
+///
+/// Uses the computational identity: `mean(u'w') = mean(u*w) - mean(u)*mean(w)`
+/// which is more efficient than explicitly computing perturbations.
+///
+/// # Arguments
+///
+/// * `u` - Time series of along-wind component (m/s)
+/// * `w` - Time series of vertical wind component (m/s)
+///
+/// # Returns
+///
+/// Friction velocity (m/s), always non-negative.
+///
+/// # Panics
+///
+/// Panics if `u` and `w` have different lengths or fewer than 2 samples.
+///
+/// # References
+///
+/// Garratt, J. R. (1994). The Atmospheric Boundary Layer. Cambridge University Press.
+///
+/// # Examples
+///
+/// ```
+/// use metrust::calc::wind::friction_velocity;
+/// let u = vec![1.0, -1.0, 1.0, -1.0, 1.0];
+/// let w = vec![0.5, -0.5, 0.5, -0.5, 0.5];
+/// let u_star = friction_velocity(&u, &w);
+/// assert!(u_star > 0.0);
+/// ```
+pub fn friction_velocity(u: &[f64], w: &[f64]) -> f64 {
+    let n = u.len();
+    assert_eq!(n, w.len(), "u and w must have the same length");
+    assert!(n >= 2, "need at least 2 samples");
+
+    let n_f = n as f64;
+    let mean_u = u.iter().sum::<f64>() / n_f;
+    let mean_w = w.iter().sum::<f64>() / n_f;
+    let mean_uw: f64 = u.iter().zip(w.iter()).map(|(ui, wi)| ui * wi).sum::<f64>() / n_f;
+
+    // kinematic flux = cov(u, w) using the identity
+    let uw_flux = mean_uw - mean_u * mean_w;
+
+    // u* = (uw^2)^(1/4) = sqrt(|uw|)
+    uw_flux.abs().sqrt()
+}
+
+/// Turbulent Kinetic Energy from time series of wind components.
+///
+/// `TKE = 0.5 * (var(u) + var(v) + var(w))`
+///
+/// where `var()` is the population variance (N denominator, not N-1).
+///
+/// # Arguments
+///
+/// * `u` - Time series of u-component (m/s)
+/// * `v` - Time series of v-component (m/s)
+/// * `w` - Time series of w-component (m/s)
+///
+/// # Returns
+///
+/// TKE in m^2/s^2.
+///
+/// # Panics
+///
+/// Panics if arrays have different lengths or fewer than 2 samples.
+///
+/// # Examples
+///
+/// ```
+/// use metrust::calc::wind::tke;
+/// let u = vec![1.0, -1.0, 1.0, -1.0];
+/// let v = vec![2.0, -2.0, 2.0, -2.0];
+/// let w = vec![0.5, -0.5, 0.5, -0.5];
+/// let e = tke(&u, &v, &w);
+/// assert!((e - 2.625).abs() < 1e-10);
+/// ```
+pub fn tke(u: &[f64], v: &[f64], w: &[f64]) -> f64 {
+    let n = u.len();
+    assert_eq!(n, v.len(), "u and v must have the same length");
+    assert_eq!(n, w.len(), "u and w must have the same length");
+    assert!(n >= 2, "need at least 2 samples");
+
+    let n_f = n as f64;
+
+    // Population variance helper
+    let variance = |arr: &[f64]| -> f64 {
+        let mean = arr.iter().sum::<f64>() / n_f;
+        arr.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / n_f
+    };
+
+    0.5 * (variance(u) + variance(v) + variance(w))
+}
+
+/// Gradient Richardson number at each level.
+///
+/// `Ri = (g / theta) * (d_theta/dz) / ((du/dz)^2 + (dv/dz)^2)`
+///
+/// Uses the same 3-point derivative scheme as MetPy: centered differences at
+/// interior points, 3-point forward/backward differences at the boundaries.
+///
+/// # Arguments
+///
+/// * `height` - Height profile (meters, ascending)
+/// * `theta` - Potential temperature profile (Kelvin)
+/// * `u` - U-component wind profile (m/s)
+/// * `v` - V-component wind profile (m/s)
+///
+/// # Returns
+///
+/// Richardson number at each level. Values below 0.25 indicate turbulence.
+/// Where the wind shear denominator is zero, returns `f64::INFINITY` (or
+/// `f64::NEG_INFINITY` for unstable layers with zero shear).
+///
+/// # Panics
+///
+/// Panics if arrays have different lengths or fewer than 3 levels.
+///
+/// # References
+///
+/// Holton, J. R. (2004). *An Introduction to Dynamic Meteorology*, 4th Ed., pg. 121-122.
+///
+/// # Examples
+///
+/// ```
+/// use metrust::calc::wind::gradient_richardson_number;
+/// let z = vec![0.0, 100.0, 200.0, 300.0, 400.0];
+/// let theta = vec![300.0, 301.0, 302.5, 304.5, 307.0];
+/// let u = vec![2.0, 5.0, 8.0, 10.0, 12.0];
+/// let v = vec![1.0, 2.0, 3.5, 5.0, 6.0];
+/// let ri = gradient_richardson_number(&z, &theta, &u, &v);
+/// assert_eq!(ri.len(), 5);
+/// assert!(ri[0] > 0.0); // stable
+/// ```
+pub fn gradient_richardson_number(
+    height: &[f64],
+    theta: &[f64],
+    u: &[f64],
+    v: &[f64],
+) -> Vec<f64> {
+    let n = height.len();
+    assert_eq!(n, theta.len());
+    assert_eq!(n, u.len());
+    assert_eq!(n, v.len());
+    assert!(n >= 3, "need at least 3 levels for gradient Richardson number");
+
+    const G: f64 = 9.80665;
+
+    // 3-point first derivative matching MetPy's first_derivative:
+    // - Forward at i=0: (-3*f[0] + 4*f[1] - f[2]) / (x[2] - x[0])
+    // - Centered at interior: (f[i+1] - f[i-1]) / (x[i+1] - x[i-1])
+    // - Backward at i=n-1: (f[n-3] - 4*f[n-2] + 3*f[n-1]) / (x[n-1] - x[n-3])
+    let first_deriv = |f: &[f64], x: &[f64]| -> Vec<f64> {
+        let m = f.len();
+        let mut d = vec![0.0; m];
+        // Forward difference at i=0
+        let dx_fwd = x[2] - x[0];
+        if dx_fwd.abs() > 1e-30 {
+            d[0] = (-3.0 * f[0] + 4.0 * f[1] - f[2]) / dx_fwd;
+        }
+        // Centered differences at interior
+        for i in 1..m - 1 {
+            let dx = x[i + 1] - x[i - 1];
+            if dx.abs() > 1e-30 {
+                d[i] = (f[i + 1] - f[i - 1]) / dx;
+            }
+        }
+        // Backward difference at i=n-1
+        let dx_bwd = x[m - 1] - x[m - 3];
+        if dx_bwd.abs() > 1e-30 {
+            d[m - 1] = (f[m - 3] - 4.0 * f[m - 2] + 3.0 * f[m - 1]) / dx_bwd;
+        }
+        d
+    };
+
+    let dthetadz = first_deriv(theta, height);
+    let dudz = first_deriv(u, height);
+    let dvdz = first_deriv(v, height);
+
+    let mut ri = vec![0.0; n];
+    for i in 0..n {
+        let shear_sq = dudz[i].powi(2) + dvdz[i].powi(2);
+        if shear_sq.abs() < 1e-30 {
+            ri[i] = if dthetadz[i] >= 0.0 {
+                f64::INFINITY
+            } else {
+                f64::NEG_INFINITY
+            };
+        } else {
+            ri[i] = (G / theta[i]) * (dthetadz[i] / shear_sq);
+        }
+    }
+    ri
+}
+
+// ─────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────
 
@@ -608,5 +811,130 @@ mod tests {
         assert!((upwind.1 - mw_v).abs() < 1e-10);
         assert!((downwind.0 - 2.0 * mw_u).abs() < 1e-10);
         assert!((downwind.1 - 2.0 * mw_v).abs() < 1e-10);
+    }
+
+    // ── friction_velocity ──
+
+    #[test]
+    fn test_friction_velocity_correlated() {
+        // u and w perfectly correlated: u' = [1,-1,1,-1,1], w' = [0.5,-0.5,0.5,-0.5,0.5]
+        // mean(u)=0.2, mean(w)=0.1
+        // kinematic_flux = mean(u*w) - mean(u)*mean(w) = 0.5 - 0.02 = 0.48
+        // u* = sqrt(|0.48|) = 0.6928203230
+        // Verified against MetPy: friction_velocity(simple) = 0.6928203230
+        let u = vec![1.0, -1.0, 1.0, -1.0, 1.0];
+        let w = vec![0.5, -0.5, 0.5, -0.5, 0.5];
+        let u_star = friction_velocity(&u, &w);
+        assert!((u_star - 0.6928203230).abs() < 1e-8,
+            "u* = {u_star}, expected 0.6928203230");
+    }
+
+    #[test]
+    fn test_friction_velocity_zero_mean() {
+        // When means are already zero: mean(u'w') = mean(uw)
+        let u = vec![1.0, -1.0, 2.0, -2.0];
+        let w = vec![0.5, -0.5, 1.0, -1.0];
+        // mean(u)=0, mean(w)=0, mean(uw) = (0.5+0.5+2+2)/4 = 5/4 = 1.25
+        let u_star = friction_velocity(&u, &w);
+        assert!((u_star - 1.25_f64.sqrt()).abs() < 1e-10,
+            "u* = {u_star}");
+    }
+
+    #[test]
+    fn test_friction_velocity_uncorrelated() {
+        // Uncorrelated signals: u'w' ~ 0
+        let u = vec![1.0, -1.0, 1.0, -1.0];
+        let w = vec![1.0, 1.0, -1.0, -1.0];
+        // mean(u)=0, mean(w)=0, mean(uw) = (1 + (-1) + (-1) + 1)/4 = 0
+        let u_star = friction_velocity(&u, &w);
+        assert!(u_star.abs() < 1e-10, "u* = {u_star}, expected ~0");
+    }
+
+    // ── tke ──
+
+    #[test]
+    fn test_tke_simple() {
+        // var(u)=1, var(v)=4, var(w)=0.25 => TKE = 0.5*(1+4+0.25) = 2.625
+        // Verified against MetPy: tke(simple) = 2.625
+        let u = vec![1.0, -1.0, 1.0, -1.0];
+        let v = vec![2.0, -2.0, 2.0, -2.0];
+        let w = vec![0.5, -0.5, 0.5, -0.5];
+        let e = tke(&u, &v, &w);
+        assert!((e - 2.625).abs() < 1e-10, "TKE = {e}, expected 2.625");
+    }
+
+    #[test]
+    fn test_tke_zero_variance() {
+        // Constant wind: all variance = 0 => TKE = 0
+        let u = vec![5.0, 5.0, 5.0, 5.0];
+        let v = vec![3.0, 3.0, 3.0, 3.0];
+        let w = vec![0.0, 0.0, 0.0, 0.0];
+        let e = tke(&u, &v, &w);
+        assert!(e.abs() < 1e-10, "TKE = {e}, expected 0");
+    }
+
+    #[test]
+    fn test_tke_equal_components() {
+        // Equal variance in all components
+        let u = vec![1.0, -1.0];
+        let v = vec![1.0, -1.0];
+        let w = vec![1.0, -1.0];
+        // var of each = 1.0, TKE = 0.5 * 3 = 1.5
+        let e = tke(&u, &v, &w);
+        assert!((e - 1.5).abs() < 1e-10, "TKE = {e}, expected 1.5");
+    }
+
+    // ── gradient_richardson_number ──
+
+    #[test]
+    fn test_gradient_richardson_number_metpy_reference() {
+        // Verified against MetPy:
+        // z = [0, 100, 200, 300, 400] m
+        // theta = [300, 301, 302.5, 304.5, 307] K
+        // u = [2, 5, 8, 10, 12] m/s
+        // v = [1, 2, 3.5, 5, 6] m/s
+        // Ri = [0.25638301, 0.38556488, 0.66744336, 1.30270438, 1.92536076]
+        let z = vec![0.0, 100.0, 200.0, 300.0, 400.0];
+        let theta = vec![300.0, 301.0, 302.5, 304.5, 307.0];
+        let u = vec![2.0, 5.0, 8.0, 10.0, 12.0];
+        let v = vec![1.0, 2.0, 3.5, 5.0, 6.0];
+
+        let ri = gradient_richardson_number(&z, &theta, &u, &v);
+        let expected = [0.25638301, 0.38556488, 0.66744336, 1.30270438, 1.92536076];
+
+        assert_eq!(ri.len(), 5);
+        for i in 0..5 {
+            assert!((ri[i] - expected[i]).abs() < 1e-4,
+                "Ri[{i}] = {}, expected {}", ri[i], expected[i]);
+        }
+    }
+
+    #[test]
+    fn test_gradient_ri_stable_layer() {
+        // Strongly stable: large theta increase, small shear
+        let z = vec![0.0, 100.0, 200.0];
+        let theta = vec![300.0, 310.0, 320.0]; // 10 K per 100 m
+        let u = vec![5.0, 5.1, 5.2]; // very weak shear
+        let v = vec![0.0, 0.0, 0.0];
+
+        let ri = gradient_richardson_number(&z, &theta, &u, &v);
+        // All Ri should be >> 0.25 (very stable)
+        for i in 0..3 {
+            assert!(ri[i] > 10.0, "Ri[{i}] = {}, expected >> 0.25", ri[i]);
+        }
+    }
+
+    #[test]
+    fn test_gradient_ri_below_quarter_means_turbulent() {
+        // Strong shear, weak stability => Ri < 0.25
+        let z = vec![0.0, 100.0, 200.0];
+        let theta = vec![300.0, 300.01, 300.02]; // nearly neutral
+        let u = vec![0.0, 10.0, 20.0]; // very strong shear
+        let v = vec![0.0, 0.0, 0.0];
+
+        let ri = gradient_richardson_number(&z, &theta, &u, &v);
+        for i in 0..3 {
+            assert!(ri[i] < 0.25, "Ri[{i}] = {}, expected < 0.25", ri[i]);
+        }
     }
 }

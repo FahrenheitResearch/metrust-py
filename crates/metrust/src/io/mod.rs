@@ -39,6 +39,40 @@ pub use metar::{Metar, parse_metar_file};
 pub mod station;
 pub use station::{StationInfo, StationLookup};
 
+// ── GEMPAK grid files ──────────────────────────────────────────────
+pub mod gempak;
+pub use gempak::GempakGrid;
+
+// ── GEMPAK shared DM format infrastructure ──────────────────────────
+pub mod gempak_dm;
+
+// ── GEMPAK sounding files ─────────────────────────────────────────
+pub mod gempak_sounding;
+pub use gempak_sounding::{GempakSounding, GempakStation as GempakSoundingStation, SoundingData};
+
+// ── GEMPAK surface files ──────────────────────────────────────────
+pub mod gempak_surface;
+pub use gempak_surface::{GempakSurface, SurfaceStation, SurfaceObs};
+
+// ── GINI satellite images ──────────────────────────────────────────
+pub mod gini;
+pub use gini::GiniFile;
+
+// ── WPC coded surface bulletins ────────────────────────────────────
+pub mod wpc;
+pub use wpc::{parse_wpc_surface_bulletin, SurfaceBulletinFeature};
+
+// ── NEXRAD VCP helpers ─────────────────────────────────────────────
+
+/// Return `true` if the given NEXRAD Volume Coverage Pattern (VCP)
+/// number corresponds to a precipitation (storm) scanning mode.
+///
+/// Precipitation VCPs use shorter update cycles and more tilts in the
+/// lower atmosphere to better resolve convective features.
+pub fn is_precip_mode(vcp: u16) -> bool {
+    matches!(vcp, 11 | 12 | 21 | 121 | 211 | 212 | 215 | 221)
+}
+
 // ── Download ─────────────────────────────────────────────────────────
 pub use rustmet_core::download::{
     DownloadClient, DownloadConfig, Cache, DiskCache,

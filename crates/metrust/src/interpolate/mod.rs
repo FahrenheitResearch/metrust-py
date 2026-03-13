@@ -52,11 +52,12 @@ pub fn interpolate_to_grid(
 
 // ── 1-D linear interpolation (like numpy.interp) ────────────────────
 
-/// Piecewise linear interpolation, matching NumPy's `numpy.interp`.
+/// Piecewise linear interpolation (MetPy-compatible).
 ///
 /// Given monotonically increasing breakpoints `xp` with values `fp`,
 /// evaluate the piecewise-linear interpolant at each point in `x`.
-/// Values outside `[xp[0], xp[last]]` are clamped to the boundary values.
+/// Values outside `[xp[0], xp[last]]` return `NaN` (no extrapolation),
+/// matching MetPy's behavior.
 ///
 /// # Panics
 /// Panics if `xp` and `fp` have different lengths or are empty.
@@ -67,9 +68,11 @@ pub fn interpolate_1d(x: &[f64], xp: &[f64], fp: &[f64]) -> Vec<f64> {
     let n = xp.len();
     x.iter()
         .map(|&xi| {
-            if xi <= xp[0] {
+            if xi < xp[0] || xi > xp[n - 1] {
+                f64::NAN
+            } else if xi == xp[0] {
                 fp[0]
-            } else if xi >= xp[n - 1] {
+            } else if xi == xp[n - 1] {
                 fp[n - 1]
             } else {
                 // Binary search for the enclosing interval
@@ -597,6 +600,44 @@ pub fn remove_observations_below_value(
     (out_lats, out_lons, out_vals)
 }
 
+/// Interpolate scattered data to arbitrary points using a specified method.
+///
+/// This is a convenience dispatcher that selects between inverse-distance
+/// weighting and natural-neighbor interpolation.
+///
+/// # Arguments
+///
+/// * `src_lats`, `src_lons`, `src_values` - Source observation coordinates and values
+/// * `target_lats`, `target_lons` - Target point coordinates
+/// * `interp_type` - Method: `"inverse_distance"` (or `"idw"`, `"linear"`)
+///   or `"natural_neighbor"` (or `"nn"`, `"natural"`)
+///
+/// For IDW, uses power=2, min_neighbors=1, search_radius=10 degrees.
+pub fn interpolate_to_points(
+    src_lats: &[f64],
+    src_lons: &[f64],
+    src_values: &[f64],
+    target_lats: &[f64],
+    target_lons: &[f64],
+    interp_type: &str,
+) -> Vec<f64> {
+    match interp_type {
+        "natural_neighbor" | "nn" | "natural" => {
+            natural_neighbor_to_points(src_lats, src_lons, src_values, target_lats, target_lons)
+        }
+        _ => {
+            // Default to inverse distance (idw / linear)
+            inverse_distance_to_points(
+                src_lats, src_lons, src_values,
+                target_lats, target_lons,
+                2.0,    // power
+                1,      // min_neighbors
+                10.0,   // search_radius
+            )
+        }
+    }
+}
+
 /// Remove observations with duplicate `(lat, lon)` coordinates,
 /// keeping the first occurrence.
 pub fn remove_repeat_coordinates(
@@ -696,10 +737,22 @@ mod tests {
     }
 
     #[test]
-    fn test_interpolate_1d_clamp() {
+    fn test_interpolate_1d_nan_outside_range() {
+        // Values outside [xp[0], xp[last]] should return NaN (MetPy-compatible).
         let xp = vec![1.0, 2.0, 3.0];
         let fp = vec![10.0, 20.0, 30.0];
         let x = vec![0.0, 4.0];
+        let result = interpolate_1d(&x, &xp, &fp);
+        assert!(result[0].is_nan(), "below range should be NaN");
+        assert!(result[1].is_nan(), "above range should be NaN");
+    }
+
+    #[test]
+    fn test_interpolate_1d_exact_boundary() {
+        // Values exactly at boundaries should return the boundary values.
+        let xp = vec![1.0, 2.0, 3.0];
+        let fp = vec![10.0, 20.0, 30.0];
+        let x = vec![1.0, 3.0];
         let result = interpolate_1d(&x, &xp, &fp);
         assert!((result[0] - 10.0).abs() < 1e-10);
         assert!((result[1] - 30.0).abs() < 1e-10);

@@ -10,8 +10,8 @@
 /// Standard sea-level pressure (hPa).
 const P0: f64 = 1013.25;
 
-/// Standard sea-level temperature (K).
-const T0: f64 = 288.15;
+/// Standard sea-level temperature (K) — matches MetPy's value.
+const T0: f64 = 288.0;
 
 /// Temperature lapse rate in the troposphere (K/m).
 const LAPSE_RATE: f64 = 0.0065;
@@ -87,10 +87,12 @@ pub fn pressure_to_height_std(pressure_hpa: f64) -> f64 {
 
 /// Convert altimeter setting to station pressure.
 ///
-/// Uses the ASOS/NWS hypsometric reduction:
+/// Uses the Smithsonian Meteorological Tables (1951) formula, matching MetPy's
+/// implementation:
 ///
 /// ```text
-/// P_stn = altimeter * (1 - L*elev / T0) ^ (g*M / (R*L))
+/// n = Rd * gamma / g        (≈ 0.190284)
+/// P_stn = (A^n - p0^n * gamma * H / T0) ^ (1/n) + 0.3
 /// ```
 ///
 /// # Arguments
@@ -99,16 +101,21 @@ pub fn pressure_to_height_std(pressure_hpa: f64) -> f64 {
 ///
 /// # Returns
 /// Station pressure (hPa).
+///
+/// # References
+/// Smithsonian Meteorological Tables (1951), p. 269.
 pub fn altimeter_to_station_pressure(altimeter_hpa: f64, elevation_m: f64) -> f64 {
-    altimeter_hpa * (1.0 - LAPSE_RATE * elevation_m / T0).powf(BARO_EXP)
+    let n = 1.0 / BARO_EXP;
+    (altimeter_hpa.powf(n) - P0.powf(n) * LAPSE_RATE * elevation_m / T0).powf(1.0 / n) + 0.3
 }
 
 /// Convert station pressure to altimeter setting.
 ///
-/// Inverse of [`altimeter_to_station_pressure`].
+/// Inverse of [`altimeter_to_station_pressure`] (Smithsonian formula).
 ///
 /// ```text
-/// altimeter = P_stn / (1 - L*elev / T0) ^ (g*M / (R*L))
+/// n = Rd * gamma / g
+/// A = ((P_stn - 0.3)^n + p0^n * gamma * H / T0) ^ (1/n)
 /// ```
 ///
 /// # Arguments
@@ -118,7 +125,8 @@ pub fn altimeter_to_station_pressure(altimeter_hpa: f64, elevation_m: f64) -> f6
 /// # Returns
 /// Altimeter setting (hPa).
 pub fn station_to_altimeter_pressure(station_hpa: f64, elevation_m: f64) -> f64 {
-    station_hpa / (1.0 - LAPSE_RATE * elevation_m / T0).powf(BARO_EXP)
+    let n = 1.0 / BARO_EXP;
+    ((station_hpa - 0.3).powf(n) + P0.powf(n) * LAPSE_RATE * elevation_m / T0).powf(1.0 / n)
 }
 
 // ─────────────────────────────────────────────
@@ -127,12 +135,12 @@ pub fn station_to_altimeter_pressure(station_hpa: f64, elevation_m: f64) -> f64 
 
 /// Convert altimeter setting to sea-level pressure accounting for temperature.
 ///
-/// First reduces the altimeter setting to station pressure using the standard
-/// atmosphere, then applies a temperature-corrected hypsometric equation to
-/// obtain the sea-level pressure.
+/// First reduces the altimeter setting to station pressure using the Smithsonian
+/// formula ([`altimeter_to_station_pressure`]), then applies a temperature-corrected
+/// hypsometric equation to obtain the sea-level pressure.
 ///
 /// ```text
-/// P_stn = altimeter * (1 - L*elev / T0) ^ (g*M / (R*L))
+/// P_stn = (A^n - p0^n * gamma * H / T0)^(1/n) + 0.3   (Smithsonian 1951)
 /// SLP   = P_stn * exp( g * elev / (Rd * T_mean) )
 /// ```
 ///
@@ -150,8 +158,9 @@ pub fn station_to_altimeter_pressure(station_hpa: f64, elevation_m: f64) -> f64 
 /// # Examples
 /// ```
 /// use metrust::calc::atmo::altimeter_to_sea_level_pressure;
+/// // At sea level, SLP equals the Smithsonian station value (altimeter + 0.3)
 /// let slp = altimeter_to_sea_level_pressure(1013.25, 0.0, 15.0);
-/// assert!((slp - 1013.25).abs() < 0.01);
+/// assert!((slp - 1013.55).abs() < 0.01);
 /// ```
 pub fn altimeter_to_sea_level_pressure(alt_hpa: f64, elevation_m: f64, t_c: f64) -> f64 {
     // Step 1: reduce altimeter to station pressure via standard atmosphere
@@ -252,34 +261,27 @@ pub fn heat_index(temperature_c: f64, relative_humidity_pct: f64) -> f64 {
 
 /// Wind chill index using the NWS/Environment Canada formula.
 ///
-/// The NWS wind chill is valid for temperatures at or below 10 C (50 F) and
-/// wind speeds above 1.34 m/s (3 mph, ~4.8 km/h).
+/// Computes the Wind Chill Temperature Index (WCTI) per the FCM formula.
+/// The formula is always evaluated (matching MetPy's default behavior).
 ///
 /// # Arguments
 /// * `temperature_c` — Air temperature (degrees Celsius)
 /// * `wind_speed_ms` — Wind speed at 10 m height (m/s)
 ///
 /// # Returns
-/// Wind chill temperature in degrees Celsius. Returns the air temperature
-/// unchanged if conditions are outside the formula's valid range.
+/// Wind chill temperature in degrees Celsius. The formula is applied
+/// unconditionally; callers may wish to mask values where T > 10 C or
+/// wind <= ~1.34 m/s (3 mph).
 ///
 /// # References
 /// NWS Wind Chill Temperature Index, adopted 2001 (Osczevski and Bluestein).
 pub fn windchill(temperature_c: f64, wind_speed_ms: f64) -> f64 {
-    let t_f = temperature_c * 9.0 / 5.0 + 32.0;
-    let wind_mph = wind_speed_ms * 2.23694;
+    let wind_kmh = wind_speed_ms * 3.6;
+    let speed_factor = wind_kmh.powf(0.16);
 
-    // Formula only valid for T <= 50 F and wind > 3 mph
-    if t_f > 50.0 || wind_mph <= 3.0 {
-        return temperature_c;
-    }
-
-    let wc_f = 35.74
-        + 0.6215 * t_f
-        - 35.75 * wind_mph.powf(0.16)
-        + 0.4275 * t_f * wind_mph.powf(0.16);
-
-    (wc_f - 32.0) * 5.0 / 9.0
+    (0.6215 + 0.3965 * speed_factor) * temperature_c
+        - 11.37 * speed_factor
+        + 13.12
 }
 
 /// Apparent temperature combining heat index and wind chill.
@@ -390,9 +392,10 @@ mod tests {
 
     #[test]
     fn test_altimeter_at_sea_level() {
-        // At sea level, station pressure should equal altimeter setting
+        // At sea level, the Smithsonian formula gives station = altimeter + 0.3
+        // (matching MetPy's behavior)
         let station = altimeter_to_station_pressure(1013.25, 0.0);
-        assert!((station - 1013.25).abs() < 0.01);
+        assert!((station - 1013.55).abs() < 0.01, "sea-level station = {station}");
     }
 
     // ── sigma_to_pressure ──
@@ -468,17 +471,24 @@ mod tests {
     // ── windchill ──
 
     #[test]
-    fn test_windchill_warm_passthrough() {
-        // Above 10 C / 50 F, windchill returns the temperature unchanged
+    fn test_windchill_warm_computed() {
+        // Formula is always applied (matching MetPy), even above 10 C
         let wc = windchill(15.0, 10.0);
-        assert!((wc - 15.0).abs() < 1e-10, "warm temp should pass through");
+        // Should not just return 15.0; the formula yields a different value
+        assert!(
+            (wc - 15.0).abs() > 0.01,
+            "windchill should compute formula even for warm temps, got {wc}"
+        );
     }
 
     #[test]
-    fn test_windchill_calm_passthrough() {
-        // Below threshold wind speed, returns temperature
-        let wc = windchill(-10.0, 1.0); // ~2.2 mph, below 3 mph
-        assert!((wc - (-10.0)).abs() < 1e-10, "calm wind should pass through");
+    fn test_windchill_calm_computed() {
+        // Formula is always applied, even with low wind
+        let wc = windchill(-10.0, 1.0);
+        assert!(
+            (wc - (-10.0)).abs() > 0.01,
+            "windchill should compute formula even for calm wind, got {wc}"
+        );
     }
 
     #[test]

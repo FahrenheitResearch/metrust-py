@@ -1,18 +1,12 @@
-"""Unit handling compatible with MetPy's units interface.
+"""Unit handling for metrust, built on Pint."""
 
-Provides the same ``units`` UnitRegistry that MetPy exposes, along with
-internal helpers for stripping and attaching Pint units at the Rust
-boundary.  Users can do::
-
-    from metrust.units import units
-    t = 25 * units.degC
-"""
 import numpy as np
 import pint
 
-units = pint.UnitRegistry()
+units = pint.UnitRegistry(autoconvert_offset_to_baseunit=True)
+units.autoconvert_offset_to_baseunit = True
 
-# Ensure MetPy-compatible aliases are registered.  degC, degF, and hPa
+# Ensure common meteorological aliases are registered.  degC, degF, and hPa
 # are usually available in modern Pint, but we guard against older
 # versions that may lack the convenience aliases.
 try:
@@ -61,7 +55,7 @@ def _strip_or_none(quantity, target_unit):
 
 def _attach(value, unit_str):
     """Attach pint units to a bare value."""
-    return value * units(unit_str)
+    return units.Quantity(value, unit_str)
 
 
 def _as_float(v):

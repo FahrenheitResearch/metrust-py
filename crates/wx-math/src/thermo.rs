@@ -16,6 +16,34 @@ pub const LAPSE_STD: f64 = 0.0065;  // Standard atmosphere lapse rate (K/m)
 pub const P0_STD: f64 = 1013.25;    // Standard sea level pressure (hPa)
 pub const T0_STD: f64 = 288.15;     // Standard sea level temperature (K)
 
+// --- Ambaum (2020) / MetPy constants for saturation vapor pressure ---
+// Triple-point temperature (K) — used as the auto-phase boundary.
+const T0: f64 = 273.16;
+// Saturation vapor pressure at 0 C (Pa). MetPy: 611.2 Pa = 6.112 hPa.
+const SAT_PRESSURE_0C: f64 = 611.2;
+// Specific heat capacities (J/(kg·K))
+const CP_L: f64 = 4219.4;          // Liquid water
+const CP_V: f64 = 1860.078011865639; // Water vapor (MetPy exact)
+const CP_I: f64 = 2090.0;          // Ice
+// Water vapor gas constant (J/(kg·K)) — MetPy's exact value
+const RV_METPY: f64 = 461.52311572606084;
+// Reference latent heats at T0 (J/kg)
+const LV_0: f64 = 2_500_840.0;     // Vaporization
+const LS_0: f64 = 2_834_540.0;     // Sublimation
+
+// --- Phase selection for saturation vapor pressure ---
+
+/// Phase of water for saturation calculations, matching MetPy's `phase` parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    /// Saturation over liquid water (default).
+    Liquid,
+    /// Saturation over solid ice.
+    Solid,
+    /// Automatically select liquid (T > T0 = 273.16 K) or solid (T <= T0).
+    Auto,
+}
+
 // --- SHARPpy Thermodynamic Approximations ---
 
 /// Wobus function for computing moist adiabats.
@@ -637,19 +665,69 @@ pub fn kelvin_to_celsius(t: f64) -> f64 {
 // Saturation / Moisture Functions
 // =============================================================================
 
-/// Saturation vapor pressure (hPa) using Bolton (1980) formula.
-/// Input: temperature in Celsius.
+/// Saturation vapor pressure (hPa) over **liquid** water.
+///
+/// Uses the Ambaum (2020) formulation matching MetPy exactly.
+/// For ice-phase or automatic phase selection, use [`saturation_vapor_pressure_with_phase`].
+///
+/// Input: temperature in Celsius. Output: hPa.
 pub fn saturation_vapor_pressure(t_c: f64) -> f64 {
-    6.112 * ((17.67 * t_c) / (t_c + 243.5)).exp()
+    svp_liquid_pa(t_c + ZEROCNK) / 100.0
+}
+
+/// Saturation vapor pressure (hPa) with explicit phase selection.
+///
+/// Uses the Ambaum (2020) formulation matching MetPy exactly.
+/// - `Phase::Liquid` — saturation over liquid water (same as [`saturation_vapor_pressure`]).
+/// - `Phase::Solid`  — saturation over ice.
+/// - `Phase::Auto`   — liquid when T > 273.16 K, solid otherwise.
+///
+/// Input: temperature in Celsius. Output: hPa.
+pub fn saturation_vapor_pressure_with_phase(t_c: f64, phase: Phase) -> f64 {
+    let t_k = t_c + ZEROCNK;
+    let pa = match phase {
+        Phase::Liquid => svp_liquid_pa(t_k),
+        Phase::Solid  => svp_solid_pa(t_k),
+        Phase::Auto   => {
+            if t_k > T0 { svp_liquid_pa(t_k) } else { svp_solid_pa(t_k) }
+        }
+    };
+    pa / 100.0
+}
+
+/// Internal: saturation vapor pressure over liquid water in **Pa**.
+///
+/// Ambaum (2020) Eq. 13:
+///   e = e_s0 * (T0/T)^((Cp_l - Cp_v) / Rv) * exp((Lv0/(Rv*T0) - L(T)/(Rv*T)))
+/// where L(T) = Lv0 - (Cp_l - Cp_v)*(T - T0)
+fn svp_liquid_pa(t_k: f64) -> f64 {
+    let latent_heat = LV_0 - (CP_L - CP_V) * (t_k - T0);
+    let heat_power = (CP_L - CP_V) / RV_METPY;
+    let exp_term = (LV_0 / T0 - latent_heat / t_k) / RV_METPY;
+    SAT_PRESSURE_0C * (T0 / t_k).powf(heat_power) * exp_term.exp()
+}
+
+/// Internal: saturation vapor pressure over ice in **Pa**.
+///
+/// Ambaum (2020) Eq. 17:
+///   e_i = e_s0 * (T0/T)^((Cp_i - Cp_v) / Rv) * exp((Ls0/(Rv*T0) - Ls(T)/(Rv*T)))
+/// where Ls(T) = Ls0 - (Cp_i - Cp_v)*(T - T0)
+fn svp_solid_pa(t_k: f64) -> f64 {
+    let latent_heat = LS_0 - (CP_I - CP_V) * (t_k - T0);
+    let heat_power = (CP_I - CP_V) / RV_METPY;
+    let exp_term = (LS_0 / T0 - latent_heat / t_k) / RV_METPY;
+    SAT_PRESSURE_0C * (T0 / t_k).powf(heat_power) * exp_term.exp()
 }
 
 /// Dewpoint (Celsius) from temperature (Celsius) and relative humidity (%).
-/// Uses the Magnus formula inverted.
+///
+/// Computes vapor pressure using the Ambaum SVP, then inverts via the Bolton (1980)
+/// formula — matching MetPy's approach.
 pub fn dewpoint_from_rh(t_c: f64, rh: f64) -> f64 {
     let rh_frac = rh / 100.0;
     let es = saturation_vapor_pressure(t_c);
     let e = rh_frac * es;
-    // Invert Bolton: Td = 243.5 * ln(e/6.112) / (17.67 - ln(e/6.112))
+    // Invert via Bolton: Td = 243.5 * ln(e/6.112) / (17.67 - ln(e/6.112))
     let ln_ratio = (e / 6.112).ln();
     243.5 * ln_ratio / (17.67 - ln_ratio)
 }
@@ -674,14 +752,22 @@ pub fn mixing_ratio_from_specific_humidity(q: f64) -> f64 {
 }
 
 /// Saturation mixing ratio (g/kg) at given pressure (hPa) and temperature (Celsius).
-/// Uses Bolton saturation vapor pressure.
+///
+/// Uses Ambaum (2020) SVP over liquid water. For phase-aware mixing ratio, use
+/// [`saturation_mixing_ratio_with_phase`].
 pub fn saturation_mixing_ratio(p_hpa: f64, t_c: f64) -> f64 {
     let es = saturation_vapor_pressure(t_c);
     (EPS * es / (p_hpa - es) * 1000.0).max(0.0)
 }
 
+/// Saturation mixing ratio (g/kg) with explicit phase selection.
+pub fn saturation_mixing_ratio_with_phase(p_hpa: f64, t_c: f64, phase: Phase) -> f64 {
+    let es = saturation_vapor_pressure_with_phase(t_c, phase);
+    (EPS * es / (p_hpa - es) * 1000.0).max(0.0)
+}
+
 /// Vapor pressure (hPa) from dewpoint temperature (Celsius).
-/// Uses Bolton (1980) formula.
+/// Uses Ambaum (2020) SVP over liquid water.
 pub fn vapor_pressure_from_dewpoint(td_c: f64) -> f64 {
     saturation_vapor_pressure(td_c)
 }
@@ -1057,15 +1143,25 @@ pub fn dry_lapse(p: &[f64], t_surface_c: f64) -> Vec<f64> {
 }
 
 /// Moist adiabatic lapse rate dT/dp for saturated parcel.
-/// Returns dT/dp in K/hPa (for use in RK4 integration).
+/// Returns dT/dp in K/hPa (for use in RK4 integration where pressure is in hPa).
+///
+/// Formula from Bakhshaii & Stull 2013:
+///   dT/dp = (1/p) * (Rd*T + Lv*rs) / (Cp_d + Lv^2*rs*epsilon/(Rd*T^2))
+///
+/// Since p is in hPa here, the Rd*T and Lv^2*... terms use SI (J/kg) but we
+/// must divide by p in Pa to get K/Pa, then multiply by 100 to get K/hPa.
+/// Equivalently, we compute the SI numerator and divide by p_hpa directly,
+/// but scale Rd and Lv^2 terms so the result is in K/hPa.
 fn moist_lapse_rate(p_hpa: f64, t_c: f64) -> f64 {
     let t_k = t_c + ZEROCNK;
     let es = saturation_vapor_pressure(t_c);
     let rs = EPS * es / (p_hpa - es); // kg/kg
-    let p_pa = p_hpa * 100.0;
 
-    // Clausius-Clapeyron based moist adiabatic lapse rate in pressure coords
-    let numerator = (RD * t_k + LV * rs) / p_pa;
+    // Numerator: (Rd*T + Lv*rs) / p, with p in Pa => divide by (p_hpa * 100)
+    // Denominator: Cp_d + Lv^2 * rs * epsilon / (Rd * T^2)
+    // Result is K/Pa; multiply by 100 to get K/hPa.
+    // Net effect: divide numerator by p_hpa only (the 100s cancel).
+    let numerator = (RD * t_k + LV * rs) / p_hpa;
     let denominator = CP + (LV * LV * rs * EPS) / (RD * t_k * t_k);
     numerator / denominator
 }
@@ -1173,7 +1269,9 @@ pub fn parcel_profile(p: &[f64], t_surface_c: f64, td_surface_c: f64) -> Vec<f64
 }
 
 /// Dewpoint (Celsius) from vapor pressure (hPa). Inverse Bolton formula.
-pub fn dewpoint(vapor_pressure_hpa: f64) -> f64 {
+///
+/// This is an alias for the `dewpoint` function defined earlier in this module.
+pub fn dewpoint_from_vapor_pressure(vapor_pressure_hpa: f64) -> f64 {
     if vapor_pressure_hpa <= 0.0 {
         return -ZEROCNK; // absolute zero-ish
     }
@@ -1218,7 +1316,7 @@ pub fn specific_humidity_from_dewpoint(p_hpa: f64, td_c: f64) -> f64 {
 pub fn dewpoint_from_specific_humidity(p_hpa: f64, q: f64) -> f64 {
     let w = q / (1.0 - q); // kg/kg
     let e = w * p_hpa / (EPS + w);
-    dewpoint(e)
+    dewpoint_from_vapor_pressure(e)
 }
 
 /// Saturation equivalent potential temperature (K). Assumes RH=100%.
@@ -2108,22 +2206,22 @@ mod tests {
     #[test]
     fn test_saturation_vapor_pressure_at_0c() {
         let es = saturation_vapor_pressure(0.0);
-        // Bolton at 0C: 6.112 * exp(0) = 6.112 hPa
-        assert!((es - 6.112).abs() < 0.01);
+        // Ambaum (2020) / MetPy at 0C: 6.107563 hPa
+        assert!((es - 6.107563).abs() < 0.001, "es at 0C = {es}");
     }
 
     #[test]
     fn test_saturation_vapor_pressure_at_20c() {
         let es = saturation_vapor_pressure(20.0);
-        // At 20C, es should be ~23.4 hPa
-        assert!((es - 23.4).abs() < 0.5);
+        // MetPy at 20C: 23.347481 hPa
+        assert!((es - 23.347).abs() < 0.01, "es at 20C = {es}");
     }
 
     #[test]
     fn test_saturation_vapor_pressure_at_100c() {
         let es = saturation_vapor_pressure(100.0);
-        // Bolton formula gives ~1014-1020 at 100C (slightly differs from exact 1013.25)
-        assert!((es - 1013.0).abs() < 50.0, "es={es}");
+        // MetPy at 100C: 993.344909 hPa
+        assert!((es - 993.34).abs() < 1.0, "es at 100C = {es}");
     }
 
     #[test]
@@ -2492,11 +2590,20 @@ mod tests {
     #[test]
     fn test_moist_lapse() {
         let p = vec![1000.0, 900.0, 800.0, 700.0, 600.0, 500.0];
-        let result = moist_lapse(&p, 20.0);
+        let result = moist_lapse(&p, 25.0);
         assert_eq!(result.len(), 6);
-        assert!((result[0] - 20.0).abs() < 0.01);
+        assert!((result[0] - 25.0).abs() < 0.01);
+
+        // Reference values from MetPy moist_lapse([1000,900,800,700,600,500] hPa, 25 degC):
+        //   [25.0, 21.47, 17.43, 12.73, 7.06, -0.08]
+        let metpy_ref = [25.0, 21.47, 17.43, 12.73, 7.06, -0.08];
+        for i in 0..result.len() {
+            assert!((result[i] - metpy_ref[i]).abs() < 0.15,
+                "level {}: got {:.2}, expected ~{:.2}", i, result[i], metpy_ref[i]);
+        }
+
         // Moist adiabat cools slower than dry at warm temps
-        let dry = dry_lapse(&p, 20.0);
+        let dry = dry_lapse(&p, 25.0);
         // At 500 hPa, moist should be warmer than dry
         assert!(result[5] > dry[5],
             "moist {} should be warmer than dry {} at 500 hPa", result[5], dry[5]);
@@ -2606,7 +2713,7 @@ mod tests {
     fn test_dewpoint_from_vapor_pressure() {
         // At 20C, es ~ 23.4 hPa; dewpoint(23.4) should be ~20C
         let es = saturation_vapor_pressure(20.0);
-        let td = dewpoint(es);
+        let td = dewpoint_from_vapor_pressure(es);
         assert!((td - 20.0).abs() < 0.1, "dewpoint from es at 20C = {td}");
     }
 
@@ -2701,36 +2808,77 @@ mod tests {
     }
 
     // =========================================================================
-    // Bolton SVP comprehensive tests
+    // Ambaum (2020) SVP -- MetPy parity tests
     // =========================================================================
 
     #[test]
-    fn test_svp_bolton_known_values() {
-        // Bolton (1980): es = 6.112 * exp(17.67*T / (T + 243.5))
-        // Compute expected values directly from the formula.
-        let cases: &[(f64, &str)] = &[
-            (-40.0, "-40C"),
-            (-20.0, "-20C"),
-            (0.0,   "0C"),
-            (10.0,  "10C"),
-            (20.0,  "20C"),
-            (25.0,  "25C"),
-            (30.0,  "30C"),
-            (40.0,  "40C"),
+    fn test_svp_metpy_parity_liquid() {
+        // Reference values from MetPy (Ambaum 2020), all in hPa.
+        let cases: &[(f64, f64, &str)] = &[
+            (   0.0,  6.107563, "0C"),
+            (  10.0, 12.266556, "10C"),
+            (  20.0, 23.347481, "20C"),
+            (  25.0, 31.623456, "25C"),
+            (  30.0, 42.346532, "30C"),
+            (  35.0, 56.094080, "35C"),
+            (  -5.0,  4.215412, "-5C"),
+            ( -10.0,  2.863560, "-10C"),
+            ( -20.0,  1.254936, "-20C"),
+            ( -40.0,  0.189848, "-40C"),
+            ( 100.0, 993.344909, "100C"),
         ];
-        for &(t, label) in cases {
+        for &(t, expected, label) in cases {
             let got = saturation_vapor_pressure(t);
-            let expected = 6.112 * ((17.67 * t) / (t + 243.5)).exp();
             assert!(
-                (got - expected).abs() < 1e-10,
-                "SVP at {label}: got={got}, expected={expected}"
+                (got - expected).abs() < 0.001,
+                "SVP liquid at {label}: got={got:.6}, expected={expected:.6}"
             );
         }
     }
 
     #[test]
-    fn test_svp_bolton_monotonic() {
-        // SVP must strictly increase with temperature
+    fn test_svp_metpy_parity_solid() {
+        // Reference values from MetPy (Ambaum 2020 Eq. 17), all in hPa.
+        let cases: &[(f64, f64, &str)] = &[
+            (   0.0,  6.106971, "0C"),
+            (  -5.0,  4.015204, "-5C"),
+            ( -10.0,  2.597718, "-10C"),
+            ( -15.0,  1.652232, "-15C"),
+            ( -20.0,  1.032058, "-20C"),
+            ( -30.0,  0.379743, "-30C"),
+            ( -40.0,  0.128129, "-40C"),
+        ];
+        for &(t, expected, label) in cases {
+            let got = saturation_vapor_pressure_with_phase(t, Phase::Solid);
+            assert!(
+                (got - expected).abs() < 0.001,
+                "SVP solid at {label}: got={got:.6}, expected={expected:.6}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_svp_auto_phase() {
+        // Auto: liquid above T0 = 273.16 K (0.01 C), solid at or below.
+        // At 10C => liquid
+        let auto_10 = saturation_vapor_pressure_with_phase(10.0, Phase::Auto);
+        let liq_10 = saturation_vapor_pressure(10.0);
+        assert!((auto_10 - liq_10).abs() < 1e-10);
+
+        // At -10C => solid
+        let auto_m10 = saturation_vapor_pressure_with_phase(-10.0, Phase::Auto);
+        let solid_m10 = saturation_vapor_pressure_with_phase(-10.0, Phase::Solid);
+        assert!((auto_m10 - solid_m10).abs() < 1e-10);
+
+        // At 0C (273.15 K < T0=273.16 K) => solid
+        let auto_0 = saturation_vapor_pressure_with_phase(0.0, Phase::Auto);
+        let solid_0 = saturation_vapor_pressure_with_phase(0.0, Phase::Solid);
+        assert!((auto_0 - solid_0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_svp_monotonic() {
+        // SVP (liquid) must strictly increase with temperature
         let temps = [-40.0, -20.0, 0.0, 10.0, 20.0, 30.0, 40.0];
         for i in 0..temps.len() - 1 {
             let es_lo = saturation_vapor_pressure(temps[i]);
@@ -2744,12 +2892,11 @@ mod tests {
     }
 
     #[test]
-    fn test_svp_bolton_physical_values() {
-        // Check against well-known physical reference values (WMO)
-        // At 0C: ~6.11 hPa, at 20C: ~23.4 hPa, at 30C: ~42.4 hPa
-        assert!((saturation_vapor_pressure(0.0) - 6.112).abs() < 0.01);
-        assert!((saturation_vapor_pressure(20.0) - 23.39).abs() < 0.1);
-        assert!((saturation_vapor_pressure(30.0) - 42.43).abs() < 0.1);
+    fn test_svp_physical_values() {
+        // Check against well-known physical reference values
+        assert!((saturation_vapor_pressure(0.0) - 6.108).abs() < 0.01);
+        assert!((saturation_vapor_pressure(20.0) - 23.35).abs() < 0.1);
+        assert!((saturation_vapor_pressure(30.0) - 42.35).abs() < 0.1);
     }
 
     // =========================================================================
@@ -2758,8 +2905,7 @@ mod tests {
 
     #[test]
     fn test_saturation_mixing_ratio_known_values() {
-        // ws = EPS * es / (p - es) * 1000 (g/kg), with es from Bolton
-        // At 1000 hPa, 0C: es=6.112, ws = 0.62197*6.112/(1000-6.112)*1000 = 3.822 g/kg
+        // ws = EPS * es / (p - es) * 1000 (g/kg), with es from Ambaum SVP
         let ws_0 = saturation_mixing_ratio(1000.0, 0.0);
         let es_0 = saturation_vapor_pressure(0.0);
         let expected_0 = EPS * es_0 / (1000.0 - es_0) * 1000.0;
@@ -2784,6 +2930,17 @@ mod tests {
         assert!(
             (ws_500 - expected_500).abs() < 1e-10,
             "ws at 500hPa/-20C: got={ws_500}, expected={expected_500}"
+        );
+    }
+
+    #[test]
+    fn test_saturation_mixing_ratio_with_phase() {
+        // With Phase::Solid, mixing ratio at sub-zero should be lower (ice SVP < liquid SVP)
+        let ws_liq = saturation_mixing_ratio(1000.0, -10.0);
+        let ws_ice = saturation_mixing_ratio_with_phase(1000.0, -10.0, Phase::Solid);
+        assert!(
+            ws_ice < ws_liq,
+            "Ice mixing ratio ({ws_ice}) should be less than liquid ({ws_liq}) at -10C"
         );
     }
 
@@ -2817,7 +2974,9 @@ mod tests {
 
     #[test]
     fn test_dewpoint_from_rh_roundtrip_comprehensive() {
-        // For various (T, RH) pairs, compute Td then recover RH
+        // For various (T, RH) pairs, compute Td then recover RH.
+        // Tolerance is 0.5% because SVP uses Ambaum (2020) while the dewpoint
+        // inversion uses Bolton (1980) -- the same mixed approach as MetPy.
         let cases: &[(f64, f64)] = &[
             (-20.0, 50.0),
             (-10.0, 30.0),
@@ -2833,7 +2992,7 @@ mod tests {
             let td = dewpoint_from_rh(t, rh);
             let rh_back = rh_from_dewpoint(t, td);
             assert!(
-                (rh_back - rh).abs() < 0.01,
+                (rh_back - rh).abs() < 0.5,
                 "Roundtrip failed at T={t}, RH={rh}: Td={td}, RH_back={rh_back}"
             );
         }

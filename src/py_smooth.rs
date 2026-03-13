@@ -19,46 +19,58 @@ fn smooth_gaussian<'py>(
 }
 
 /// Rectangular (box / uniform) smoothing with kernel side length `size`.
+///
+/// `passes` controls how many times the filter is applied (default 1).
 #[pyfunction]
+#[pyo3(signature = (data, size, passes=1))]
 fn smooth_rectangular<'py>(
     py: Python<'py>,
     data: PyReadonlyArray2<f64>,
     size: usize,
+    passes: usize,
 ) -> PyResult<Bound<'py, PyArray2<f64>>> {
     let shape = data.shape();
     let (ny, nx) = (shape[0], shape[1]);
     let flat: Vec<f64> = data.as_slice()?.to_vec();
-    let result = metrust::calc::smooth::smooth_rectangular(&flat, nx, ny, size);
+    let result = metrust::calc::smooth::smooth_rectangular(&flat, nx, ny, size, passes);
     let rows: Vec<Vec<f64>> = result.chunks(nx).map(|c| c.to_vec()).collect();
     Ok(PyArray2::from_vec2(py, &rows)?.into())
 }
 
 /// Circular (disk) smoothing with `radius` in grid-point units.
+///
+/// `passes` controls how many times the filter is applied (default 1).
 #[pyfunction]
+#[pyo3(signature = (data, radius, passes=1))]
 fn smooth_circular<'py>(
     py: Python<'py>,
     data: PyReadonlyArray2<f64>,
     radius: f64,
+    passes: usize,
 ) -> PyResult<Bound<'py, PyArray2<f64>>> {
     let shape = data.shape();
     let (ny, nx) = (shape[0], shape[1]);
     let flat: Vec<f64> = data.as_slice()?.to_vec();
-    let result = metrust::calc::smooth::smooth_circular(&flat, nx, ny, radius);
+    let result = metrust::calc::smooth::smooth_circular(&flat, nx, ny, radius, passes);
     let rows: Vec<Vec<f64>> = result.chunks(nx).map(|c| c.to_vec()).collect();
     Ok(PyArray2::from_vec2(py, &rows)?.into())
 }
 
 /// N-point smoother (n must be 5 or 9).
+///
+/// `passes` controls how many times the filter is applied (default 1).
 #[pyfunction]
+#[pyo3(signature = (data, n, passes=1))]
 fn smooth_n_point<'py>(
     py: Python<'py>,
     data: PyReadonlyArray2<f64>,
     n: usize,
+    passes: usize,
 ) -> PyResult<Bound<'py, PyArray2<f64>>> {
     let shape = data.shape();
     let (ny, nx) = (shape[0], shape[1]);
     let flat: Vec<f64> = data.as_slice()?.to_vec();
-    let result = metrust::calc::smooth::smooth_n_point(&flat, nx, ny, n);
+    let result = metrust::calc::smooth::smooth_n_point(&flat, nx, ny, n, passes);
     let rows: Vec<Vec<f64>> = result.chunks(nx).map(|c| c.to_vec()).collect();
     Ok(PyArray2::from_vec2(py, &rows)?.into())
 }
@@ -67,11 +79,18 @@ fn smooth_n_point<'py>(
 ///
 /// `data` is the 2D input grid and `window` is the 2D kernel. Both are
 /// provided as numpy 2D arrays.
+///
+/// `passes` controls how many times the filter is applied (default 1).
+/// `normalize_weights` controls whether weights are normalized before
+/// applying (default true).
 #[pyfunction]
+#[pyo3(signature = (data, window, passes=1, normalize_weights=true))]
 fn smooth_window<'py>(
     py: Python<'py>,
     data: PyReadonlyArray2<f64>,
     window: PyReadonlyArray2<f64>,
+    passes: usize,
+    normalize_weights: bool,
 ) -> PyResult<Bound<'py, PyArray2<f64>>> {
     let d_shape = data.shape();
     let (ny, nx) = (d_shape[0], d_shape[1]);
@@ -80,7 +99,7 @@ fn smooth_window<'py>(
     let flat_data: Vec<f64> = data.as_slice()?.to_vec();
     let flat_window: Vec<f64> = window.as_slice()?.to_vec();
     let result = metrust::calc::smooth::smooth_window(
-        &flat_data, nx, ny, &flat_window, window_nx, window_ny,
+        &flat_data, nx, ny, &flat_window, window_nx, window_ny, passes, normalize_weights,
     );
     let rows: Vec<Vec<f64>> = result.chunks(nx).map(|c| c.to_vec()).collect();
     Ok(PyArray2::from_vec2(py, &rows)?.into())

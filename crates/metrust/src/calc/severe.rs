@@ -122,8 +122,13 @@ pub fn significant_tornado_parameter(
     // SRH term: SRH / 150, floored at 0
     let srh_term = (srh_0_1km / 150.0).max(0.0);
 
-    // Shear term: shear / 20, floored at 0, capped at 1.5
-    let shear_term = (bulk_shear_0_6km_ms / 20.0).clamp(0.0, 1.5);
+    // Shear term: zero when < 12.5 m/s, capped at 30 m/s, then / 20
+    // (per Thompson et al. 2003 / MetPy: shear < 12.5 m/s => 0)
+    let shear_term = if bulk_shear_0_6km_ms < 12.5 {
+        0.0
+    } else {
+        (bulk_shear_0_6km_ms.min(30.0) / 20.0).max(0.0)
+    };
 
     cape_term * lcl_term * srh_term * shear_term
 }
@@ -158,7 +163,13 @@ pub fn supercell_composite_parameter(
 ) -> f64 {
     let cape_term = (mucape / 1000.0).max(0.0);
     let srh_term = (srh_eff / 50.0).max(0.0);
-    let shear_term = (bulk_shear_eff_ms / 20.0).max(0.0);
+    // Shear term: zero when < 10 m/s, capped at 1.0 (i.e. clipped to 20 m/s then / 20)
+    // (per Thompson et al. 2004 / MetPy)
+    let shear_term = if bulk_shear_eff_ms < 10.0 {
+        0.0
+    } else {
+        (bulk_shear_eff_ms.min(20.0) / 20.0).max(0.0)
+    };
 
     cape_term * srh_term * shear_term
 }
@@ -269,6 +280,13 @@ mod tests {
     }
 
     #[test]
+    fn test_stp_weak_shear_zero() {
+        // Shear below 12.5 m/s => shear_term = 0 => STP = 0 (per MetPy)
+        let stp = significant_tornado_parameter(2000.0, 800.0, 150.0, 10.0);
+        assert!((stp - 0.0).abs() < 1e-10, "STP should be 0 with weak shear (<12.5 m/s)");
+    }
+
+    #[test]
     fn test_stp_negative_inputs_floored() {
         let stp = significant_tornado_parameter(-500.0, 3000.0, -100.0, -5.0);
         assert!((stp - 0.0).abs() < 1e-10, "STP should be 0 with all negative inputs");
@@ -298,9 +316,17 @@ mod tests {
 
     #[test]
     fn test_scp_strong_case() {
+        // Shear 30 m/s is capped at 20 m/s => shear_term = 1.0
         let scp = supercell_composite_parameter(3000.0, 300.0, 30.0);
-        let expected = (3000.0 / 1000.0) * (300.0 / 50.0) * (30.0 / 20.0);
+        let expected = (3000.0 / 1000.0) * (300.0 / 50.0) * 1.0;
         assert!((scp - expected).abs() < 1e-10, "SCP = {scp}, expected {expected}");
+    }
+
+    #[test]
+    fn test_scp_weak_shear_zero() {
+        // Shear below 10 m/s => shear_term = 0 => SCP = 0 (per MetPy)
+        let scp = supercell_composite_parameter(3000.0, 200.0, 8.0);
+        assert!((scp - 0.0).abs() < 1e-10, "SCP should be 0 with weak shear");
     }
 
     #[test]

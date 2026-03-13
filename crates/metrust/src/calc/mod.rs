@@ -22,12 +22,16 @@ pub mod utils;
 // Thermo essentials
 pub use thermo::{
     potential_temperature, equivalent_potential_temperature,
-    saturation_vapor_pressure, saturation_mixing_ratio,
+    saturation_vapor_pressure, saturation_vapor_pressure_with_phase,
+    saturation_mixing_ratio, saturation_mixing_ratio_with_phase,
+    Phase,
     wet_bulb_temperature, lfc, el, lcl,
     dewpoint_from_relative_humidity, relative_humidity_from_dewpoint,
     virtual_temperature, cape_cin, mixing_ratio,
     showalter_index, k_index, total_totals,
     downdraft_cape,
+    specific_humidity_from_mixing_ratio,
+    thickness_hydrostatic_from_relative_humidity,
 };
 
 // Wind essentials
@@ -35,12 +39,13 @@ pub use wind::{
     wind_speed, wind_direction, wind_components,
     bulk_shear, mean_wind, storm_relative_helicity,
     bunkers_storm_motion, corfidi_storm_motion,
+    friction_velocity, tke, gradient_richardson_number,
 };
 
 // Kinematics essentials
 pub use kinematics::{
     divergence, vorticity, absolute_vorticity,
-    advection, frontogenesis,
+    advection, advection_3d, frontogenesis,
     geostrophic_wind, ageostrophic_wind,
     potential_vorticity_baroclinic,
     normal_component, tangential_component,
@@ -79,7 +84,9 @@ pub use smooth::{
 
 // Utils essentials
 pub use utils::{
-    angle_to_direction, parse_angle,
+    angle_to_direction, angle_to_direction_ext, parse_angle,
     find_bounding_indices, nearest_intersection_idx,
     resample_nn_1d,
+    find_peaks, peak_persistence,
+    azimuth_range_to_lat_lon,
 };

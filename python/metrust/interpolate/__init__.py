@@ -403,6 +403,36 @@ def geodesic(start, end, n_points):
     )
 
 
+def interpolate_to_points(src_lats, src_lons, src_values,
+                          target_lats, target_lons,
+                          interp_type='linear'):
+    """Interpolate scattered data to arbitrary target points.
+
+    A convenience dispatcher that selects between inverse-distance
+    weighting and natural-neighbor interpolation.
+
+    Parameters
+    ----------
+    src_lats, src_lons, src_values : array-like
+        Source observation locations and values.
+    target_lats, target_lons : array-like
+        Target point locations.
+    interp_type : str, optional
+        Interpolation method: ``'linear'`` (default) or ``'idw'`` for
+        inverse-distance weighting, ``'natural_neighbor'`` (or ``'nn'``)
+        for natural-neighbor interpolation.
+
+    Returns
+    -------
+    numpy.ndarray
+    """
+    return _interp.interpolate_to_points_dispatch(
+        _f64(src_lats), _f64(src_lons), _f64(src_values),
+        _f64(target_lats), _f64(target_lons),
+        str(interp_type),
+    )
+
+
 __all__ = [
     # 1-D interpolation
     "interpolate_1d",
@@ -413,6 +443,8 @@ __all__ = [
     "interpolate_to_slice",
     # Gridding convenience
     "interpolate_to_grid",
+    # Point interpolation
+    "interpolate_to_points",
     # IDW
     "inverse_distance_to_grid",
     "inverse_distance_to_points",

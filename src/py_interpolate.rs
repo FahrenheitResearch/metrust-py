@@ -579,6 +579,43 @@ fn natural_neighbor_to_points<'py>(
 }
 
 // ═════════════════════════════════════════════════════════════════════════
+// Generic interpolate_to_points dispatcher
+// ═════════════════════════════════════════════════════════════════════════
+
+/// Interpolate scattered data to arbitrary points using a specified method.
+///
+/// Parameters
+/// ----------
+/// src_lats : source observation latitudes
+/// src_lons : source observation longitudes
+/// src_values : source observation values
+/// target_lats : target point latitudes
+/// target_lons : target point longitudes
+/// interp_type : interpolation method ('idw', 'linear', 'inverse_distance',
+///               'natural_neighbor', 'nn', 'natural')
+#[pyfunction]
+#[pyo3(signature = (src_lats, src_lons, src_values, target_lats, target_lons, interp_type="linear"))]
+fn interpolate_to_points_dispatch<'py>(
+    py: Python<'py>,
+    src_lats: PyReadonlyArray1<f64>,
+    src_lons: PyReadonlyArray1<f64>,
+    src_values: PyReadonlyArray1<f64>,
+    target_lats: PyReadonlyArray1<f64>,
+    target_lons: PyReadonlyArray1<f64>,
+    interp_type: &str,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let result = metrust::interpolate::interpolate_to_points(
+        src_lats.as_slice()?,
+        src_lons.as_slice()?,
+        src_values.as_slice()?,
+        target_lats.as_slice()?,
+        target_lons.as_slice()?,
+        interp_type,
+    );
+    Ok(result.into_pyarray(py))
+}
+
+// ═════════════════════════════════════════════════════════════════════════
 // Observation filtering
 // ═════════════════════════════════════════════════════════════════════════
 
@@ -738,6 +775,9 @@ pub fn register(_py: Python, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     // Natural neighbor
     parent.add_function(wrap_pyfunction!(natural_neighbor_to_grid, parent)?)?;
     parent.add_function(wrap_pyfunction!(natural_neighbor_to_points, parent)?)?;
+
+    // Generic dispatcher
+    parent.add_function(wrap_pyfunction!(interpolate_to_points_dispatch, parent)?)?;
 
     // Observation filtering
     parent.add_function(wrap_pyfunction!(remove_nan_observations, parent)?)?;

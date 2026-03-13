@@ -20,7 +20,10 @@
 pub use wx_math::thermo::potential_temperature;
 pub use wx_math::thermo::equivalent_potential_temperature;
 pub use wx_math::thermo::saturation_vapor_pressure;
+pub use wx_math::thermo::saturation_vapor_pressure_with_phase;
 pub use wx_math::thermo::saturation_mixing_ratio;
+pub use wx_math::thermo::saturation_mixing_ratio_with_phase;
+pub use wx_math::thermo::Phase;
 pub use wx_math::thermo::wet_bulb_temperature;
 pub use wx_math::thermo::lfc;
 pub use wx_math::thermo::el;
@@ -60,7 +63,7 @@ pub use wx_math::thermo::exner_function;
 pub use wx_math::thermo::montgomery_streamfunction;
 
 // Re-exports: humidity conversions
-pub use wx_math::thermo::dewpoint;
+pub use wx_math::thermo::dewpoint_from_vapor_pressure;
 pub use wx_math::thermo::mixing_ratio_from_relative_humidity;
 pub use wx_math::thermo::relative_humidity_from_mixing_ratio;
 pub use wx_math::thermo::relative_humidity_from_specific_humidity;
@@ -183,6 +186,23 @@ pub fn vapor_pressure(td_c: f64) -> f64 {
 #[inline]
 pub fn virtual_temperature(t: f64, p: f64, td: f64) -> f64 {
     wx_math::thermo::virtual_temp(t, p, td)
+}
+
+/// Virtual temperature (Celsius) from temperature (C), dewpoint (C), and pressure (hPa).
+///
+/// Wraps [`wx_math::thermo::virtual_temperature_from_dewpoint`]. Argument order
+/// matches MetPy: `(temperature, dewpoint, pressure)`.
+///
+/// # Examples
+///
+/// ```
+/// use metrust::calc::thermo::virtual_temperature_from_dewpoint;
+/// let tv = virtual_temperature_from_dewpoint(25.0, 20.0, 1000.0);
+/// assert!(tv > 25.0);
+/// ```
+#[inline]
+pub fn virtual_temperature_from_dewpoint(t_c: f64, td_c: f64, p_hpa: f64) -> f64 {
+    wx_math::thermo::virtual_temperature_from_dewpoint(t_c, td_c, p_hpa)
 }
 
 /// Lifting Condensation Level via dry-adiabatic ascent.
@@ -1119,6 +1139,108 @@ pub fn weighted_continuous_average(values: &[f64], weights: &[f64]) -> f64 {
 }
 
 // ============================================================================
+// New implementations -- humidity / thickness functions
+// ============================================================================
+
+/// Specific humidity from mixing ratio.
+///
+/// `q = w / (1 + w)` where `w` is the mixing ratio in kg/kg.
+///
+/// Both input and output are in kg/kg (dimensionless mass ratios).
+///
+/// # Arguments
+///
+/// * `mixing_ratio` - Mixing ratio in kg/kg.
+///
+/// # Returns
+///
+/// Specific humidity in kg/kg.
+///
+/// # References
+///
+/// [Salby1996] pg. 118.
+///
+/// # Examples
+///
+/// ```
+/// use metrust::calc::thermo::specific_humidity_from_mixing_ratio;
+/// let q = specific_humidity_from_mixing_ratio(0.012);
+/// assert!((q - 0.011857707510).abs() < 1e-8);
+/// ```
+#[inline]
+pub fn specific_humidity_from_mixing_ratio(mixing_ratio: f64) -> f64 {
+    mixing_ratio / (1.0 + mixing_ratio)
+}
+
+/// Hypsometric thickness (meters) from pressure, temperature, and relative humidity profiles.
+///
+/// Computes the thickness of a layer using the hypsometric equation with virtual
+/// temperature adjustment derived from relative humidity:
+///
+/// ```text
+/// dz = -(Rd/g) * integral(Tv * d(ln p))
+/// ```
+///
+/// Virtual temperature is computed from temperature and mixing ratio, where
+/// mixing ratio is derived from relative humidity.
+///
+/// # Arguments
+///
+/// * `pressure` - Pressure profile (hPa, surface first, decreasing)
+/// * `temperature` - Temperature profile (Celsius)
+/// * `relative_humidity` - Relative humidity profile (percent, 0-100)
+///
+/// # Returns
+///
+/// Layer thickness in meters.
+///
+/// # Examples
+///
+/// ```
+/// use metrust::calc::thermo::thickness_hydrostatic_from_relative_humidity;
+/// let p  = vec![1000.0, 900.0, 800.0, 700.0, 600.0, 500.0];
+/// let t  = vec![  25.0,  18.0,  10.0,   2.0,  -8.0, -18.0];
+/// let rh = vec![  80.0,  70.0,  60.0,  50.0,  40.0,  30.0];
+/// let dz = thickness_hydrostatic_from_relative_humidity(&p, &t, &rh);
+/// assert!(dz > 5500.0 && dz < 5700.0);
+/// ```
+pub fn thickness_hydrostatic_from_relative_humidity(
+    pressure: &[f64],
+    temperature: &[f64],
+    relative_humidity: &[f64],
+) -> f64 {
+    let n = pressure.len().min(temperature.len()).min(relative_humidity.len());
+    if n < 2 {
+        return 0.0;
+    }
+
+    // Compute virtual temperature at each level
+    let tv: Vec<f64> = (0..n)
+        .map(|i| {
+            // mixing ratio in g/kg from RH
+            let w_gkg = mixing_ratio_from_relative_humidity(
+                pressure[i],
+                temperature[i],
+                relative_humidity[i],
+            );
+            let w = w_gkg / 1000.0; // kg/kg
+            let t_k = temperature[i] + ZEROCNK;
+            // Tv = T * (1 + w/epsilon) / (1 + w)
+            t_k * (1.0 + w / EPS) / (1.0 + w)
+        })
+        .collect();
+
+    // Trapezoidal integration: dz = -(Rd/g) * integral(Tv d(ln p))
+    let mut integral = 0.0;
+    for i in 0..n - 1 {
+        let dlnp = (pressure[i + 1] * 100.0).ln() - (pressure[i] * 100.0).ln();
+        let tv_avg = 0.5 * (tv[i] + tv[i + 1]);
+        integral += tv_avg * dlnp;
+    }
+    -(RD / G) * integral
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1152,8 +1274,8 @@ mod tests {
     #[test]
     fn test_saturation_vapor_pressure() {
         let es = saturation_vapor_pressure(20.0);
-        // Bolton: ~23.37 hPa at 20 C
-        assert!(approx(es, 23.37, 0.5));
+        // Ambaum (2020) / MetPy: 23.347 hPa at 20 C
+        assert!(approx(es, 23.347, 0.5));
     }
 
     #[test]
@@ -2063,5 +2185,78 @@ mod tests {
             &[0.0, 1.0, 3.0, 6.0],
         );
         assert!(approx(avg, 34.0 / 6.0, 1e-10));
+    }
+
+    // ====================================================================
+    // specific_humidity_from_mixing_ratio
+    // ====================================================================
+
+    #[test]
+    fn test_specific_humidity_from_mixing_ratio_basic() {
+        // MetPy reference: specific_humidity_from_mixing_ratio(0.012 kg/kg) = 0.0118577075 kg/kg
+        let q = specific_humidity_from_mixing_ratio(0.012);
+        assert!(approx(q, 0.0118577075, 1e-8));
+    }
+
+    #[test]
+    fn test_specific_humidity_from_mixing_ratio_zero() {
+        // Dry air: w=0 => q=0
+        assert!(approx(specific_humidity_from_mixing_ratio(0.0), 0.0, 1e-15));
+    }
+
+    #[test]
+    fn test_specific_humidity_from_mixing_ratio_identity() {
+        // q < w always, and q = w / (1+w)
+        let w = 0.02;
+        let q = specific_humidity_from_mixing_ratio(w);
+        assert!(q < w);
+        assert!(approx(q, w / (1.0 + w), 1e-15));
+    }
+
+    // ====================================================================
+    // thickness_hydrostatic_from_relative_humidity
+    // ====================================================================
+
+    #[test]
+    fn test_thickness_hydrostatic_from_rh_basic() {
+        // MetPy reference: 5614.4389 m (slight constant differences expected)
+        let p  = vec![1000.0, 900.0, 800.0, 700.0, 600.0, 500.0];
+        let t  = vec![  25.0,  18.0,  10.0,   2.0,  -8.0, -18.0];
+        let rh = vec![  80.0,  70.0,  60.0,  50.0,  40.0,  30.0];
+        let dz = thickness_hydrostatic_from_relative_humidity(&p, &t, &rh);
+        // Allow ~5m tolerance due to different Rd/epsilon constants
+        assert!(approx(dz, 5614.4, 5.0),
+            "thickness = {dz}, expected ~5614.4 m");
+    }
+
+    #[test]
+    fn test_thickness_hydrostatic_from_rh_dry() {
+        // With RH=0, virtual temp equals actual temp, result should match
+        // simple hypsometric thickness
+        let p = vec![1000.0, 500.0];
+        let t = vec![15.0, -15.0]; // mean T ~273 K
+        let rh = vec![0.0, 0.0];
+        let dz = thickness_hydrostatic_from_relative_humidity(&p, &t, &rh);
+        // With T_mean ~273.15 K: Rd/g * T_mean * ln(1000/500) = 29.27 * 273.15 * 0.6931 ~ 5536
+        assert!(dz > 5400.0 && dz < 5700.0, "thickness = {dz}");
+    }
+
+    #[test]
+    fn test_thickness_hydrostatic_from_rh_more_moisture_increases_thickness() {
+        let p  = vec![1000.0, 500.0];
+        let t  = vec![25.0, -10.0];
+        let rh_low  = vec![20.0, 20.0];
+        let rh_high = vec![90.0, 90.0];
+        let dz_low  = thickness_hydrostatic_from_relative_humidity(&p, &t, &rh_low);
+        let dz_high = thickness_hydrostatic_from_relative_humidity(&p, &t, &rh_high);
+        // More moisture => higher virtual temp => greater thickness
+        assert!(dz_high > dz_low,
+            "high RH thickness ({dz_high}) should exceed low RH ({dz_low})");
+    }
+
+    #[test]
+    fn test_thickness_hydrostatic_from_rh_single_level() {
+        let dz = thickness_hydrostatic_from_relative_humidity(&[1000.0], &[25.0], &[50.0]);
+        assert!(approx(dz, 0.0, 1e-10));
     }
 }

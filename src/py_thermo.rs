@@ -1,5 +1,5 @@
 use pyo3::prelude::*;
-use numpy::{PyArray1, PyReadonlyArray1, IntoPyArray};
+use numpy::{PyArray1, PyReadonlyArray1};
 
 // =============================================================================
 // Scalar thermodynamic functions
@@ -320,7 +320,7 @@ fn montgomery_streamfunction(py: Python, theta: f64, pressure: f64, temperature_
 #[pyfunction]
 fn dewpoint(py: Python, vapor_pressure: f64) -> f64 {
     let _ = py;
-    metrust::calc::thermo::dewpoint(vapor_pressure)
+    metrust::calc::thermo::dewpoint_from_vapor_pressure(vapor_pressure)
 }
 
 /// Mixing ratio (g/kg) from relative humidity (%).
@@ -603,6 +603,13 @@ fn virtual_temperature(py: Python, temperature: f64, pressure: f64, dewpoint: f6
     metrust::calc::thermo::virtual_temperature(temperature, pressure, dewpoint)
 }
 
+/// Virtual temperature (C) from temperature (C), dewpoint (C), pressure (hPa).
+#[pyfunction]
+fn virtual_temperature_from_dewpoint(py: Python, temperature: f64, dewpoint: f64, pressure: f64) -> f64 {
+    let _ = py;
+    metrust::calc::thermo::virtual_temperature_from_dewpoint(temperature, dewpoint, pressure)
+}
+
 /// LCL via dry-adiabatic ascent. Returns (p_lcl, t_lcl) in (hPa, C).
 #[pyfunction]
 fn lcl(py: Python, pressure: f64, temperature: f64, dewpoint: f64) -> (f64, f64) {
@@ -880,11 +887,34 @@ fn isentropic_interpolation(
         .collect())
 }
 
+/// Specific humidity (kg/kg) from mixing ratio (kg/kg).
+#[pyfunction]
+fn specific_humidity_from_mixing_ratio(py: Python, mixing_ratio: f64) -> f64 {
+    let _ = py;
+    metrust::calc::thermo::specific_humidity_from_mixing_ratio(mixing_ratio)
+}
+
+/// Hypsometric thickness (m) from pressure (hPa), temperature (C), and RH (%) profiles.
+#[pyfunction]
+fn thickness_hydrostatic_from_relative_humidity(
+    py: Python,
+    pressure: PyReadonlyArray1<f64>,
+    temperature: PyReadonlyArray1<f64>,
+    relative_humidity: PyReadonlyArray1<f64>,
+) -> PyResult<f64> {
+    let _ = py;
+    Ok(metrust::calc::thermo::thickness_hydrostatic_from_relative_humidity(
+        pressure.as_slice()?,
+        temperature.as_slice()?,
+        relative_humidity.as_slice()?,
+    ))
+}
+
 // =============================================================================
 // Registration
 // =============================================================================
 
-pub fn register(py: Python, parent: &Bound<'_, PyModule>) -> PyResult<()> {
+pub fn register(_py: Python, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     // Direct re-exports (scalar)
     parent.add_function(wrap_pyfunction!(potential_temperature, parent)?)?;
     parent.add_function(wrap_pyfunction!(equivalent_potential_temperature, parent)?)?;
@@ -955,6 +985,7 @@ pub fn register(py: Python, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     parent.add_function(wrap_pyfunction!(relative_humidity_from_dewpoint, parent)?)?;
     parent.add_function(wrap_pyfunction!(vapor_pressure, parent)?)?;
     parent.add_function(wrap_pyfunction!(virtual_temperature, parent)?)?;
+    parent.add_function(wrap_pyfunction!(virtual_temperature_from_dewpoint, parent)?)?;
     parent.add_function(wrap_pyfunction!(lcl, parent)?)?;
     parent.add_function(wrap_pyfunction!(cape_cin, parent)?)?;
 
@@ -985,6 +1016,10 @@ pub fn register(py: Python, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     parent.add_function(wrap_pyfunction!(water_latent_heat_sublimation, parent)?)?;
     parent.add_function(wrap_pyfunction!(relative_humidity_wet_psychrometric, parent)?)?;
     parent.add_function(wrap_pyfunction!(weighted_continuous_average, parent)?)?;
+
+    // Humidity / thickness
+    parent.add_function(wrap_pyfunction!(specific_humidity_from_mixing_ratio, parent)?)?;
+    parent.add_function(wrap_pyfunction!(thickness_hydrostatic_from_relative_humidity, parent)?)?;
 
     Ok(())
 }

@@ -607,6 +607,81 @@ pub fn vector_derivative(
 }
 
 // ─────────────────────────────────────────────────────────────
+// 3D advection
+// ─────────────────────────────────────────────────────────────
+
+/// Advection of a scalar field by a 3-D wind: -u(ds/dx) - v(ds/dy) - w(ds/dz).
+///
+/// Extends the 2-D advection to include the vertical advection term.  The
+/// scalar, u, v, and w fields are 3-D arrays flattened in level-major
+/// order: `index = k * ny * nx + j * nx + i`.
+///
+/// `dz` is the spacing between vertical levels in meters.
+///
+/// # Arguments
+///
+/// * `scalar` - 3-D scalar field, flattened `[nz * ny * nx]`
+/// * `u` - Zonal wind component, flattened `[nz * ny * nx]`
+/// * `v` - Meridional wind component, flattened `[nz * ny * nx]`
+/// * `w` - Vertical velocity, flattened `[nz * ny * nx]`
+/// * `nx`, `ny`, `nz` - Grid dimensions
+/// * `dx`, `dy` - Horizontal grid spacings (meters)
+/// * `dz` - Vertical grid spacing (meters)
+pub fn advection_3d(
+    scalar: &[f64],
+    u: &[f64],
+    v: &[f64],
+    w: &[f64],
+    nx: usize,
+    ny: usize,
+    nz: usize,
+    dx: f64,
+    dy: f64,
+    dz: f64,
+) -> Vec<f64> {
+    let nxy = nx * ny;
+    let n = nxy * nz;
+    assert_eq!(scalar.len(), n, "scalar length mismatch");
+    assert_eq!(u.len(), n, "u length mismatch");
+    assert_eq!(v.len(), n, "v length mismatch");
+    assert_eq!(w.len(), n, "w length mismatch");
+
+    let mut out = vec![0.0; n];
+
+    for k in 0..nz {
+        let offset = k * nxy;
+        let slab_s = &scalar[offset..offset + nxy];
+        let slab_u = &u[offset..offset + nxy];
+        let slab_v = &v[offset..offset + nxy];
+        let slab_w = &w[offset..offset + nxy];
+
+        // Horizontal gradients for this level.
+        let dsdx = wx_math::dynamics::gradient_x(slab_s, nx, ny, dx);
+        let dsdy = wx_math::dynamics::gradient_y(slab_s, nx, ny, dy);
+
+        for ij in 0..nxy {
+            let idx = offset + ij;
+            // Horizontal advection: -u ds/dx - v ds/dy.
+            out[idx] = -slab_u[ij] * dsdx[ij] - slab_v[ij] * dsdy[ij];
+
+            // Vertical advection: -w ds/dz (centered differences).
+            let dsdz = if nz < 2 {
+                0.0
+            } else if k == 0 {
+                (scalar[(k + 1) * nxy + ij] - scalar[k * nxy + ij]) / dz
+            } else if k == nz - 1 {
+                (scalar[k * nxy + ij] - scalar[(k - 1) * nxy + ij]) / dz
+            } else {
+                (scalar[(k + 1) * nxy + ij] - scalar[(k - 1) * nxy + ij]) / (2.0 * dz)
+            };
+            out[idx] -= slab_w[ij] * dsdz;
+        }
+    }
+
+    out
+}
+
+// ─────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────
 
@@ -700,7 +775,7 @@ mod tests {
     #[test]
     fn test_coriolis_parameter_values() {
         let f_45 = coriolis_parameter(45.0);
-        let expected = 2.0 * 7.2921e-5 * (45.0_f64 * std::f64::consts::PI / 180.0).sin();
+        let expected = 2.0 * 7.2921159e-5 * (45.0_f64 * std::f64::consts::PI / 180.0).sin();
         assert!((f_45 - expected).abs() < 1e-12);
 
         assert!(coriolis_parameter(0.0).abs() < 1e-15);
@@ -1582,6 +1657,92 @@ mod tests {
                 let shear = dv_dx[k] + du_dy[k];
                 assert!(stretch.abs() < 1e-10, "stretching = {}", stretch);
                 assert!(shear.abs() < 1e-10, "shearing = {}", shear);
+            }
+        }
+    }
+
+    // ── advection_3d ──
+
+    #[test]
+    fn test_advection_3d_uniform_field() {
+        // Uniform scalar field => advection should be zero everywhere.
+        let nx = 4;
+        let ny = 3;
+        let nz = 3;
+        let n = nx * ny * nz;
+        let scalar = vec![10.0; n];
+        let u = vec![5.0; n];
+        let v = vec![3.0; n];
+        let w = vec![1.0; n];
+        let result = advection_3d(&scalar, &u, &v, &w, nx, ny, nz, 1000.0, 1000.0, 500.0);
+        for val in &result {
+            assert!(val.abs() < 1e-10, "Expected 0, got {}", val);
+        }
+    }
+
+    #[test]
+    fn test_advection_3d_vertical_only() {
+        // Scalar varies linearly with level: s = k * 10.0, all horizontal uniform.
+        // Only w-advection term should be nonzero.
+        let nx = 3;
+        let ny = 3;
+        let nz = 3;
+        let nxy = nx * ny;
+        let mut scalar = vec![0.0; nxy * nz];
+        for k in 0..nz {
+            for ij in 0..nxy {
+                scalar[k * nxy + ij] = k as f64 * 10.0;
+            }
+        }
+        let u = vec![0.0; nxy * nz];
+        let v = vec![0.0; nxy * nz];
+        let w = vec![1.0; nxy * nz];
+        let dz = 100.0;
+        let result = advection_3d(&scalar, &u, &v, &w, nx, ny, nz, 1000.0, 1000.0, dz);
+        // ds/dz = 10 / 100 = 0.1 for interior levels.
+        // advection = -w * ds/dz = -1.0 * 0.1 = -0.1 for interior.
+        let k = 1; // middle level
+        for ij in 0..nxy {
+            let val = result[k * nxy + ij];
+            assert!((val + 0.1).abs() < 1e-10, "Expected -0.1, got {} at ij={}", val, ij);
+        }
+    }
+
+    #[test]
+    fn test_advection_3d_horizontal_only() {
+        // When w=0, 3D advection should match 2D advection for each level.
+        let nx = 5;
+        let ny = 5;
+        let nz = 2;
+        let nxy = nx * ny;
+        // Linear ramp in x: s = i.
+        let mut scalar = vec![0.0; nxy * nz];
+        for k in 0..nz {
+            for j in 0..ny {
+                for i in 0..nx {
+                    scalar[k * nxy + j * nx + i] = i as f64;
+                }
+            }
+        }
+        let u = vec![2.0; nxy * nz];
+        let v = vec![0.0; nxy * nz];
+        let w = vec![0.0; nxy * nz];
+        let dx = 1.0;
+        let dy = 1.0;
+        let dz = 1.0;
+        let result_3d = advection_3d(&scalar, &u, &v, &w, nx, ny, nz, dx, dy, dz);
+        // Compare with 2D advection for each level.
+        for k in 0..nz {
+            let slab_s = &scalar[k * nxy..(k + 1) * nxy];
+            let slab_u = &u[k * nxy..(k + 1) * nxy];
+            let slab_v = &v[k * nxy..(k + 1) * nxy];
+            let result_2d = advection(slab_s, slab_u, slab_v, nx, ny, dx, dy);
+            for ij in 0..nxy {
+                assert!(
+                    (result_3d[k * nxy + ij] - result_2d[ij]).abs() < 1e-10,
+                    "Mismatch at k={}, ij={}: 3d={}, 2d={}",
+                    k, ij, result_3d[k * nxy + ij], result_2d[ij]
+                );
             }
         }
     }

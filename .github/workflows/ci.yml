@@ -11,40 +11,24 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        python-version: ['3.10', '3.12']
+        python-version: ["3.10", "3.12"]
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Create virtualenv
-        run: python -m venv .venv
-      - name: Activate venv and install deps (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          source .venv/bin/activate
-          pip install numpy pint pytest
-      - name: Activate venv and install deps (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          .venv\Scripts\activate
-          pip install numpy pint pytest
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-      - name: Build and install
-        uses: PyO3/maturin-action@v1
-        with:
-          command: develop
-          args: --release
+
+      - name: Install package and test deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e "." pytest numpy pint
+
       - name: Run Rust tests
         run: cargo test --workspace
-      - name: Test Python import (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          source .venv/bin/activate
-          python -c "from metrust.calc import potential_temperature; from metrust.units import units; print('OK:', potential_temperature(1000 * units.hPa, 25 * units.degC))"
-      - name: Test Python import (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          .venv\Scripts\activate
-          python -c "from metrust.calc import potential_temperature; from metrust.units import units; print('OK:', potential_temperature(1000 * units.hPa, 25 * units.degC))"
+
+      - name: Run Python compatibility tests
+        run: python -m pytest tests/test_python_compat.py -q
