@@ -1814,7 +1814,12 @@ def most_unstable_cape_cin(pressure, temperature, dewpoint, depth=300, **kwargs)
     p = _as_1d(_strip(pressure, "hPa"))
     t = _as_1d(_strip(temperature, "degC"))
     td = _as_1d(_strip(dewpoint, "degC"))
-    cape_val, cin_val = _calc.most_unstable_cape_cin(p, t, td)
+    d = _scalar_strip(depth, "hPa") if hasattr(depth, "magnitude") else float(depth)
+    # Find MU parcel within the specified depth, then compute CAPE from it
+    mu_p, mu_t, mu_td = _calc.get_most_unstable_parcel(p, t, td, d)
+    # Find index of MU parcel and compute CAPE from that level up
+    mu_idx = int(np.argmin(np.abs(p - mu_p)))
+    cape_val, cin_val = _calc.surface_based_cape_cin(p[mu_idx:], t[mu_idx:], td[mu_idx:])
     return cape_val * units("J/kg"), cin_val * units("J/kg")
 
 
@@ -2324,8 +2329,8 @@ def bulk_shear(pressure_or_u, u_or_v, v_or_height=None, height=None,
         v_arr = _as_1d(_strip(u_or_v, "m/s"))
         h_arr = _as_1d(_strip(v_or_height, "m"))
 
-    # Resolve bottom/top from depth
-    bot_val = _scalar_strip(bottom, "m") if bottom is not None else 0.0
+    # Resolve bottom/top from depth (default bottom = first height, matching MetPy)
+    bot_val = _scalar_strip(bottom, "m") if bottom is not None else float(h_arr[0])
     if top is not None:
         top_val = _scalar_strip(top, "m")
     elif depth is not None:
@@ -3614,10 +3619,9 @@ def critical_angle(*args):
     """Critical angle between storm-relative inflow and 0-500m shear.
 
     MetPy form: ``critical_angle(pressure, u, v, height, u_storm, v_storm)``
-    Direct form: ``critical_angle(storm_u, storm_v, u_sfc, v_sfc, u_500m, v_500m)``
 
-    When called with profile data (MetPy form), surface and 500m values are
-    interpolated from the profiles automatically.
+    Computes the angle between the 10m storm-relative inflow vector and
+    the 0-500m shear vector (MetPy-exact algorithm).
 
     Returns
     -------
@@ -3626,25 +3630,37 @@ def critical_angle(*args):
     if len(args) != 6:
         raise TypeError(
             "critical_angle expects 6 positional args: "
-            "(pressure, u, v, height, u_storm, v_storm) or "
-            "(storm_u, storm_v, u_sfc, v_sfc, u_500m, v_500m)"
+            "(pressure, u, v, height, u_storm, v_storm)"
         )
-    # Detect profile form: if 1st arg is array-like with >1 element, it's the profile form
+    # Detect profile form: if 1st arg is array-like with >1 element
     first = np.asarray(args[0].magnitude if hasattr(args[0], "magnitude") else args[0])
     if first.ndim >= 1 and first.size > 1:
         # MetPy profile form: (pressure, u, v, height, u_storm, v_storm)
-        _p, u_prof, v_prof, h_prof, storm_u, storm_v = args
-        u_arr = _as_1d(_strip(u_prof, "m/s"))
-        v_arr = _as_1d(_strip(v_prof, "m/s"))
-        h_arr = _as_1d(_strip(h_prof, "m"))
-        # Surface values (index 0)
-        u_sfc = u_arr[0]
-        v_sfc = v_arr[0]
-        # Interpolate to 500m AGL
-        u_500 = float(np.interp(500.0, h_arr, u_arr))
-        v_500 = float(np.interp(500.0, h_arr, v_arr))
+        p_prof, u_prof, v_prof, h_prof, storm_u, storm_v = args
         su = _scalar_strip(storm_u, "m/s")
         sv = _scalar_strip(storm_v, "m/s")
+
+        # 0-500m bulk shear (MetPy uses bulk_shear for this)
+        shr_u, shr_v = bulk_shear(p_prof, u_prof, v_prof, height=h_prof,
+                                   depth=500.0 * units.m)
+        shr_u_val = float(shr_u.magnitude if hasattr(shr_u, "magnitude") else shr_u)
+        shr_v_val = float(shr_v.magnitude if hasattr(shr_v, "magnitude") else shr_v)
+
+        # Storm motion relative to surface wind (MetPy convention: u_storm - u[0])
+        u_sfc = float(_as_1d(_strip(u_prof, "m/s"))[0])
+        v_sfc = float(_as_1d(_strip(v_prof, "m/s"))[0])
+        inflow_u = su - u_sfc
+        inflow_v = sv - v_sfc
+
+        # Angle between shear vector and inflow vector
+        vshr = np.array([shr_u_val, shr_v_val])
+        vsm = np.array([inflow_u, inflow_v])
+        mag_product = np.linalg.norm(vshr) * np.linalg.norm(vsm)
+        if mag_product < 1e-10:
+            return 0.0 * units.degree
+        cos_angle = np.clip(np.dot(vshr, vsm) / mag_product, -1.0, 1.0)
+        angle_deg = float(np.degrees(np.arccos(cos_angle)))
+        return angle_deg * units.degree
     else:
         # Direct scalar form: (storm_u, storm_v, u_sfc, v_sfc, u_500m, v_500m)
         storm_u, storm_v, u_sfc_q, v_sfc_q, u_500_q, v_500_q = args
