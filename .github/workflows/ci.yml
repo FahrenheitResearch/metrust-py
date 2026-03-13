@@ -46,7 +46,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run Criterion benchmarks
-        run: cargo bench --package metrust -- --output-format bencher
+        run: cargo bench --package metrust --bench calc_bench
 
       - name: Upload criterion artifacts
         uses: actions/upload-artifact@v4
