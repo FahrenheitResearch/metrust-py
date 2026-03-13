@@ -18,3 +18,8 @@ rayon = "1"
 flate2 = "1"
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "calc_bench"
+harness = false

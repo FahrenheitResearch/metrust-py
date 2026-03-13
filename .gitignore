@@ -9,3 +9,4 @@ build/
 *.pyd
 .venv/
 *.pdb
+bench_results.json

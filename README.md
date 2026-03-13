@@ -78,21 +78,45 @@ Current shimmed surfaces:
 
 ## Performance
 
-The Rust-backed paths are substantially faster than MetPy on scalar-heavy workloads and still meaningfully faster on many array operations.
+The benchmark suite (`benches/`) measures performance at three tiers to give an honest picture:
 
-Representative numbers from the repo benchmarks:
+| Tier | What it measures | Import path |
+|------|-----------------|-------------|
+| **T1: Raw Rust** | Pure FFI, no Pint overhead | `metrust._metrust.calc` |
+| **T2: metrust + Pint** | Rust backend with Pint unit wrappers | `metrust.calc` |
+| **T3: MetPy + Pint** | Pure Python + Pint baseline | `metpy.calc` |
 
-| Operation | MetPy | metrust | Speedup |
-|---|---|---|---|
-| `potential_temperature` (scalar) | 0.145 ms | 0.0000092 ms | 15,700x |
-| `saturation_vapor_pressure` (scalar) | 0.039 ms | 0.0000025 ms | 15,800x |
-| `equivalent_potential_temperature` | 0.323 ms | 0.0000363 ms | 8,900x |
-| `cape_cin` (100-level sounding) | 1.70 ms | 0.025 ms | 68x |
-| `divergence` (100x100 grid) | 1.01 ms | 0.027 ms | 37x |
-| `divergence` (500x500 grid) | 15.93 ms | 0.92 ms | 17x |
-| `interpolate_1d` (1000 points) | 0.047 ms | 0.003 ms | 15x |
+The **fair comparison** is T3 vs T2 (both use Pint). T1 shows the raw Rust ceiling.
 
-Scalar gains are especially large because MetPy pays more Python and Pint overhead per call. The exact speedup depends on how much of your workflow stays on the native Rust path.
+Representative numbers (p50, AMD Ryzen 9):
+
+| Operation | MetPy (T3) | metrust+Pint (T2) | Raw Rust (T1) | Fair speedup (T3/T2) |
+|---|---|---|---|---|
+| `potential_temperature` (scalar) | 129 us | 7.4 us | 60 ns | **17x** |
+| `equivalent_potential_temperature` | 300 us | 7.5 us | 95 ns | **40x** |
+| `wet_bulb_temperature` (scalar) | 724 us | 8.1 us | 201 ns | **90x** |
+| `dewpoint_from_rh` (scalar) | 120 us | 2.7 us | 76 ns | **44x** |
+| `parcel_profile` (100 levels) | 2.55 ms | 71 us | 56 us | **36x** |
+| `cape_cin` (100-level sounding) | 1.60 ms | 137 us | 20 us | **12x** |
+| `divergence` (100x100 grid) | 994 us | 12.6 us | 12.6 us | **79x** |
+| `storm_relative_helicity` (100 levels) | 579 us | 16.5 us | 532 ns | **35x** |
+
+A few operations are **not** faster — this is expected and the benchmarks don't hide it:
+
+- `wind_speed` at small arrays (1k elements): metrust+Pint is ~2x slower than MetPy because Pint wrapper overhead dominates a sub-microsecond Rust call. At 10k+ elements they converge.
+- `smooth_gaussian`: MetPy delegates to scipy's heavily-optimized C `gaussian_filter`. The pure Rust implementation is ~10x slower on large grids. The raw Rust API (`T1`) avoids any Pint cost but the algorithm itself is less optimized.
+
+Run the benchmarks yourself:
+
+```bash
+# Rust (Criterion, HTML reports in target/criterion/)
+cargo bench --package metrust
+
+# Python three-tier (requires metrust; MetPy optional for T3)
+python benches/bench_python.py              # T1+T2 only
+python benches/bench_python.py --tier 1,2,3 # all three tiers
+python benches/bench_python.py --json       # machine-readable output
+```
 
 ## Known Limits
 
