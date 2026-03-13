@@ -3723,6 +3723,284 @@ def advection_3d(scalar, u, v, w, dx, dy, dz):
 
 
 # ============================================================================
+# Grid composite kernels (Rust-parallel, no Pint overhead)
+# ============================================================================
+
+def _grid_strip(arr):
+    """Strip Pint units and return contiguous float64 array."""
+    if hasattr(arr, "magnitude"):
+        arr = arr.magnitude
+    return np.ascontiguousarray(arr, dtype=np.float64)
+
+
+def _grid_flatten_3d(arr):
+    """Flatten a 3D array [nz, ny, nx] → 1D, return (flat, nx, ny, nz)."""
+    a = _grid_strip(arr)
+    if a.ndim != 3:
+        raise ValueError(f"Expected 3-D array (nz, ny, nx), got {a.ndim}-D")
+    nz, ny, nx = a.shape
+    return a.ravel(), nx, ny, nz
+
+
+def _grid_flatten_2d(arr):
+    """Flatten a 2D array [ny, nx] → 1D, return (flat, nx, ny)."""
+    a = _grid_strip(arr)
+    if a.ndim != 2:
+        raise ValueError(f"Expected 2-D array (ny, nx), got {a.ndim}-D")
+    ny, nx = a.shape
+    return a.ravel(), nx, ny
+
+
+def compute_cape_cin(pressure_3d, temperature_c_3d, qvapor_3d,
+                     height_agl_3d, psfc, t2, q2,
+                     parcel_type="surface", top_m=None):
+    """CAPE/CIN for every grid point (parallelized Rust).
+
+    3-D inputs: shape (nz, ny, nx) — pressure (Pa), temperature (C),
+    mixing ratio (kg/kg), height AGL (m).
+    2-D inputs: shape (ny, nx) — surface pressure (Pa), T2m (K), Q2m (kg/kg).
+
+    Returns (cape, cin, lcl_height, lfc_height) each shaped (ny, nx).
+    """
+    p3, nx, ny, nz = _grid_flatten_3d(pressure_3d)
+    t3 = _grid_strip(temperature_c_3d).ravel()
+    q3 = _grid_strip(qvapor_3d).ravel()
+    h3 = _grid_strip(height_agl_3d).ravel()
+    ps = _grid_strip(psfc).ravel()
+    t2v = _grid_strip(t2).ravel()
+    q2v = _grid_strip(q2).ravel()
+    cape, cin, lcl, lfc = _calc.compute_cape_cin(
+        p3, t3, q3, h3, ps, t2v, q2v,
+        nx, ny, nz, parcel_type, top_m,
+    )
+    shape = (ny, nx)
+    return (
+        np.asarray(cape).reshape(shape) * units("J/kg"),
+        np.asarray(cin).reshape(shape) * units("J/kg"),
+        np.asarray(lcl).reshape(shape) * units.m,
+        np.asarray(lfc).reshape(shape) * units.m,
+    )
+
+
+def compute_srh(u_3d, v_3d, height_agl_3d, top_m=1000.0):
+    """Storm-relative helicity for every grid point.
+
+    3-D inputs: shape (nz, ny, nx) — u/v wind (m/s), height AGL (m).
+    top_m: integration depth in meters (default 1000 = 0-1 km).
+
+    Returns SRH shaped (ny, nx) in m^2/s^2.
+    """
+    u3, nx, ny, nz = _grid_flatten_3d(u_3d)
+    v3 = _grid_strip(v_3d).ravel()
+    h3 = _grid_strip(height_agl_3d).ravel()
+    result = _calc.compute_srh(u3, v3, h3, nx, ny, nz, float(top_m))
+    return np.asarray(result).reshape(ny, nx) * units("m**2/s**2")
+
+
+def compute_shear(u_3d, v_3d, height_agl_3d, bottom_m=0.0, top_m=6000.0):
+    """Bulk wind shear for every grid point.
+
+    3-D inputs: shape (nz, ny, nx) — u/v wind (m/s), height AGL (m).
+    bottom_m, top_m: shear layer bounds in meters AGL.
+
+    Returns shear magnitude shaped (ny, nx) in m/s.
+    """
+    u3, nx, ny, nz = _grid_flatten_3d(u_3d)
+    v3 = _grid_strip(v_3d).ravel()
+    h3 = _grid_strip(height_agl_3d).ravel()
+    result = _calc.compute_shear(
+        u3, v3, h3, nx, ny, nz, float(bottom_m), float(top_m),
+    )
+    return np.asarray(result).reshape(ny, nx) * units("m/s")
+
+
+def compute_lapse_rate(temperature_c_3d, qvapor_3d, height_agl_3d,
+                       bottom_km=0.0, top_km=3.0):
+    """Environmental lapse rate for every grid point (C/km).
+
+    3-D inputs: shape (nz, ny, nx).
+    bottom_km, top_km: layer bounds in km AGL.
+
+    Returns lapse rate shaped (ny, nx) in C/km.
+    """
+    t3, nx, ny, nz = _grid_flatten_3d(temperature_c_3d)
+    q3 = _grid_strip(qvapor_3d).ravel()
+    h3 = _grid_strip(height_agl_3d).ravel()
+    result = _calc.compute_lapse_rate(
+        t3, q3, h3, nx, ny, nz, float(bottom_km), float(top_km),
+    )
+    return np.asarray(result).reshape(ny, nx) * units("degC/km")
+
+
+def compute_pw(qvapor_3d, pressure_3d):
+    """Precipitable water for every grid point (mm).
+
+    3-D inputs: shape (nz, ny, nx) — mixing ratio (kg/kg), pressure (Pa).
+
+    Returns PW shaped (ny, nx) in mm.
+    """
+    q3, nx, ny, nz = _grid_flatten_3d(qvapor_3d)
+    p3 = _grid_strip(pressure_3d).ravel()
+    result = _calc.compute_pw(q3, p3, nx, ny, nz)
+    return np.asarray(result).reshape(ny, nx) * units.mm
+
+
+def compute_stp(cape, lcl_height, srh_1km, shear_6km):
+    """Significant Tornado Parameter on pre-computed 2-D fields.
+
+    All inputs: shape (ny, nx).
+    - cape: MLCAPE (J/kg)
+    - lcl_height: LCL height (m AGL)
+    - srh_1km: 0-1 km SRH (m^2/s^2)
+    - shear_6km: 0-6 km bulk shear (m/s)
+
+    Returns STP shaped (ny, nx), dimensionless.
+    """
+    c, nx, ny = _grid_flatten_2d(cape)
+    l = _grid_strip(lcl_height).ravel()
+    s = _grid_strip(srh_1km).ravel()
+    sh = _grid_strip(shear_6km).ravel()
+    result = _calc.compute_stp(c, l, s, sh)
+    return np.asarray(result).reshape(ny, nx) * units.dimensionless
+
+
+def compute_scp(mucape, srh_3km, shear_6km):
+    """Supercell Composite Parameter on pre-computed 2-D fields.
+
+    All inputs: shape (ny, nx).
+    - mucape: MUCAPE (J/kg)
+    - srh_3km: 0-3 km SRH (m^2/s^2)
+    - shear_6km: 0-6 km bulk shear (m/s)
+
+    Returns SCP shaped (ny, nx), dimensionless.
+    """
+    c, nx, ny = _grid_flatten_2d(mucape)
+    s = _grid_strip(srh_3km).ravel()
+    sh = _grid_strip(shear_6km).ravel()
+    result = _calc.compute_scp(c, s, sh)
+    return np.asarray(result).reshape(ny, nx) * units.dimensionless
+
+
+def compute_ehi(cape, srh):
+    """Energy-Helicity Index on pre-computed 2-D fields.
+
+    EHI = (CAPE * SRH) / 160000.
+
+    All inputs: shape (ny, nx).
+
+    Returns EHI shaped (ny, nx), dimensionless.
+    """
+    c, nx, ny = _grid_flatten_2d(cape)
+    s = _grid_strip(srh).ravel()
+    result = _calc.compute_ehi(c, s)
+    return np.asarray(result).reshape(ny, nx) * units.dimensionless
+
+
+def compute_ship(cape, shear06, t500, lr_700_500, mixing_ratio_gkg):
+    """Significant Hail Parameter (SHIP) on 2-D fields.
+
+    All inputs: shape (ny, nx).
+    - cape: MUCAPE (J/kg)
+    - shear06: 0-6 km bulk shear (m/s)
+    - t500: 500 hPa temperature (C)
+    - lr_700_500: 700-500 hPa lapse rate (C/km)
+    - mixing_ratio_gkg: Mixing ratio (g/kg)
+
+    Returns SHIP shaped (ny, nx), dimensionless.
+    """
+    c, nx, ny = _grid_flatten_2d(cape)
+    sh = _grid_strip(shear06).ravel()
+    t5 = _grid_strip(t500).ravel()
+    lr = _grid_strip(lr_700_500).ravel()
+    mr = _grid_strip(mixing_ratio_gkg).ravel()
+    result = _calc.significant_hail_parameter(c, sh, t5, lr, mr, nx, ny)
+    return np.asarray(result).reshape(ny, nx) * units.dimensionless
+
+
+def compute_dcp(dcape, mu_cape, shear06, mu_mixing_ratio):
+    """Derecho Composite Parameter (DCP) on 2-D fields.
+
+    DCP = (DCAPE/980) * (MUCAPE/2000) * (SHEAR_06/20) * (MU_MR/11).
+
+    All inputs: shape (ny, nx).
+
+    Returns DCP shaped (ny, nx), dimensionless.
+    """
+    d, nx, ny = _grid_flatten_2d(dcape)
+    mc = _grid_strip(mu_cape).ravel()
+    sh = _grid_strip(shear06).ravel()
+    mr = _grid_strip(mu_mixing_ratio).ravel()
+    result = _calc.derecho_composite_parameter(d, mc, sh, mr, nx, ny)
+    return np.asarray(result).reshape(ny, nx) * units.dimensionless
+
+
+def compute_grid_scp(mu_cape, srh, shear_06, mu_cin):
+    """Enhanced Supercell Composite with CIN term on 2-D fields.
+
+    SCP = (MUCAPE/1000) * (SRH/50) * (SHEAR_06/40) * CIN_term.
+
+    All inputs: shape (ny, nx).
+
+    Returns SCP shaped (ny, nx), dimensionless.
+    """
+    mc, nx, ny = _grid_flatten_2d(mu_cape)
+    s = _grid_strip(srh).ravel()
+    sh = _grid_strip(shear_06).ravel()
+    ci = _grid_strip(mu_cin).ravel()
+    result = _calc.grid_supercell_composite_parameter(mc, s, sh, ci, nx, ny)
+    return np.asarray(result).reshape(ny, nx) * units.dimensionless
+
+
+def compute_grid_critical_angle(u_storm, v_storm, u_shear, v_shear):
+    """Critical angle on 2-D fields.
+
+    Returns angle in degrees (0-180). Values near 90 favor tornadogenesis.
+
+    All inputs: shape (ny, nx).
+    """
+    us, nx, ny = _grid_flatten_2d(u_storm)
+    vs = _grid_strip(v_storm).ravel()
+    ush = _grid_strip(u_shear).ravel()
+    vsh = _grid_strip(v_shear).ravel()
+    result = _calc.grid_critical_angle(us, vs, ush, vsh, nx, ny)
+    return np.asarray(result).reshape(ny, nx) * units.degree
+
+
+def composite_reflectivity(refl_3d):
+    """Composite reflectivity (column max) from a 3-D reflectivity field.
+
+    Input: shape (nz, ny, nx) — reflectivity in dBZ.
+
+    Returns composite reflectivity shaped (ny, nx) in dBZ.
+    """
+    r3, nx, ny, nz = _grid_flatten_3d(refl_3d)
+    result = _calc.composite_reflectivity_from_refl(r3, nx, ny, nz)
+    return np.asarray(result).reshape(ny, nx) * units.dimensionless
+
+
+def composite_reflectivity_from_hydrometeors(pressure_3d, temperature_c_3d,
+                                             qrain_3d, qsnow_3d, qgraup_3d):
+    """Composite reflectivity from hydrometeor mixing ratios.
+
+    All 3-D inputs: shape (nz, ny, nx).
+    - pressure_3d: Pa
+    - temperature_c_3d: Celsius
+    - qrain_3d, qsnow_3d, qgraup_3d: kg/kg
+
+    Returns composite reflectivity shaped (ny, nx) in dBZ.
+    """
+    p3, nx, ny, nz = _grid_flatten_3d(pressure_3d)
+    t3 = _grid_strip(temperature_c_3d).ravel()
+    qr = _grid_strip(qrain_3d).ravel()
+    qs = _grid_strip(qsnow_3d).ravel()
+    qg = _grid_strip(qgraup_3d).ravel()
+    result = _calc.composite_reflectivity_from_hydrometeors(
+        p3, t3, qr, qs, qg, nx, ny, nz,
+    )
+    return np.asarray(result).reshape(ny, nx) * units.dimensionless
+
+
+# ============================================================================
 # __all__ -- explicit public API
 # ============================================================================
 
@@ -3869,6 +4147,21 @@ __all__ = [
     "hot_dry_windy",
     "warm_nose_check",
     "galvez_davison_index",
+    # grid composites
+    "compute_cape_cin",
+    "compute_srh",
+    "compute_shear",
+    "compute_lapse_rate",
+    "compute_pw",
+    "compute_stp",
+    "compute_scp",
+    "compute_ehi",
+    "compute_ship",
+    "compute_dcp",
+    "compute_grid_scp",
+    "compute_grid_critical_angle",
+    "composite_reflectivity",
+    "composite_reflectivity_from_hydrometeors",
     # atmo
     "pressure_to_height_std",
     "height_to_pressure_std",
