@@ -51,9 +51,9 @@ The surface is identical. Under the hood, every calculation runs through compile
 
 ## Key Features
 
-### 100+ Native Rust Calculation Functions
+### 150/150 MetPy Calc Functions (Plus 36 Extras)
 
-The entire `metrust.calc` module is backed by Rust -- no MetPy dependency, no Python fallback.
+Every function in `metpy.calc` has a metrust equivalent -- 100% API coverage. Plus 36 additional functions MetPy doesn't have (grid composites, fire weather indices, and more). The entire `metrust.calc` module is backed by Rust -- no MetPy dependency, no Python fallback.
 Coverage spans the core of operational meteorology:
 
 - **Thermodynamics** -- potential temperature, equivalent potential temperature, virtual temperature, wet-bulb temperature, LCL, LFC, EL, CAPE/CIN, parcel profiles, precipitable water, thickness hydrostatic, stability indices

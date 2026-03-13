@@ -4012,6 +4012,165 @@ def composite_reflectivity_from_hydrometeors(pressure_3d, temperature_c_3d,
 
 
 # ============================================================================
+# ============================================================================
+# xarray Dataset wrappers
+# ============================================================================
+
+def parcel_profile_with_lcl_as_dataset(pressure, temperature, dewpoint):
+    """Calculate parcel profile and return as xarray Dataset with LCL inserted.
+
+    Wraps :func:`parcel_profile_with_lcl` and returns the result as an
+    ``xarray.Dataset`` with pressure as the ``isobaric`` coordinate and
+    data variables for ambient temperature, ambient dewpoint, and parcel
+    temperature.
+
+    Parameters
+    ----------
+    pressure : array Quantity (pressure)
+    temperature : array Quantity (temperature)
+    dewpoint : array Quantity (temperature)
+
+    Returns
+    -------
+    xarray.Dataset
+    """
+    import xarray as xr
+    # Extract surface values (first element = highest pressure)
+    t_arr = np.asarray(temperature.magnitude if hasattr(temperature, "magnitude") else temperature, dtype=np.float64)
+    td_arr = np.asarray(dewpoint.magnitude if hasattr(dewpoint, "magnitude") else dewpoint, dtype=np.float64)
+    t_units_obj = temperature.units if hasattr(temperature, "units") else units.degC
+    t_sfc = t_arr[0] * t_units_obj
+    td_sfc = td_arr[0] * t_units_obj
+    p_out, t_parcel = parcel_profile_with_lcl(pressure, t_sfc, td_sfc)
+    p_mag = p_out.magnitude if hasattr(p_out, "magnitude") else np.asarray(p_out)
+    p_units = str(p_out.units) if hasattr(p_out, "units") else "hPa"
+    # Interpolate ambient T and Td onto the new pressure grid (with LCL inserted)
+    p_orig = np.asarray(pressure.magnitude if hasattr(pressure, "magnitude") else pressure, dtype=np.float64)
+    t_orig = t_arr
+    td_orig = td_arr
+    p_new = np.asarray(p_mag, dtype=np.float64)
+    t_interp = np.interp(p_new, p_orig[::-1], t_orig[::-1])[::-1] if p_orig[0] > p_orig[-1] else np.interp(p_new, p_orig, t_orig)
+    td_interp = np.interp(p_new, p_orig[::-1], td_orig[::-1])[::-1] if p_orig[0] > p_orig[-1] else np.interp(p_new, p_orig, td_orig)
+    t_parc = np.asarray(t_parcel.magnitude if hasattr(t_parcel, "magnitude") else t_parcel, dtype=np.float64)
+    t_units = str(temperature.units) if hasattr(temperature, "units") else "degC"
+    coord = xr.Variable("isobaric", p_new, attrs={"units": p_units})
+    return xr.Dataset(
+        {
+            "ambient_temperature": xr.Variable("isobaric", t_interp, attrs={"units": t_units}),
+            "ambient_dew_point": xr.Variable("isobaric", td_interp, attrs={"units": t_units}),
+            "parcel_temperature": xr.Variable("isobaric", t_parc, attrs={"units": t_units}),
+        },
+        coords={"isobaric": coord},
+    )
+
+
+def isentropic_interpolation_as_dataset(levels, temperature, *args,
+                                         max_iters=50, eps=1e-6,
+                                         bottom_up_search=True, pressure=None):
+    """Interpolate to isentropic surfaces and return as xarray Dataset.
+
+    Wraps :func:`isentropic_interpolation` and packages the result as an
+    ``xarray.Dataset`` with ``isentropic_level`` as the vertical coordinate.
+
+    Parameters
+    ----------
+    levels : array Quantity (K)
+        Desired theta surfaces.
+    temperature : xarray.DataArray
+        Temperature array with a vertical (pressure) dimension.
+    *args : xarray.DataArray
+        Additional fields to interpolate.
+    max_iters : int, optional
+    eps : float, optional
+    bottom_up_search : bool, optional
+    pressure : xarray.DataArray, optional
+        Pressure array if vertical coordinate is not pressure.
+
+    Returns
+    -------
+    xarray.Dataset
+    """
+    import xarray as xr
+    # Extract pressure from the vertical coordinate if not provided
+    temp_arr = temperature
+    if hasattr(temp_arr, "metpy"):
+        temp_arr = temp_arr.metpy.dequantify()
+    t_vals = np.asarray(temp_arr.values, dtype=np.float64)
+    if pressure is not None:
+        p_vals = np.asarray(pressure.values if hasattr(pressure, "values") else pressure, dtype=np.float64)
+    else:
+        # Try to find the vertical coordinate
+        for dim in temp_arr.dims:
+            coord = temp_arr.coords[dim]
+            u = str(getattr(coord, "units", getattr(coord.attrs.get("units", ""), "__str__", lambda: "")()))
+            if "Pa" in u or "hPa" in u or "millibar" in u or dim in ("isobaric", "level", "pressure"):
+                p_vals = np.asarray(coord.values, dtype=np.float64)
+                break
+        else:
+            p_vals = np.asarray(temp_arr.coords[temp_arr.dims[0]].values, dtype=np.float64)
+    theta_levs = np.asarray(levels.magnitude if hasattr(levels, "magnitude") else levels, dtype=np.float64)
+    # Build 3D pressure array if needed
+    shape = t_vals.shape
+    if p_vals.ndim == 1 and t_vals.ndim == 3:
+        p_3d = np.broadcast_to(p_vals[:, None, None], shape).copy()
+    elif p_vals.ndim == 1 and t_vals.ndim == 1:
+        p_3d = p_vals
+    else:
+        p_3d = p_vals
+    extra = [np.asarray(a.values if hasattr(a, "values") else a, dtype=np.float64) for a in args]
+    result = isentropic_interpolation(theta_levs, p_3d, t_vals, extra)
+    # Package as Dataset
+    theta_coord = xr.Variable("isentropic_level", theta_levs, attrs={"units": "K", "positive": "up"})
+    ds_vars = {}
+    if isinstance(result, (list, tuple)) and len(result) >= 2:
+        ds_vars["pressure"] = xr.Variable("isentropic_level", np.asarray(result[0]), attrs={"units": "hPa"})
+        ds_vars["temperature"] = xr.Variable("isentropic_level", np.asarray(result[1]), attrs={"units": "K"})
+        for i, a in enumerate(args):
+            name = getattr(a, "name", None) or f"field_{i}"
+            if 2 + i < len(result):
+                ds_vars[name] = xr.Variable("isentropic_level", np.asarray(result[2 + i]))
+    return xr.Dataset(ds_vars, coords={"isentropic_level": theta_coord})
+
+
+def zoom_xarray(input_field, zoom, output=None, order=3, mode="constant",
+                cval=0.0, prefilter=True):
+    """Zoom/interpolate an xarray DataArray using scipy.ndimage.zoom.
+
+    Parameters
+    ----------
+    input_field : xarray.DataArray
+        2-D field to zoom.
+    zoom : float or sequence of float
+        Zoom factor(s) for each axis.
+    output, order, mode, cval, prefilter
+        Passed directly to :func:`scipy.ndimage.zoom`.
+
+    Returns
+    -------
+    xarray.DataArray
+        Zoomed field with scaled coordinates.
+    """
+    import xarray as xr
+    from scipy.ndimage import zoom as _zoom
+    data = input_field.values
+    if hasattr(input_field, "metpy"):
+        data = input_field.metpy.dequantify().values
+    zoomed = _zoom(np.asarray(data, dtype=np.float64), zoom, output=output,
+                   order=order, mode=mode, cval=cval, prefilter=prefilter)
+    zoom_factors = np.atleast_1d(zoom)
+    if zoom_factors.size == 1:
+        zoom_factors = np.full(data.ndim, zoom_factors[0])
+    new_coords = {}
+    for i, dim in enumerate(input_field.dims):
+        if dim in input_field.coords:
+            old = np.asarray(input_field.coords[dim].values, dtype=np.float64)
+            new_len = zoomed.shape[i]
+            new_coords[dim] = np.linspace(old[0], old[-1], new_len)
+    result = xr.DataArray(zoomed, dims=input_field.dims, coords=new_coords,
+                          attrs=input_field.attrs.copy())
+    return result
+
+
 # __all__ -- explicit public API
 # ============================================================================
 
@@ -4208,6 +4367,10 @@ __all__ = [
     "advection_3d",
     # exceptions
     "InvalidSoundingError",
+    # xarray dataset wrappers
+    "parcel_profile_with_lcl_as_dataset",
+    "isentropic_interpolation_as_dataset",
+    "zoom_xarray",
 ]
 
 _COMPAT_ALIASES = {
