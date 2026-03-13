@@ -1,7 +1,15 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+
 [package]
 name = "metrust-py"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
 description = "Python bindings for metrust — a drop-in replacement for MetPy"
 
 [lib]
@@ -9,6 +17,6 @@ name = "_metrust"
 crate-type = ["cdylib"]
 
 [dependencies]
-metrust = { path = "../metrust" }
+metrust = { path = "crates/metrust" }
 pyo3 = { version = "0.23", features = ["extension-module"] }
 numpy = "0.23"
