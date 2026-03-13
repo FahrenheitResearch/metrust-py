@@ -1801,13 +1801,13 @@ def montgomery_streamfunction(height_or_theta, temperature_or_pressure=None,
         g = 9.80665  # m/s^2
         h_arr = np.asarray(h_val, dtype=np.float64)
         t_arr = np.asarray(t_val, dtype=np.float64)
-        result = cp * t_arr + g * h_arr
+        result = (cp * t_arr + g * h_arr) / 1000.0  # Convert to kJ/kg (MetPy convention)
         if hasattr(height_or_theta, "coords") and hasattr(height_or_theta, "dims"):
             import xarray as xr
             return xr.DataArray(result, coords=height_or_theta.coords,
                                 dims=height_or_theta.dims,
-                                attrs={"units": "J/kg"})
-        return result * units("J/kg")
+                                attrs={"units": "kJ/kg"})
+        return result * units("kJ/kg")
     elif temperature is not None and height is not None:
         # 4-arg legacy form: (theta, pressure, temperature, height)
         result = _vec_call(_calc.montgomery_streamfunction,
