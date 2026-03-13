@@ -45,11 +45,14 @@ def _can_convert(value, unit_str):
 def _rh_to_percent(relative_humidity):
     if hasattr(relative_humidity, "to"):
         try:
-            return _as_float(relative_humidity.to("percent").magnitude)
+            return relative_humidity.to("percent").magnitude
         except Exception:
-            return _as_float(relative_humidity.to("").magnitude) * 100.0
-    rh = float(relative_humidity)
-    return rh * 100.0 if abs(rh) <= 1.5 else rh
+            return np.asarray(relative_humidity.to("").magnitude, dtype=np.float64) * 100.0
+    val = np.asarray(relative_humidity, dtype=np.float64)
+    if val.ndim == 0:
+        v = float(val)
+        return v * 100.0 if abs(v) <= 1.5 else v
+    return val
 
 
 def _as_2d(data, unit=None):
@@ -70,6 +73,20 @@ def _as_2d_raw(data):
     else:
         arr = np.asarray(data, dtype=np.float64)
     return np.ascontiguousarray(arr)
+
+
+def _prep(*values):
+    """Convert stripped values to arrays; determine scalar vs array dispatch.
+
+    Returns (processed_values, orig_shape, is_array).
+    """
+    arrays = [np.asarray(v, dtype=np.float64) for v in values]
+    if all(a.ndim == 0 for a in arrays):
+        return [float(a) for a in arrays], (), False
+    shapes = [a.shape for a in arrays if a.ndim > 0]
+    orig_shape = np.broadcast_shapes(*shapes)
+    flat = [np.ascontiguousarray(np.broadcast_to(a, orig_shape).ravel()) for a in arrays]
+    return flat, orig_shape, True
 
 
 def _is_pressure_like(value):
@@ -126,9 +143,12 @@ def potential_temperature(pressure, temperature):
     -------
     Quantity (K)
     """
-    p = _as_float(_strip(pressure, "hPa"))
-    t = _as_float(_strip(temperature, "degC"))
-    return _calc.potential_temperature(p, t) * units.K
+    vals, shape, is_arr = _prep(_strip(pressure, "hPa"), _strip(temperature, "degC"))
+    if is_arr:
+        result = np.asarray(_calc.potential_temperature_array(vals[0], vals[1])).reshape(shape)
+    else:
+        result = _calc.potential_temperature(vals[0], vals[1])
+    return result * units.K
 
 
 def equivalent_potential_temperature(pressure, temperature, dewpoint):
@@ -144,10 +164,12 @@ def equivalent_potential_temperature(pressure, temperature, dewpoint):
     -------
     Quantity (K)
     """
-    p = _as_float(_strip(pressure, "hPa"))
-    t = _as_float(_strip(temperature, "degC"))
-    td = _as_float(_strip(dewpoint, "degC"))
-    return _calc.equivalent_potential_temperature(p, t, td) * units.K
+    vals, shape, is_arr = _prep(_strip(pressure, "hPa"), _strip(temperature, "degC"), _strip(dewpoint, "degC"))
+    if is_arr:
+        result = np.asarray(_calc.equivalent_potential_temperature_array(vals[0], vals[1], vals[2])).reshape(shape)
+    else:
+        result = _calc.equivalent_potential_temperature(vals[0], vals[1], vals[2])
+    return result * units.K
 
 
 def saturation_vapor_pressure(temperature, phase="liquid"):
@@ -166,10 +188,16 @@ def saturation_vapor_pressure(temperature, phase="liquid"):
     -------
     Quantity (hPa)
     """
-    t = _as_float(_strip(temperature, "degC"))
+    t_raw = _strip(temperature, "degC")
     if phase == "liquid":
-        return _attach(_calc.saturation_vapor_pressure(t) * 100.0, "Pa")
+        vals, shape, is_arr = _prep(t_raw)
+        if is_arr:
+            result = np.asarray(_calc.saturation_vapor_pressure_array(vals[0])).reshape(shape) * 100.0
+        else:
+            result = _calc.saturation_vapor_pressure(vals[0]) * 100.0
+        return _attach(result, "Pa")
     # ice / auto -- Ambaum (2020) ice-phase SVP (same as Rust impl)
+    t = _as_float(t_raw)
     return _attach(_svp_with_phase(t, phase) * 100.0, "Pa")
 
 
@@ -187,11 +215,18 @@ def saturation_mixing_ratio(pressure, temperature, phase="liquid"):
     -------
     Quantity (dimensionless, kg/kg)
     """
-    p = _as_float(_strip(pressure, "hPa"))
-    t = _as_float(_strip(temperature, "degC"))
+    p_raw = _strip(pressure, "hPa")
+    t_raw = _strip(temperature, "degC")
     if phase == "liquid":
-        return _attach(_calc.saturation_mixing_ratio(p, t) / 1000.0, "kg/kg")
+        vals, shape, is_arr = _prep(p_raw, t_raw)
+        if is_arr:
+            result = np.asarray(_calc.saturation_mixing_ratio_array(vals[0], vals[1])).reshape(shape) / 1000.0
+        else:
+            result = _calc.saturation_mixing_ratio(vals[0], vals[1]) / 1000.0
+        return _attach(result, "kg/kg")
     # ice / auto
+    p = _as_float(p_raw)
+    t = _as_float(t_raw)
     _EPS = 0.6219569100577033
     es = _svp_with_phase(t, phase)
     return _attach(max((_EPS * es / (p - es)), 0.0) / 1000.0, "kg/kg")
@@ -210,10 +245,12 @@ def wet_bulb_temperature(pressure, temperature, dewpoint):
     -------
     Quantity (degC)
     """
-    p = _as_float(_strip(pressure, "hPa"))
-    t = _as_float(_strip(temperature, "degC"))
-    td = _as_float(_strip(dewpoint, "degC"))
-    return _calc.wet_bulb_temperature(p, t, td) * units.degC
+    vals, shape, is_arr = _prep(_strip(pressure, "hPa"), _strip(temperature, "degC"), _strip(dewpoint, "degC"))
+    if is_arr:
+        result = np.asarray(_calc.wet_bulb_temperature_array(vals[0], vals[1], vals[2])).reshape(shape)
+    else:
+        result = _calc.wet_bulb_temperature(vals[0], vals[1], vals[2])
+    return result * units.degC
 
 
 def lfc(pressure, temperature, dewpoint):
@@ -291,9 +328,14 @@ def dewpoint_from_relative_humidity(temperature, relative_humidity):
     -------
     Quantity (degC)
     """
-    t = _as_float(_strip(temperature, "degC"))
+    t_raw = _strip(temperature, "degC")
     rh = _rh_to_percent(relative_humidity)
-    return _attach(_calc.dewpoint_from_relative_humidity(t, rh), "degC")
+    vals, shape, is_arr = _prep(t_raw, rh)
+    if is_arr:
+        result = np.asarray(_calc.dewpoint_from_rh_array(vals[0], vals[1])).reshape(shape)
+    else:
+        result = _calc.dewpoint_from_relative_humidity(vals[0], vals[1])
+    return _attach(result, "degC")
 
 
 def relative_humidity_from_dewpoint(temperature, dewpoint, phase="liquid"):
@@ -310,11 +352,18 @@ def relative_humidity_from_dewpoint(temperature, dewpoint, phase="liquid"):
     -------
     Quantity (dimensionless, 0-1)
     """
-    t = _as_float(_strip(temperature, "degC"))
-    td = _as_float(_strip(dewpoint, "degC"))
+    t_raw = _strip(temperature, "degC")
+    td_raw = _strip(dewpoint, "degC")
     if phase == "liquid":
-        return _attach(_calc.relative_humidity_from_dewpoint(t, td) / 100.0, "")
+        vals, shape, is_arr = _prep(t_raw, td_raw)
+        if is_arr:
+            result = np.asarray(_calc.rh_from_dewpoint_array(vals[0], vals[1])).reshape(shape) / 100.0
+        else:
+            result = _calc.relative_humidity_from_dewpoint(vals[0], vals[1]) / 100.0
+        return _attach(result, "")
     # e(Td) / es(T) with requested phase
+    t = _as_float(t_raw)
+    td = _as_float(td_raw)
     e_td = _svp_with_phase(td, "liquid")  # actual vapor pressure always liquid
     es_t = _svp_with_phase(t, phase)
     return _attach(e_td / es_t, "")
@@ -346,10 +395,16 @@ def virtual_temperature(temperature, pressure_or_mixing_ratio, dewpoint=None,
         t_k = t + 273.15
         tv_k = t_k * (1.0 + w / eps) / (1.0 + w)
         return _attach(tv_k - 273.15, "degC")
-    t = _as_float(_strip(temperature, "degC"))
-    p = _as_float(_strip(pressure_or_mixing_ratio, "hPa"))
-    td = _as_float(_strip(dewpoint, "degC"))
-    return _attach(_calc.virtual_temperature(t, p, td), "degC")
+    vals, shape, is_arr = _prep(
+        _strip(temperature, "degC"),
+        _strip(pressure_or_mixing_ratio, "hPa"),
+        _strip(dewpoint, "degC"),
+    )
+    if is_arr:
+        result = np.asarray(_calc.virtual_temp_array(vals[0], vals[1], vals[2])).reshape(shape)
+    else:
+        result = _calc.virtual_temperature(vals[0], vals[1], vals[2])
+    return _attach(result, "degC")
 
 
 def virtual_temperature_from_dewpoint(pressure, temperature, dewpoint,
@@ -460,9 +515,15 @@ def mixing_ratio(partial_press_or_pressure, total_press_or_temperature,
     Quantity (dimensionless, kg/kg)
     """
     if _is_temperature_like(total_press_or_temperature):
-        p = _as_float(_strip(partial_press_or_pressure, "hPa"))
-        t = _as_float(_strip(total_press_or_temperature, "degC"))
-        return _attach(_calc.mixing_ratio(p, t) / 1000.0, "kg/kg")
+        vals, shape, is_arr = _prep(
+            _strip(partial_press_or_pressure, "hPa"),
+            _strip(total_press_or_temperature, "degC"),
+        )
+        if is_arr:
+            result = np.asarray(_calc.mixing_ratio_array(vals[0], vals[1])).reshape(shape) / 1000.0
+        else:
+            result = _calc.mixing_ratio(vals[0], vals[1]) / 1000.0
+        return _attach(result, "kg/kg")
     # partial_pressure / total_pressure path: w = eps * e / (p - e)
     e = _as_float(_strip(partial_press_or_pressure, "Pa"))
     p = _as_float(_strip(total_press_or_temperature, "Pa"))
@@ -926,8 +987,13 @@ def vapor_pressure(pressure_or_dewpoint, mixing_ratio=None,
         pressure_pa = _attach(_as_float(_strip(pressure_or_dewpoint, "Pa")), "Pa")
         mixing_ratio_val = _attach(_as_float(_strip(mixing_ratio, "kg/kg")), "kg/kg")
         return pressure_pa * mixing_ratio_val / (molecular_weight_ratio + mixing_ratio_val)
-    td = _as_float(_strip(pressure_or_dewpoint, "degC"))
-    return _attach(_calc.vapor_pressure(td) * 100.0, "Pa")
+    td_raw = _strip(pressure_or_dewpoint, "degC")
+    vals, shape, is_arr = _prep(td_raw)
+    if is_arr:
+        result = np.asarray(_calc.vapor_pressure_array(vals[0])).reshape(shape) * 100.0
+    else:
+        result = _calc.vapor_pressure(vals[0]) * 100.0
+    return _attach(result, "Pa")
 
 
 def specific_humidity_from_mixing_ratio(mixing_ratio):
@@ -1035,10 +1101,15 @@ def density(pressure, temperature, mixing_ratio):
     -------
     Quantity (kg/m^3)
     """
-    p = _as_float(_strip(pressure, "hPa"))
-    t = _as_float(_strip(temperature, "degC"))
-    w = _as_float(_strip(mixing_ratio, "g/kg")) if _can_convert(mixing_ratio, "g/kg") else _as_float(_strip(mixing_ratio, "kg/kg")) * 1000.0
-    return _calc.density(p, t, w) * units("kg/m**3")
+    p_raw = _strip(pressure, "hPa")
+    t_raw = _strip(temperature, "degC")
+    w_raw = _strip(mixing_ratio, "g/kg") if _can_convert(mixing_ratio, "g/kg") else np.asarray(_strip(mixing_ratio, "kg/kg"), dtype=np.float64) * 1000.0
+    vals, shape, is_arr = _prep(p_raw, t_raw, w_raw)
+    if is_arr:
+        result = np.asarray(_calc.density_array(vals[0], vals[1], vals[2])).reshape(shape)
+    else:
+        result = _calc.density(vals[0], vals[1], vals[2])
+    return result * units("kg/m**3")
 
 
 def dewpoint(vapor_pressure_val):
@@ -1119,8 +1190,12 @@ def exner_function(pressure):
     -------
     Quantity (dimensionless)
     """
-    p = _as_float(_strip(pressure, "hPa"))
-    return _calc.exner_function(p) * units.dimensionless
+    vals, shape, is_arr = _prep(_strip(pressure, "hPa"))
+    if is_arr:
+        result = np.asarray(_calc.exner_function_array(vals[0])).reshape(shape)
+    else:
+        result = _calc.exner_function(vals[0])
+    return result * units.dimensionless
 
 
 def find_intersections(x, y1, y2):
