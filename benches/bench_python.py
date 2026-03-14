@@ -332,7 +332,7 @@ def _bench_wind(tiers):
     if 2 in tiers:
         mc = _import_metrust()
         results.append(run_bench(name, 2, "T2 metrust+Pint",
-                                 lambda: mc.bulk_shear(u_p, v_p, z_p, 0.0, 6000.0)))
+                                 lambda: mc.bulk_shear(u_p, v_p, z_p, bottom=0.0, top=6000.0)))
     if 3 in tiers:
         results.append(skip_bench(name, 3, "T3 MetPy+Pint",
                                   "MetPy bulk_shear API differs"))
