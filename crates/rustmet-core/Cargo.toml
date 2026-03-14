@@ -1,6 +1,6 @@
 [package]
 name = "rustmet-core"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2021"
 description = "Pure Rust GRIB2 processor and weather model data library — HRRR, GFS, NAM, RAP"
 license = "MIT"

@@ -10,6 +10,9 @@ pub use wx_math::regrid::{
     cross_section_data, interpolate_vertical,
 };
 
+// ── Re-exports from wx-math interpolate ─────────────────────────────
+pub use wx_math::interpolate::inverse_distance_to_points;
+
 // ── Convenience wrapper ─────────────────────────────────────────────
 
 /// Interpolate scattered values onto a regular lat/lon grid.
@@ -270,12 +273,15 @@ pub fn inverse_distance_to_grid(
     out
 }
 
-/// Inverse distance weighted (IDW) interpolation to arbitrary points.
+/// Inverse distance weighted (IDW) interpolation to arbitrary points (legacy API).
 ///
 /// Same algorithm as [`inverse_distance_to_grid`] but evaluates at
 /// the supplied `(target_lats, target_lons)` positions instead of a
 /// regular grid.
-pub fn inverse_distance_to_points(
+///
+/// For the newer Barnes/Cressman-capable variant, see the re-exported
+/// [`inverse_distance_to_points`] from `wx_math::interpolate`.
+pub fn inverse_distance_to_points_legacy(
     src_lats: &[f64],
     src_lons: &[f64],
     src_values: &[f64],
@@ -627,7 +633,7 @@ pub fn interpolate_to_points(
         }
         _ => {
             // Default to inverse distance (idw / linear)
-            inverse_distance_to_points(
+            inverse_distance_to_points_legacy(
                 src_lats, src_lons, src_values,
                 target_lats, target_lons,
                 2.0,    // power
@@ -1000,7 +1006,7 @@ mod tests {
         // Target at midpoint.
         let tgt_lats = vec![31.0];
         let tgt_lons = vec![-90.0];
-        let out = inverse_distance_to_points(
+        let out = inverse_distance_to_points_legacy(
             &src_lats, &src_lons, &src_vals,
             &tgt_lats, &tgt_lons,
             2.0, 1, 5.0,
@@ -1017,7 +1023,7 @@ mod tests {
         // Target exactly at first source point.
         let tgt_lats = vec![40.0];
         let tgt_lons = vec![-80.0];
-        let out = inverse_distance_to_points(
+        let out = inverse_distance_to_points_legacy(
             &src_lats, &src_lons, &src_vals,
             &tgt_lats, &tgt_lons,
             2.0, 1, 10.0,

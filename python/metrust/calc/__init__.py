@@ -5105,6 +5105,374 @@ def zoom_xarray(input_field, zoom, output=None, order=3, mode="constant",
     return result
 
 
+# ---------------------------------------------------------------------------
+# Interpolation functions (MetPy compatibility)
+# ---------------------------------------------------------------------------
+
+def _idw_fallback(obs_x, obs_y, obs_values, grid_x, grid_y, radius,
+                  min_neighbors, kind_int, kappa, gamma):
+    """Pure-Python fallback for inverse-distance interpolation using cKDTree."""
+    from scipy.spatial import cKDTree
+    obs_points = np.column_stack([obs_x, obs_y])
+    query_points = np.column_stack([grid_x, grid_y])
+    tree = cKDTree(obs_points)
+    result = np.full(len(grid_x), np.nan)
+    for i, qp in enumerate(query_points):
+        idx = tree.query_ball_point(qp, radius)
+        if len(idx) < min_neighbors:
+            continue
+        dists = np.sqrt(np.sum((obs_points[idx] - qp) ** 2, axis=1))
+        dists = np.maximum(dists, 1e-12)
+        if kind_int == 0:  # cressman
+            weights = (radius ** 2 - dists ** 2) / (radius ** 2 + dists ** 2)
+        else:  # barnes
+            weights = np.exp(-dists ** 2 / (kappa if kappa else radius ** 2))
+        weights = np.maximum(weights, 0.0)
+        wsum = weights.sum()
+        if wsum > 0:
+            result[i] = np.sum(weights * np.asarray(obs_values)[idx]) / wsum
+    return result
+
+
+def _call_idw(obs_x, obs_y, obs_values, grid_x, grid_y, r,
+              gamma, kappa, min_neighbors, kind):
+    """Call Rust IDW if available, otherwise fall back to Python."""
+    kind_int = 0 if kind == 'cressman' else 1
+    _gamma = gamma if gamma is not None else 1.0
+    _kappa = kappa if kappa is not None else (r ** 2)
+    try:
+        return _calc.inverse_distance_to_points(
+            np.asarray(obs_x, dtype=np.float64).ravel(),
+            np.asarray(obs_y, dtype=np.float64).ravel(),
+            np.asarray(obs_values, dtype=np.float64).ravel(),
+            np.asarray(grid_x, dtype=np.float64).ravel(),
+            np.asarray(grid_y, dtype=np.float64).ravel(),
+            float(r), int(min_neighbors), kind_int, float(_kappa), float(_gamma),
+        )
+    except AttributeError:
+        return _idw_fallback(
+            np.asarray(obs_x, dtype=np.float64).ravel(),
+            np.asarray(obs_y, dtype=np.float64).ravel(),
+            np.asarray(obs_values, dtype=np.float64).ravel(),
+            np.asarray(grid_x, dtype=np.float64).ravel(),
+            np.asarray(grid_y, dtype=np.float64).ravel(),
+            float(r), int(min_neighbors), kind_int, float(_kappa), float(_gamma),
+        )
+
+
+def inverse_distance_to_grid(xp, yp, variable, grid_x, grid_y, r,
+                              gamma=None, kappa=None, min_neighbors=3,
+                              kind='cressman'):
+    """Interpolate using inverse-distance weighting to a grid.
+
+    Parameters match :func:`metpy.interpolate.inverse_distance_to_grid`.
+    """
+    xp = np.asarray(xp, dtype=np.float64)
+    yp = np.asarray(yp, dtype=np.float64)
+    variable = np.asarray(variable, dtype=np.float64)
+    grid_x = np.asarray(grid_x, dtype=np.float64)
+    grid_y = np.asarray(grid_y, dtype=np.float64)
+    target_shape = grid_x.shape
+    result = _call_idw(xp, yp, variable, grid_x.ravel(), grid_y.ravel(),
+                       r, gamma, kappa, min_neighbors, kind)
+    return np.asarray(result).reshape(target_shape)
+
+
+def inverse_distance_to_points(points, values, xi, r,
+                                gamma=None, kappa=None, min_neighbors=3,
+                                kind='cressman'):
+    """Interpolate using inverse-distance weighting to arbitrary points.
+
+    Parameters match :func:`metpy.interpolate.inverse_distance_to_points`.
+    """
+    points = np.asarray(points, dtype=np.float64)
+    values = np.asarray(values, dtype=np.float64)
+    xi = np.asarray(xi, dtype=np.float64)
+    return np.asarray(_call_idw(
+        points[:, 0], points[:, 1], values,
+        xi[:, 0], xi[:, 1],
+        r, gamma, kappa, min_neighbors, kind,
+    ))
+
+
+def remove_nan_observations(x, y, z):
+    """Remove all observations where any of x, y, or z is NaN."""
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    z = np.asarray(z, dtype=np.float64)
+    mask = ~(np.isnan(x) | np.isnan(y) | np.isnan(z))
+    return x[mask], y[mask], z[mask]
+
+
+def remove_observations_below_value(x, y, z, val=0):
+    """Remove observations where z < val."""
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    z = np.asarray(z, dtype=np.float64)
+    mask = z >= val
+    return x[mask], y[mask], z[mask]
+
+
+def remove_repeat_coordinates(x, y, z):
+    """Remove duplicate (x, y) coordinate pairs, keeping the first."""
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    z = np.asarray(z, dtype=np.float64)
+    coords = np.column_stack([x, y])
+    _, idx = np.unique(coords, axis=0, return_index=True)
+    idx = np.sort(idx)
+    return x[idx], y[idx], z[idx]
+
+
+def interpolate_nans_1d(x, y, kind='linear'):
+    """Interpolate NaN values in a 1D array using scipy interp1d."""
+    from scipy.interpolate import interp1d
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    mask = ~np.isnan(y)
+    if mask.all() or not mask.any():
+        return y.copy()
+    f = interp1d(x[mask], y[mask], kind=kind, bounds_error=False,
+                 fill_value=np.nan)
+    out = y.copy()
+    out[~mask] = f(x[~mask])
+    return out
+
+
+def interpolate_to_grid(x, y, z, interp_type='linear', hres=50000,
+                         minimum_neighbors=3, search_radius=None,
+                         gamma=None, kappa=None, rbf_func='linear',
+                         rbf_smooth=0):
+    """Interpolate observations to a grid.
+
+    Parameters match :func:`metpy.interpolate.interpolate_to_grid`.
+    Supports interp_type = 'linear', 'cressman', 'barnes', 'rbf'.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    z = np.asarray(z, dtype=np.float64)
+    x_min, x_max = x.min(), x.max()
+    y_min, y_max = y.min(), y.max()
+    grid_x_1d = np.arange(x_min, x_max + hres, hres)
+    grid_y_1d = np.arange(y_min, y_max + hres, hres)
+    grid_x, grid_y = np.meshgrid(grid_x_1d, grid_y_1d)
+
+    if interp_type in ('cressman', 'barnes'):
+        r = search_radius if search_radius is not None else hres * 5
+        img = inverse_distance_to_grid(
+            x, y, z, grid_x, grid_y, r,
+            gamma=gamma, kappa=kappa,
+            min_neighbors=minimum_neighbors, kind=interp_type,
+        )
+    elif interp_type == 'rbf':
+        from scipy.interpolate import Rbf
+        rbf = Rbf(x, y, z, function=rbf_func, smooth=rbf_smooth)
+        img = rbf(grid_x, grid_y)
+    else:  # 'linear' or other scipy methods
+        from scipy.interpolate import griddata
+        img = griddata(np.column_stack([x, y]), z,
+                       (grid_x, grid_y), method=interp_type)
+    return grid_x, grid_y, img
+
+
+def interpolate_to_points(points, values, xi, interp_type='linear',
+                           minimum_neighbors=3, search_radius=None,
+                           gamma=None, kappa=None, rbf_func='linear',
+                           rbf_smooth=0):
+    """Interpolate observations to arbitrary points.
+
+    Parameters match :func:`metpy.interpolate.interpolate_to_points`.
+    """
+    points = np.asarray(points, dtype=np.float64)
+    values = np.asarray(values, dtype=np.float64)
+    xi = np.asarray(xi, dtype=np.float64)
+
+    if interp_type in ('cressman', 'barnes'):
+        r = search_radius if search_radius is not None else 100000.0
+        return inverse_distance_to_points(
+            points, values, xi, r,
+            gamma=gamma, kappa=kappa,
+            min_neighbors=minimum_neighbors, kind=interp_type,
+        )
+    elif interp_type == 'rbf':
+        from scipy.interpolate import Rbf
+        rbf = Rbf(points[:, 0], points[:, 1], values,
+                  function=rbf_func, smooth=rbf_smooth)
+        return rbf(xi[:, 0], xi[:, 1])
+    else:
+        from scipy.interpolate import griddata
+        return griddata(points, values, xi, method=interp_type)
+
+
+def natural_neighbor_to_grid(xp, yp, variable, grid_x, grid_y):
+    """Interpolate using natural-neighbor-like method to a grid.
+
+    Uses scipy griddata with ``method='cubic'`` (falls back to 'nearest'
+    if cubic fails).  True Voronoi-based natural neighbor would require
+    MetPy's Delaunay code.
+    """
+    xp = np.asarray(xp, dtype=np.float64)
+    yp = np.asarray(yp, dtype=np.float64)
+    variable = np.asarray(variable, dtype=np.float64)
+    grid_x = np.asarray(grid_x, dtype=np.float64)
+    grid_y = np.asarray(grid_y, dtype=np.float64)
+    from scipy.interpolate import griddata
+    pts = np.column_stack([xp, yp])
+    try:
+        result = griddata(pts, variable, (grid_x, grid_y), method='cubic')
+    except Exception:
+        result = griddata(pts, variable, (grid_x, grid_y), method='nearest')
+    return result
+
+
+def natural_neighbor_to_points(points, values, xi):
+    """Interpolate using natural-neighbor-like method to arbitrary points.
+
+    Uses scipy griddata with ``method='cubic'`` (falls back to 'nearest').
+    """
+    points = np.asarray(points, dtype=np.float64)
+    values = np.asarray(values, dtype=np.float64)
+    xi = np.asarray(xi, dtype=np.float64)
+    from scipy.interpolate import griddata
+    try:
+        return griddata(points, values, xi, method='cubic')
+    except Exception:
+        return griddata(points, values, xi, method='nearest')
+
+
+def interpolate_to_isosurface(level_var, interp_var, level,
+                               bottom_up_search=True):
+    """Interpolate a variable to an isosurface of another variable.
+
+    Thin wrapper around :func:`isentropic_interpolation` for the common
+    case of extracting a single level.
+    """
+    level_var = np.asarray(level_var, dtype=np.float64)
+    interp_var = np.asarray(interp_var, dtype=np.float64)
+    level = float(level)
+    nz = level_var.shape[0]
+    shape_2d = level_var.shape[1:]
+    result = np.full(shape_2d, np.nan)
+    rng = range(nz - 1) if bottom_up_search else range(nz - 2, -1, -1)
+    for k in rng:
+        k_above = k + 1 if bottom_up_search else k - 1
+        if k_above < 0 or k_above >= nz:
+            continue
+        below = level_var[k]
+        above = level_var[k_above]
+        mask_lower = np.minimum(below, above) <= level
+        mask_upper = np.maximum(below, above) >= level
+        mask = mask_lower & mask_upper & np.isnan(result)
+        if not mask.any():
+            continue
+        denom = above[mask] - below[mask]
+        denom = np.where(np.abs(denom) < 1e-12, 1e-12, denom)
+        frac = (level - below[mask]) / denom
+        result[mask] = (interp_var[k][mask] +
+                        frac * (interp_var[k_above][mask] - interp_var[k][mask]))
+    return result
+
+
+def interpolate_1d(x, xp, *args, axis=0, fill_value=np.nan,
+                   return_list_always=False):
+    """Interpolate 1D data along an axis.
+
+    Parameters match :func:`metpy.interpolate.interpolate_1d`.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    xp = np.asarray(xp, dtype=np.float64)
+    results = []
+    for a in args:
+        a = np.asarray(a, dtype=np.float64)
+        if a.ndim == 1:
+            results.append(np.interp(x, xp, a, left=fill_value,
+                                     right=fill_value))
+        else:
+            # Move interpolation axis to front, interp along it, move back
+            a_moved = np.moveaxis(a, axis, 0)
+            shape_rest = a_moved.shape[1:]
+            out_shape = (len(x),) + shape_rest
+            out = np.full(out_shape, fill_value)
+            for idx in np.ndindex(shape_rest):
+                out[(slice(None),) + idx] = np.interp(
+                    x, xp, a_moved[(slice(None),) + idx],
+                    left=fill_value, right=fill_value,
+                )
+            results.append(np.moveaxis(out, 0, axis))
+    if len(results) == 1 and not return_list_always:
+        return results[0]
+    return results
+
+
+def log_interpolate_1d(x, xp, *args, axis=0, fill_value=np.nan):
+    """Interpolate in log-space along an axis.
+
+    Parameters match :func:`metpy.interpolate.log_interpolate_1d`.
+    """
+    log_x = np.log(np.asarray(x, dtype=np.float64))
+    log_xp = np.log(np.asarray(xp, dtype=np.float64))
+    return interpolate_1d(log_x, log_xp, *args, axis=axis,
+                          fill_value=fill_value, return_list_always=True)
+
+
+def cross_section(data, start, end, steps=100, interp_type='linear'):
+    """Extract a cross-section from gridded data.
+
+    Forwards to :func:`metpy.interpolate.cross_section` if available.
+    """
+    try:
+        from metpy.interpolate import cross_section as _mp_cross_section
+        return _mp_cross_section(data, start, end, steps=steps,
+                                 interp_type=interp_type)
+    except ImportError:
+        raise NotImplementedError(
+            "cross_section requires metpy with xarray/cartopy support. "
+            "Install metpy to use this function."
+        )
+
+
+def interpolate_to_slice(data, points, interp_type='linear'):
+    """Interpolate data to a slice along a set of points.
+
+    Forwards to :func:`metpy.interpolate.interpolate_to_slice` if available.
+    """
+    try:
+        from metpy.interpolate import interpolate_to_slice as _mp_slice
+        return _mp_slice(data, points, interp_type=interp_type)
+    except ImportError:
+        raise NotImplementedError(
+            "interpolate_to_slice requires metpy with xarray/cartopy support. "
+            "Install metpy to use this function."
+        )
+
+
+def geodesic(crs, start, end, steps):
+    """Calculate points along a geodesic between two points.
+
+    Forwards to :func:`metpy.interpolate.geodesic` if available, otherwise
+    uses pyproj.Geod for the calculation.
+    """
+    try:
+        from metpy.interpolate import geodesic as _mp_geodesic
+        return _mp_geodesic(crs, start, end, steps)
+    except ImportError:
+        pass
+    try:
+        from pyproj import Geod
+        g = Geod(ellps='WGS84')
+        lon_start, lat_start = start
+        lon_end, lat_end = end
+        pts = g.npts(lon_start, lat_start, lon_end, lat_end, steps)
+        lons = [lon_start] + [p[0] for p in pts] + [lon_end]
+        lats = [lat_start] + [p[1] for p in pts] + [lat_end]
+        return np.array(list(zip(lons, lats)))
+    except ImportError:
+        raise NotImplementedError(
+            "geodesic requires either metpy or pyproj. "
+            "Install one of them to use this function."
+        )
+
+
 # __all__ -- explicit public API
 # ============================================================================
 
@@ -5305,6 +5673,23 @@ __all__ = [
     "parcel_profile_with_lcl_as_dataset",
     "isentropic_interpolation_as_dataset",
     "zoom_xarray",
+    # interpolation
+    "inverse_distance_to_grid",
+    "inverse_distance_to_points",
+    "remove_nan_observations",
+    "remove_observations_below_value",
+    "remove_repeat_coordinates",
+    "interpolate_nans_1d",
+    "interpolate_to_grid",
+    "interpolate_to_points",
+    "natural_neighbor_to_grid",
+    "natural_neighbor_to_points",
+    "interpolate_to_isosurface",
+    "interpolate_1d",
+    "log_interpolate_1d",
+    "cross_section",
+    "interpolate_to_slice",
+    "geodesic",
 ]
 
 _COMPAT_ALIASES = {

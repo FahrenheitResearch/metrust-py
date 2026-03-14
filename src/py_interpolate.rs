@@ -484,7 +484,7 @@ fn inverse_distance_to_grid<'py>(
 /// search_radius : search radius in degrees
 #[pyfunction]
 #[pyo3(text_signature = "(src_lats, src_lons, src_values, target_lats, target_lons, power, min_neighbors, search_radius)")]
-fn inverse_distance_to_points<'py>(
+fn inverse_distance_to_points_legacy<'py>(
     py: Python<'py>,
     src_lats: PyReadonlyArray1<f64>,
     src_lons: PyReadonlyArray1<f64>,
@@ -495,7 +495,7 @@ fn inverse_distance_to_points<'py>(
     min_neighbors: usize,
     search_radius: f64,
 ) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let result = metrust::interpolate::inverse_distance_to_points(
+    let result = metrust::interpolate::inverse_distance_to_points_legacy(
         src_lats.as_slice()?,
         src_lons.as_slice()?,
         src_values.as_slice()?,
@@ -505,6 +505,62 @@ fn inverse_distance_to_points<'py>(
         min_neighbors,
         search_radius,
     );
+    Ok(result.into_pyarray(py))
+}
+
+/// Inverse distance weighted interpolation to arbitrary target points
+/// (Barnes / Cressman family).
+///
+/// Uses the `wx_math::interpolate::inverse_distance_to_points` implementation
+/// which supports multiple IDW variants via the `kind` parameter:
+///
+/// * `kind=0` -- standard IDW (1/d^2 weighting)
+/// * `kind=1` -- Barnes scheme (Gaussian weight with `kappa` and `gamma`)
+/// * `kind=2` -- Cressman scheme (parabolic weight within `radius`)
+///
+/// Parameters
+/// ----------
+/// obs_x : array of observation x-coordinates (e.g. longitude or projected x)
+/// obs_y : array of observation y-coordinates (e.g. latitude or projected y)
+/// obs_values : array of observation values
+/// grid_x : array of target x-coordinates
+/// grid_y : array of target y-coordinates
+/// radius : search radius (same units as coordinates)
+/// min_neighbors : minimum number of neighbors required (default 3; NaN if fewer)
+/// kind : interpolation variant (0=IDW, 1=Barnes, 2=Cressman; default 0)
+/// kappa : smoothing parameter for Barnes scheme (default 100000.0)
+/// gamma : convergence parameter for Barnes scheme (default 0.2)
+///
+/// Returns a 1-D array of interpolated values at the target points.
+#[pyfunction]
+#[pyo3(signature = (obs_x, obs_y, obs_values, grid_x, grid_y, radius, min_neighbors=3, kind=0, kappa=100000.0, gamma=0.2))]
+fn inverse_distance_to_points<'py>(
+    py: Python<'py>,
+    obs_x: PyReadonlyArray1<f64>,
+    obs_y: PyReadonlyArray1<f64>,
+    obs_values: PyReadonlyArray1<f64>,
+    grid_x: PyReadonlyArray1<f64>,
+    grid_y: PyReadonlyArray1<f64>,
+    radius: f64,
+    min_neighbors: usize,
+    kind: u8,
+    kappa: f64,
+    gamma: f64,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let ox = obs_x.as_slice()?;
+    let oy = obs_y.as_slice()?;
+    let ov = obs_values.as_slice()?;
+    let gx = grid_x.as_slice()?;
+    let gy = grid_y.as_slice()?;
+
+    let result = py.allow_threads(|| {
+        metrust::interpolate::inverse_distance_to_points(
+            ox, oy, ov,
+            gx, gy,
+            radius, min_neighbors,
+            kind, kappa, gamma,
+        )
+    });
     Ok(result.into_pyarray(py))
 }
 
@@ -771,6 +827,7 @@ pub fn register(_py: Python, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     // IDW
     parent.add_function(wrap_pyfunction!(inverse_distance_to_grid, parent)?)?;
     parent.add_function(wrap_pyfunction!(inverse_distance_to_points, parent)?)?;
+    parent.add_function(wrap_pyfunction!(inverse_distance_to_points_legacy, parent)?)?;
 
     // Natural neighbor
     parent.add_function(wrap_pyfunction!(natural_neighbor_to_grid, parent)?)?;

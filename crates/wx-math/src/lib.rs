@@ -8,3 +8,4 @@ pub mod dynamics;
 pub mod gridmath;
 pub mod composite;
 pub mod regrid;
+pub mod interpolate;
