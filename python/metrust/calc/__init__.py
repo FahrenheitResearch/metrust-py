@@ -5141,7 +5141,8 @@ def _call_idw(obs_x, obs_y, obs_values, grid_x, grid_y, r,
     _gamma = gamma if gamma is not None else 1.0
     _kappa = kappa if kappa is not None else (r ** 2)
     try:
-        return _calc.inverse_distance_to_points(
+        from metrust._metrust import interpolate as _interp
+        return _interp.inverse_distance_to_points(
             np.asarray(obs_x, dtype=np.float64).ravel(),
             np.asarray(obs_y, dtype=np.float64).ravel(),
             np.asarray(obs_values, dtype=np.float64).ravel(),
