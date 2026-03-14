@@ -23,7 +23,10 @@ Rust-native conventions
 """
 
 import numpy as np
-import xarray as xr
+try:
+    import xarray as xr
+except ImportError:
+    xr = None
 from metrust._metrust import calc as _calc
 from metrust.units import units, _strip, _strip_or_none, _attach, _as_float, _as_1d
 

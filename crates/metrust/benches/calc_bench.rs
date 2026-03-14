@@ -299,7 +299,8 @@ fn bench_wind(c: &mut Criterion) {
     });
 
     group.bench_function("bunkers_storm_motion_100", |b| {
-        b.iter(|| wind::bunkers_storm_motion(&u, &v, &z))
+        let p: Vec<f64> = z.iter().map(|h| 1013.25 * (1.0 - 0.0065 * h / 288.15_f64).powf(5.2561)).collect();
+        b.iter(|| wind::bunkers_storm_motion(&p, &u, &v, &z))
     });
 
     group.bench_function("corfidi_storm_motion_100", |b| {
