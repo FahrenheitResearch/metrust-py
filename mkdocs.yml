@@ -92,5 +92,19 @@ nav:
     - Your First Grid Analysis: tutorials/first-grid.md
     - Reading the Numbers: tutorials/reading-the-numbers.md
     - Recipes & Workflows: tutorials/recipes.md
+  - Methodology:
+    - Overview: methodology/index.md
+    - Thermodynamics: methodology/thermodynamics.md
+    - Wind: methodology/wind.md
+    - Grid Kinematics: methodology/grid-kinematics.md
+    - Smoothing: methodology/smoothing.md
+    - Severe Weather: methodology/severe-weather.md
+    - Interpolation: methodology/interpolation.md
+    - Moisture: methodology/moisture.md
+    - Units and Pint: methodology/units.md
+    - MetPy Compatibility: methodology/metpy-compat.md
+    - Parallelism: methodology/parallelism.md
+    - Architecture: methodology/architecture.md
+    - I/O Formats: methodology/io-formats.md
   - Performance: performance.md
   - Compatibility: compatibility.md
