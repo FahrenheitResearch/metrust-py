@@ -3014,22 +3014,36 @@ def advection(scalar, *args, dx=None, dy=None, dz=None, x_dim=-1, y_dim=-2,
     if dx is None or dy is None:
         raise TypeError("advection requires dx/dy or inferable latitude/longitude coordinates")
     has_units = hasattr(scalar, "units")
-    s_f = _flat(scalar)
-    u_f = _flat(u, "m/s")
-    v_f = _flat(v, "m/s")
-    dx_val = _mean_spacing(dx, "m")
-    dy_val = _mean_spacing(dy, "m")
-    result = np.asarray(_calc.advection(s_f, u_f, v_f, dx_val, dy_val))
+
+    # Build output unit string safely
     if has_units:
-        # Build output unit safely — scalar.units may be a string (xarray attr)
-        # or a Pint Unit from either metrust or MetPy registry.
         try:
             s_u = units.Unit(str(scalar.units))
         except Exception:
             s_u = units.dimensionless
-        out = _wrap_result_like(scalar, result, str(s_u / units.s))
-        return out
-    return _wrap_result_like(scalar, result, "1/s")
+        out_unit = str(s_u / units.s)
+    else:
+        out_unit = "1/s"
+
+    # Check for variable spacing (lat/lon grids)
+    dx_m = np.asarray(dx.to("m").magnitude if hasattr(dx, "to") else dx, dtype=np.float64)
+    dy_m = np.asarray(dy.to("m").magnitude if hasattr(dy, "to") else dy, dtype=np.float64)
+
+    if _is_variable_spacing(dx) or _is_variable_spacing(dy) or dx_m.ndim >= 2:
+        # Variable-spacing: compute gradients with full 2D dx/dy
+        s_arr = _flat(scalar)
+        u_arr = _flat(u, "m/s")
+        v_arr = _flat(v, "m/s")
+        dsdx = _first_derivative_variable(s_arr, dx_m, axis=-1)
+        dsdy = _first_derivative_variable(s_arr, dy_m, axis=-2)
+        result = -(u_arr * dsdx + v_arr * dsdy)
+        return _wrap_result_like(scalar, result, out_unit)
+
+    # Uniform spacing: fast Rust path
+    dx_val = float(dx_m.mean()) if dx_m.ndim > 0 else float(dx_m)
+    dy_val = float(dy_m.mean()) if dy_m.ndim > 0 else float(dy_m)
+    result = np.asarray(_calc.advection(_flat(scalar), _flat(u, "m/s"), _flat(v, "m/s"), dx_val, dy_val))
+    return _wrap_result_like(scalar, result, out_unit)
 
 
 def frontogenesis(theta, u, v, dx=None, dy=None, x_dim=-1, y_dim=-2,
@@ -3052,13 +3066,31 @@ def frontogenesis(theta, u, v, dx=None, dy=None, x_dim=-1, y_dim=-2,
         dx, dy = _resolve_dx_dy(u, dx=dx, dy=dy, latitude=latitude, longitude=longitude)
     if dx is None or dy is None:
         raise TypeError("frontogenesis requires dx/dy or inferable latitude/longitude coordinates")
-    t_f = _flat(theta, "K")
-    u_f = _flat(u, "m/s")
-    v_f = _flat(v, "m/s")
-    dx_val = _mean_spacing(dx, "m")
-    dy_val = _mean_spacing(dy, "m")
-    result = np.asarray(_calc.frontogenesis(t_f, u_f, v_f, dx_val, dy_val))
-    return result * units("K/m/s")
+    t_arr = np.asarray(_strip(theta, "K"), dtype=np.float64)
+    u_arr = np.asarray(_strip(u, "m/s"), dtype=np.float64)
+    v_arr = np.asarray(_strip(v, "m/s"), dtype=np.float64)
+    dx_m = np.asarray(dx.to("m").magnitude if hasattr(dx, "to") else dx, dtype=np.float64)
+    dy_m = np.asarray(dy.to("m").magnitude if hasattr(dy, "to") else dy, dtype=np.float64)
+
+    if _is_variable_spacing(dx) or _is_variable_spacing(dy) or dx_m.ndim >= 2:
+        # Variable-spacing: compute frontogenesis with full 2D dx/dy
+        dtdx = _first_derivative_variable(t_arr, dx_m, axis=-1)
+        dtdy = _first_derivative_variable(t_arr, dy_m, axis=-2)
+        dudx = _first_derivative_variable(u_arr, dx_m, axis=-1)
+        dvdy = _first_derivative_variable(v_arr, dy_m, axis=-2)
+        dudy = _first_derivative_variable(u_arr, dy_m, axis=-2)
+        dvdx = _first_derivative_variable(v_arr, dx_m, axis=-1)
+        mag_t = np.sqrt(dtdx**2 + dtdy**2)
+        mag_t = np.where(mag_t < 1e-30, np.nan, mag_t)
+        result = -0.5 * mag_t * (
+            (dtdx**2 * dudx + dtdy**2 * dvdy + (dtdx * dtdy) * (dvdx + dudy)) / (mag_t**2)
+        )
+        return _wrap_result_like(theta, result, "K/m/s")
+
+    dx_val = float(dx_m.mean()) if dx_m.ndim > 0 else float(dx_m)
+    dy_val = float(dy_m.mean()) if dy_m.ndim > 0 else float(dy_m)
+    result = np.asarray(_calc.frontogenesis(_flat(theta, "K"), _flat(u, "m/s"), _flat(v, "m/s"), dx_val, dy_val))
+    return _wrap_result_like(theta, result, "K/m/s")
 
 
 def geostrophic_wind(heights, dx=None, dy=None, latitude=None, x_dim=-1, y_dim=-2,
@@ -3089,10 +3121,29 @@ def geostrophic_wind(heights, dx=None, dy=None, latitude=None, x_dim=-1, y_dim=-
     dx, dy = _resolve_dx_dy(heights, dx=dx, dy=dy, latitude=latitude, longitude=longitude)
     if dx is None or dy is None or latitude is None:
         raise TypeError("geostrophic_wind requires latitude plus dx/dy or inferable coordinates")
+    h_arr = np.asarray(_strip(heights, "m"), dtype=np.float64)
+    lat_arr = np.asarray(latitude.magnitude if hasattr(latitude, "magnitude") else latitude, dtype=np.float64)
+    dx_m = np.asarray(dx.to("m").magnitude if hasattr(dx, "to") else dx, dtype=np.float64)
+    dy_m = np.asarray(dy.to("m").magnitude if hasattr(dy, "to") else dy, dtype=np.float64)
+
+    if _is_variable_spacing(dx) or _is_variable_spacing(dy) or dx_m.ndim >= 2:
+        # Variable-spacing: compute geostrophic wind with full 2D dx/dy
+        # u_g = -(g/f) * dZ/dy,  v_g = (g/f) * dZ/dx
+        g = 9.80665
+        omega = 7.2921159e-5
+        lat_2d = lat_arr if lat_arr.ndim == 2 else np.broadcast_to(lat_arr[:, None], h_arr.shape)
+        f = 2.0 * omega * np.sin(np.deg2rad(lat_2d))
+        f = np.where(np.abs(f) < 1e-10, np.nan, f)
+        dzdx = _first_derivative_variable(h_arr, dx_m, axis=-1)
+        dzdy = _first_derivative_variable(h_arr, dy_m, axis=-2)
+        u_g = -(g / f) * dzdy
+        v_g = (g / f) * dzdx
+        return _wrap_result_like(heights, u_g, "m/s"), _wrap_result_like(heights, v_g, "m/s")
+
     h_f = _as_2d(heights, "m")
     lats_f = _as_2d(latitude, "degree") if hasattr(latitude, "magnitude") else _as_2d(latitude)
-    dx_val = _mean_spacing(dx, "m")
-    dy_val = _mean_spacing(dy, "m")
+    dx_val = float(dx_m.mean()) if dx_m.ndim > 0 else float(dx_m)
+    dy_val = float(dy_m.mean()) if dy_m.ndim > 0 else float(dy_m)
     u_g, v_g = _calc.geostrophic_wind(h_f, lats_f, dx_val, dy_val)
     ms = units("m/s")
     return np.asarray(u_g) * ms, np.asarray(v_g) * ms
