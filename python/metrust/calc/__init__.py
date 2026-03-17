@@ -3656,21 +3656,28 @@ def geospatial_laplacian(data, lats, lons):
 # Severe weather composite parameters
 # ============================================================================
 
-def significant_tornado_parameter(mlcape, lcl_height, srh_0_1km, bulk_shear_0_6km):
-    """Significant Tornado Parameter (STP).
+def significant_tornado_parameter(sbcape, lcl_height, srh_0_1km, bulk_shear_0_6km):
+    """Significant Tornado Parameter (fixed-layer STP).
+
+    Uses surface-based parcel CAPE and LCL height (not mixed-layer).
+    Matches MetPy's ``significant_tornado`` formula exactly.
 
     Parameters
     ----------
-    mlcape : Quantity (J/kg)
+    sbcape : Quantity (J/kg)
+        Surface-based CAPE.
     lcl_height : Quantity (m)
+        Surface-based LCL height AGL.
     srh_0_1km : Quantity (m^2/s^2)
+        0-1 km storm-relative helicity.
     bulk_shear_0_6km : Quantity (m/s)
+        0-6 km bulk wind shear magnitude.
 
     Returns
     -------
     Quantity (dimensionless)
     """
-    cape = _as_float(_strip(mlcape, "J/kg"))
+    cape = _as_float(_strip(sbcape, "J/kg"))
     lcl = _as_float(_strip(lcl_height, "m"))
     srh = _as_float(_strip(srh_0_1km, "m**2/s**2"))
     shear = _as_float(_strip(bulk_shear_0_6km, "m/s"))

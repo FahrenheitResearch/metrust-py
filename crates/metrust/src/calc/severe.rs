@@ -102,13 +102,14 @@ pub mod grid {
 /// 2003: Close proximity soundings within supercell environments obtained from
 /// the Rapid Update Cycle. *Wea. Forecasting*, **18**, 1243-1261.
 pub fn significant_tornado_parameter(
-    mlcape: f64,
+    sbcape: f64,
     lcl_height_m: f64,
     srh_0_1km: f64,
     bulk_shear_0_6km_ms: f64,
 ) -> f64 {
-    // CAPE term: mlCAPE / 1500, floored at 0
-    let cape_term = (mlcape / 1500.0).max(0.0);
+    // CAPE term: SBCAPE / 1500, floored at 0
+    // Fixed-layer STP uses surface-based CAPE (not MLCAPE)
+    let cape_term = (sbcape / 1500.0).max(0.0);
 
     // LCL term: (2000 - LCL) / 1000
     //   - Capped at 1.0 when LCL <= 1000 m (very low LCL is always favorable)
