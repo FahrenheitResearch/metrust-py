@@ -111,7 +111,7 @@ The `RadarProduct` enum covers all standard WSR-88D moments:
 
 ## 2. GRIB2
 
-**Crate:** `rustmet-core` (`crates/rustmet-core/src/grib2/`)
+**Crate:** `wx-core` (`crates/wx-core/src/grib2/`)
 
 ### Format overview
 

@@ -18,13 +18,13 @@ crate and the Python cdylib.
 | **wx-field** | Shared type foundation. `Field2D`, `Projection`, `RadialSweep`, `SoundingProfile`, `FieldMeta`, `ValidTime` -- the common data structures every other crate depends on. Minimal dependencies (just `chrono`). |
 | **wx-math** | Pure-math meteorological computations. Submodules: `thermo`, `dynamics`, `gridmath`, `composite`, `regrid`, `interpolate`. Depends only on `wx-field` and `rayon`. No I/O, no rendering. |
 | **wx-radar** | NEXRAD Level-II parser, PPI renderer, color tables, storm cell detection. Depends on `wx-field`, `byteorder`, `bzip2`, `flate2`, `rayon`. |
-| **rustmet-core** | GRIB2 parser/writer, model download client (HRRR/GFS/NAM/RAP/...), rendering pipeline (Skew-T, hodograph, contour, raster), unit conversion, grid operations. Pulls in `wx-field` and `wx-math`. |
+| **wx-core** | GRIB2 parser/writer, model download client (HRRR/GFS/NAM/RAP/...), rendering pipeline (Skew-T, hodograph, contour, raster), unit conversion, grid operations. Pulls in `wx-field` and `wx-math`. |
 
 ### metrust-py crates
 
 | Crate | Role |
 |---|---|
-| **metrust** (library) | The aggregation crate. Re-exports and organises everything into a MetPy-shaped namespace: `calc::{thermo, wind, kinematics, severe, atmo, smooth, utils}`, `constants`, `interpolate`, `io`, `plots`, `projections`, `units`. Depends on `rustmet-core`, `wx-math`, `wx-field`, `wx-radar`. |
+| **metrust** (library) | The aggregation crate. Re-exports and organises everything into a MetPy-shaped namespace: `calc::{thermo, wind, kinematics, severe, atmo, smooth, utils}`, `constants`, `interpolate`, `io`, `plots`, `projections`, `units`. Depends on `wx-core`, `wx-math`, `wx-field`, `wx-radar`. |
 | **metrust-py** (root, cdylib) | The PyO3 extension module. Compiles to `_metrust.pyd` / `_metrust.so`. Depends on `metrust`, `pyo3`, `numpy`, `rayon`. |
 
 ### Dependency graph (simplified)
@@ -33,7 +33,7 @@ crate and the Python cdylib.
 wx-field
   ├── wx-math
   ├── wx-radar
-  └── rustmet-core  (also depends on wx-math)
+  └── wx-core  (also depends on wx-math)
         └── metrust  (also depends on wx-math, wx-field, wx-radar)
               └── metrust-py  (cdylib, links pyo3 + numpy)
                     └── python/metrust/  (pure-Python wrapper layer)

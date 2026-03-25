@@ -16,8 +16,8 @@ pub struct DiskCache {
 impl DiskCache {
     /// Create a new cache using the platform-specific default directory.
     ///
-    /// - Linux/macOS: `~/.cache/rustmet/`
-    /// - Windows: `%LOCALAPPDATA%/rustmet/cache/`
+    /// - Linux/macOS: `~/.cache/metrust/`
+    /// - Windows: `%LOCALAPPDATA%/metrust/cache/`
     pub fn new() -> Self {
         let dir = default_cache_dir();
         std::fs::create_dir_all(&dir).ok();
@@ -81,12 +81,12 @@ impl DiskCache {
         let path = self.cache_path(key);
         if let Some(parent) = path.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
-                eprintln!("rustmet cache: failed to create dir {:?}: {}", parent, e);
+                eprintln!("metrust cache: failed to create dir {:?}: {}", parent, e);
                 return;
             }
         }
         if let Err(e) = std::fs::write(&path, data) {
-            eprintln!("rustmet cache: failed to write {:?}: {}", path, e);
+            eprintln!("metrust cache: failed to write {:?}: {}", path, e);
         }
     }
 
@@ -153,19 +153,19 @@ fn dir_size(path: &PathBuf) -> u64 {
 
 /// Platform-specific default cache directory.
 fn default_cache_dir() -> PathBuf {
-    // Windows: %LOCALAPPDATA%/rustmet/cache/
+    // Windows: %LOCALAPPDATA%/metrust/cache/
     if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        return PathBuf::from(local).join("rustmet").join("cache");
+        return PathBuf::from(local).join("metrust").join("cache");
     }
     // XDG_CACHE_HOME or ~/.cache on Unix
     if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
-        return PathBuf::from(xdg).join("rustmet");
+        return PathBuf::from(xdg).join("metrust");
     }
     if let Some(home) = home_dir() {
-        return home.join(".cache").join("rustmet");
+        return home.join(".cache").join("metrust");
     }
     // Last resort
-    PathBuf::from(".rustmet").join("cache")
+    PathBuf::from(".metrust").join("cache")
 }
 
 /// Get the user's home directory.
@@ -236,7 +236,7 @@ mod tests {
 
     #[test]
     fn test_roundtrip() {
-        let tmp = std::env::temp_dir().join("rustmet_test_cache");
+        let tmp = std::env::temp_dir().join("metrust_test_cache");
         let cache = DiskCache::with_dir(tmp.clone());
         let key = DiskCache::cache_key("https://example.com/test", None);
 

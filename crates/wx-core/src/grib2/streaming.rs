@@ -25,7 +25,7 @@ const INDICATOR_SIZE: usize = 16;
 /// # Example
 ///
 /// ```
-/// use rustmet_core::grib2::streaming::StreamingParser;
+/// use wx_core::grib2::streaming::StreamingParser;
 ///
 /// let mut parser = StreamingParser::new();
 ///

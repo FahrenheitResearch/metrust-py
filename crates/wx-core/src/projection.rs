@@ -2,7 +2,7 @@
 ///
 /// Core projection types and the `Projection` trait are defined in `wx-field`
 /// and re-exported here. This module adds GRIB2-specific convenience constructors
-/// that depend on rustmet-core's GridDefinition type.
+/// that depend on wx-core's GridDefinition type.
 
 // Re-export everything from wx-field::projection so existing code continues to work.
 pub use wx_field::projection::*;
@@ -10,7 +10,7 @@ pub use wx_field::projection::*;
 use crate::grib2::parser::GridDefinition;
 
 // ============================================================
-// GRIB2 GridDefinition constructors (depend on rustmet-core types)
+// GRIB2 GridDefinition constructors (depend on wx-core types)
 // These are free functions because we cannot add inherent impls
 // to types defined in wx-field.
 // ============================================================

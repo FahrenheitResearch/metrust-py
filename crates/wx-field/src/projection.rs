@@ -14,7 +14,7 @@ const WRF_EARTH_RADIUS: f64 = 6_370_000.0;
 /// GRIB2 standard uses a spherical earth with radius 6371.229 km.
 const GRIB2_EARTH_RADIUS: f64 = 6_371_229.0;
 
-/// Default earth radius (WRF convention, matches original rustmet-core).
+/// Default earth radius (WRF convention, matches original wx-core).
 const DEFAULT_EARTH_RADIUS: f64 = WRF_EARTH_RADIUS;
 
 /// Trait for map projections used by the rendering engine.

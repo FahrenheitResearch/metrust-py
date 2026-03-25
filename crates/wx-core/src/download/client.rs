@@ -112,8 +112,8 @@ impl DownloadClient {
     /// Create a new download client with disk caching enabled.
     ///
     /// If `cache_dir` is `Some`, files are cached there. If `None`, the
-    /// platform default is used (`~/.cache/rustmet/` on Linux/macOS,
-    /// `%LOCALAPPDATA%/rustmet/cache/` on Windows).
+    /// platform default is used (`~/.cache/metrust/` on Linux/macOS,
+    /// `%LOCALAPPDATA%/metrust/cache/` on Windows).
     pub fn new_with_cache(cache_dir: Option<&str>) -> crate::error::Result<Self> {
         let config = DownloadConfig::default();
         let agent = build_agent(&config);

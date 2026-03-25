@@ -1,13 +1,13 @@
 [package]
 name = "metrust"
-version = "0.3.6"
+version = "0.3.7"
 edition = "2021"
 description = "A pure-Rust drop-in replacement for MetPy — meteorological calculations, data I/O, and visualization"
 license = "MIT"
 
 [dependencies]
-# Core dependencies from rustmet
-rustmet-core = { path = "../rustmet-core" }
+# Core dependencies
+wx-core = { path = "../wx-core" }
 wx-math = { path = "../wx-math" }
 wx-field = { path = "../wx-field" }
 wx-radar = { path = "../wx-radar" }

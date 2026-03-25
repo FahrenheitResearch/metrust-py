@@ -8,7 +8,7 @@ license = "MIT"
 
 [package]
 name = "metrust-py"
-version = "0.3.6"
+version = "0.3.7"
 edition.workspace = true
 description = "Python bindings for metrust — a drop-in replacement for MetPy"
 

@@ -1,4 +1,4 @@
-//! rustmet-core — Pure Rust GRIB2 processor and weather model data library.
+//! wx-core — Pure Rust GRIB2 processor and weather model data library.
 //!
 //! Provides GRIB2 parsing, operational model downloads (HRRR, GFS, NAM, RAP),
 //! meteorological computations, and map projections. No rendering dependencies.
@@ -8,7 +8,7 @@
 //! ```no_run
 //! # #[cfg(feature = "network")]
 //! # {
-//! use rustmet_core::{grib2, download, models};
+//! use wx_core::{grib2, download, models};
 //!
 //! // Create HTTP client and download HRRR 2m temperature
 //! let client = download::DownloadClient::new().unwrap();

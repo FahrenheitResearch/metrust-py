@@ -8,7 +8,7 @@ This document describes the exact algorithms used in metrust's wind calculations
 
 ### Source files
 - `crates/wx-math/src/dynamics.rs` (primary, profile-based)
-- `crates/rustmet-core/src/grib2/ops.rs` (grid field version)
+- `crates/wx-core/src/grib2/ops.rs` (grid field version)
 
 ### Direction Convention
 
@@ -443,7 +443,7 @@ fn bunkers(h: &[f64], u: &[f64], v: &[f64]) -> Option<(f64, f64)> {
 
 Note: this works in **knots** (the hodograph data is in knots), and 7.5 is applied as 7.5 knots, not m/s.
 
-### Implementation D: Rendering Hodograph (rustmet-core/src/render/hodograph.rs)
+### Implementation D: Rendering Hodograph (wx-core/src/render/hodograph.rs)
 
 Also uses the clockwise `(dv, -du)` rotation, but converts the 7.5 m/s deviation to knots first:
 

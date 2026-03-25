@@ -6,7 +6,7 @@
 //! # Usage
 //!
 //! ```
-//! use rustmet_core::download::catalog;
+//! use wx_core::download::catalog;
 //!
 //! // List all available groups
 //! for group in catalog::variable_groups() {
@@ -258,7 +258,7 @@ fn full_sounding_patterns() -> Vec<&'static str> {
 /// # Example
 ///
 /// ```
-/// use rustmet_core::download::catalog::expand_vars;
+/// use wx_core::download::catalog::expand_vars;
 ///
 /// let patterns = expand_vars(&["severe", "TMP:2 m", "winter"]);
 /// // Returns all severe patterns + "TMP:2 m" + all winter patterns

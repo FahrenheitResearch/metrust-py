@@ -1174,7 +1174,7 @@ mod tests {
             MessageBuilder::new(0, values.clone()).grid(grid),
         );
 
-        let tmp = std::env::temp_dir().join("rustmet_test_writer.grib2");
+        let tmp = std::env::temp_dir().join("metrust_test_writer.grib2");
         let path = tmp.to_str().unwrap();
         writer.write_file(path).unwrap();
 

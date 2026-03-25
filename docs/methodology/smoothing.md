@@ -1,7 +1,7 @@
 # Smoothing Algorithms
 
 This document describes the smoothing algorithms implemented in the metrust
-Rust core (`crates/rustmet-core/src/grib2/ops.rs`). Each smoother operates on
+Rust core (`crates/wx-core/src/grib2/ops.rs`). Each smoother operates on
 a row-major `&[f64]` buffer of shape `(ny, nx)` and returns a new `Vec<f64>`
 of the same size.
 

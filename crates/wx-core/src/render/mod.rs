@@ -7,7 +7,7 @@
 //! - PNG: minimal PNG encoder for output
 //!
 //! This is a library-level module suitable for embedding in Python bindings
-//! or any consumer of rustmet-core. No windowing, no GPU, no matplotlib.
+//! or any consumer of wx-core. No windowing, no GPU, no matplotlib.
 
 pub mod colormap;
 pub mod raster;
