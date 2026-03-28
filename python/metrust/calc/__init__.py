@@ -656,11 +656,18 @@ def cape_cin(pressure, temperature, dewpoint, parcel_profile_or_height=None,
             if tv_e > 0:
                 buoyancy[i] = (tv_p - tv_e) / tv_e
 
-        # Find LFC: last crossing from negative to positive buoyancy
+        # Find LFC: first crossing from negative to positive buoyancy above LCL.
+        # If the parcel is positively buoyant from the start (no cap), LFC = 0.
         lfc_idx = None
         for i in range(1, len(p)):
             if buoyancy[i] > 0 and buoyancy[i-1] <= 0:
                 lfc_idx = i
+                break  # first crossing is the LFC
+
+        # If no negative-to-positive crossing found, check if the parcel is
+        # positively buoyant everywhere (no cap at all) — LFC is the surface.
+        if lfc_idx is None and any(buoyancy[i] > 0 for i in range(1, len(p))):
+            lfc_idx = 0
 
         # Find EL: last crossing from positive to negative after LFC
         el_idx = len(p) - 1
@@ -690,8 +697,13 @@ def cape_cin(pressure, temperature, dewpoint, parcel_profile_or_height=None,
                     cape_val += val
                 elif val < 0 and i <= lfc_idx:
                     cin_val += val
-            elif val < 0:
-                cin_val += val
+
+        # MetPy convention: if there is no LFC (no positive buoyancy / no
+        # free convection), CIN is zero — there is no energy barrier when
+        # there is nothing to convect into.
+        if lfc_idx is None or cape_val <= 0:
+            cin_val = 0.0
+            cape_val = 0.0
 
         return cape_val * units("J/kg"), cin_val * units("J/kg")
     elif fourth is not None:
