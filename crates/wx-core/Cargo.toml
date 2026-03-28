@@ -1,6 +1,6 @@
 [package]
 name = "wx-core"
-version = "0.3.7"
+version = "0.3.8"
 edition = "2021"
 description = "Pure Rust GRIB2 processor and weather model data library — HRRR, GFS, NAM, RAP"
 license = "MIT"

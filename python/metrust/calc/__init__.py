@@ -628,15 +628,54 @@ def cape_cin(pressure, temperature, dewpoint, parcel_profile_or_height=None,
             h_calc[i] = h_calc[i-1] + (287.04749 * tv_mean / 9.80665) * np.log(p[i-1] / p[i])
 
         # Integrate CAPE/CIN: trapezoidal rule
+        # Two-pass approach matching MetPy:
+        #   Pass 1: Find all buoyancy values to locate LFC and EL
+        #   Pass 2: Integrate CAPE between LFC-EL, CIN between LCL-LFC
+        #
+        # CIN is the negative area where the parcel is cooler than the
+        # environment.  For surface-based parcels, the parcel may be
+        # positively buoyant near the surface (superadiabatic layer),
+        # then negatively buoyant (the cap/CIN), then positively buoyant
+        # again above the LFC.  We need to capture that middle negative
+        # layer, not just stop at the first positive.
+
+        # Find LCL (where T_parcel ≈ Td, i.e. parcel becomes saturated)
+        lcl_idx = 0
+        for i in range(1, len(p)):
+            if t_parcel[i] <= t_parcel[0] - 1.0:  # parcel has cooled — above LCL
+                lcl_idx = i
+                break
+
+        # Compute buoyancy at each level
+        buoyancy = np.zeros(len(p))
+        for i in range(len(p)):
+            if p[i] <= 0:
+                continue
+            tv_e = _calc.virtual_temp(t[i], p[i], td[i]) + 273.15
+            tv_p = _calc.virtual_temp(t_parcel[i], p[i], t_parcel[i]) + 273.15
+            if tv_e > 0:
+                buoyancy[i] = (tv_p - tv_e) / tv_e
+
+        # Find LFC: last crossing from negative to positive buoyancy
+        lfc_idx = None
+        for i in range(1, len(p)):
+            if buoyancy[i] > 0 and buoyancy[i-1] <= 0:
+                lfc_idx = i
+
+        # Find EL: last crossing from positive to negative after LFC
+        el_idx = len(p) - 1
+        if lfc_idx is not None:
+            for i in range(lfc_idx + 1, len(p)):
+                if buoyancy[i] <= 0 and buoyancy[i-1] > 0:
+                    el_idx = i
+
         cape_val = 0.0
         cin_val = 0.0
         for i in range(1, len(p)):
             if p[i] <= 0:
                 continue
-            # Environment virtual temperature
             tv_e_lo = _calc.virtual_temp(t[i-1], p[i-1], td[i-1]) + 273.15
             tv_e_hi = _calc.virtual_temp(t[i], p[i], td[i]) + 273.15
-            # Parcel virtual temperature (saturated above LCL, so Td_parcel ≈ T_parcel)
             tv_p_lo = _calc.virtual_temp(t_parcel[i-1], p[i-1], t_parcel[i-1]) + 273.15
             tv_p_hi = _calc.virtual_temp(t_parcel[i], p[i], t_parcel[i]) + 273.15
             dz = h_calc[i] - h_calc[i-1]
@@ -645,10 +684,15 @@ def cape_cin(pressure, temperature, dewpoint, parcel_profile_or_height=None,
             buoy_lo = (tv_p_lo - tv_e_lo) / tv_e_lo
             buoy_hi = (tv_p_hi - tv_e_hi) / tv_e_hi
             val = 9.80665 * (buoy_lo + buoy_hi) / 2.0 * dz
-            if val > 0:
-                cape_val += val
-            else:
+
+            if lfc_idx is not None and i <= el_idx:
+                if val > 0 and i >= lfc_idx:
+                    cape_val += val
+                elif val < 0 and i <= lfc_idx:
+                    cin_val += val
+            elif val < 0:
                 cin_val += val
+
         return cape_val * units("J/kg"), cin_val * units("J/kg")
     elif fourth is not None:
         h = _as_1d(_strip(fourth, "m"))

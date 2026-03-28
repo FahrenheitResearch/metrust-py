@@ -581,6 +581,25 @@ pub fn cape_cin_core(
     // Only integrate between surface and top limit
     let p_top_actual = if p_top_limit > 0.0 { p_top_limit } else { p_prof[n - 1] };
 
+    // CIN is accumulated below the LFC.  We track the *last*
+    // transition from negative to positive buoyancy (the true LFC).
+    // This handles superadiabatic surface layers correctly.
+
+    // First, find the index of the last neg→pos crossing (the true LFC)
+    let mut last_lfc_idx: Option<usize> = None;
+    for i in 1..n {
+        if tv_parc_arr[i].is_nan() || tv_parc_arr[i - 1].is_nan() { continue; }
+        let tv_e = tv_env_arr[i] + ZEROCNK;
+        let tv_p = tv_parc_arr[i] + ZEROCNK;
+        let tv_e_prev = tv_env_arr[i - 1] + ZEROCNK;
+        let tv_p_prev = tv_parc_arr[i - 1] + ZEROCNK;
+        let buoy = tv_p - tv_e;
+        let buoy_prev = tv_p_prev - tv_e_prev;
+        if buoy > 0.0 && buoy_prev <= 0.0 {
+            last_lfc_idx = Some(i);
+        }
+    }
+
     for i in 1..n {
         if p_prof[i] <= 0.0 || tv_parc_arr[i].is_nan() || tv_parc_arr[i - 1].is_nan() { continue; }
         if p_prof[i] < p_top_actual { continue; }
@@ -596,10 +615,16 @@ pub fn cape_cin_core(
         let buoy_hi = (tv_p_hi - tv_e_hi) / tv_e_hi;
         let val = G * (buoy_lo + buoy_hi) / 2.0 * dz;
 
-        if val > 0.0 {
-            total_cape += val;
+        if let Some(lfc_i) = last_lfc_idx {
+            if val > 0.0 && i >= lfc_i {
+                total_cape += val;
+            } else if val < 0.0 && i <= lfc_i {
+                total_cin += val;
+            }
         } else {
-            total_cin += val;
+            // No LFC found — accumulate everything
+            if val > 0.0 { total_cape += val; }
+            else { total_cin += val; }
         }
     }
 
