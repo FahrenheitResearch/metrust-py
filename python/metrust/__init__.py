@@ -5,6 +5,7 @@ from metrust import constants
 from metrust import interpolate
 from metrust import io
 from metrust import units
+from metrust.calc import get_backend, set_backend, use_backend
 
 __all__ = [
     "calc",
@@ -12,4 +13,7 @@ __all__ = [
     "interpolate",
     "io",
     "units",
+    "get_backend",
+    "set_backend",
+    "use_backend",
 ]

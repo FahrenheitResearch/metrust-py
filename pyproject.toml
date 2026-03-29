@@ -21,6 +21,9 @@ classifiers = [
 dependencies = ["numpy>=1.20", "pint>=0.20"]
 readme = "README.md"
 
+[project.optional-dependencies]
+gpu = ["met-cu>=0.2.1"]
+
 [project.urls]
 Homepage = "https://github.com/FahrenheitResearch/metrust-py"
 Documentation = "https://fahrenheitresearch.github.io/metrust-py/"

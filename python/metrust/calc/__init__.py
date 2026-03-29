@@ -22,6 +22,8 @@ Rust-native conventions
 - Angles:  degrees
 """
 
+import importlib
+from contextlib import contextmanager
 import numpy as np
 try:
     import xarray as xr
@@ -34,6 +36,55 @@ from metrust.units import units, _strip, _strip_or_none, _attach, _as_float, _as
 class InvalidSoundingError(Exception):
     """Raised when sounding data is invalid or insufficient for the requested calculation."""
     pass
+
+
+_BACKEND = "cpu"
+_GPU_CALC = None
+
+
+def _normalize_backend_name(backend):
+    name = str(backend).strip().lower()
+    if name not in {"cpu", "gpu"}:
+        raise ValueError("backend must be 'cpu' or 'gpu'")
+    return name
+
+
+def _load_gpu_calc():
+    global _GPU_CALC
+    if _GPU_CALC is None:
+        try:
+            _GPU_CALC = importlib.import_module("metcu.calc")
+        except Exception as exc:
+            raise ImportError(
+                "GPU backend requires met-cu and a working CuPy/CUDA environment. "
+                "Install with `pip install \"metrust[gpu]\"` or `pip install met-cu`."
+            ) from exc
+    return _GPU_CALC
+
+
+def get_backend():
+    """Return the active backend name."""
+    return _BACKEND
+
+
+def set_backend(backend):
+    """Set the active backend for eligible calculations."""
+    global _BACKEND
+    name = _normalize_backend_name(backend)
+    if name == "gpu":
+        _load_gpu_calc()
+    _BACKEND = name
+
+
+@contextmanager
+def use_backend(backend):
+    """Temporarily switch to a specific backend."""
+    previous = get_backend()
+    set_backend(backend)
+    try:
+        yield
+    finally:
+        set_backend(previous)
 
 
 def _can_convert(value, unit_str):
@@ -101,6 +152,14 @@ def _prep(*values):
     orig_shape = np.broadcast_shapes(*shapes)
     flat = [np.ascontiguousarray(np.broadcast_to(a, orig_shape).ravel()) for a in arrays]
     return flat, orig_shape, True
+
+
+def _gpu_to_numpy(value):
+    if isinstance(value, tuple):
+        return tuple(_gpu_to_numpy(v) for v in value)
+    if hasattr(value, "get"):
+        value = value.get()
+    return np.asarray(value)
 
 
 def _interp_profile_level(pressure, values, target_pressure_hpa, value_unit=None):
@@ -191,6 +250,30 @@ def _wrap_result_like(template, values, unit_str=None):
     return arr * units(unit_str) if unit_str is not None else arr
 
 
+def _raw_array_ndim(data):
+    if hasattr(data, "values"):
+        data = data.values
+    elif hasattr(data, "magnitude"):
+        data = data.magnitude
+    return np.asarray(data).ndim
+
+
+def _gpu_uniform_grid_supported(*arrays, dx=None, dy=None, parallel_scale=None,
+                                meridional_scale=None, latitude=None,
+                                longitude=None, crs=None):
+    if _BACKEND != "gpu":
+        return False
+    if dx is None or dy is None:
+        return False
+    if any(value is not None for value in (
+        parallel_scale, meridional_scale, latitude, longitude, crs,
+    )):
+        return False
+    if _is_variable_spacing(dx) or _is_variable_spacing(dy):
+        return False
+    return all(_raw_array_ndim(arr) == 2 for arr in arrays)
+
+
 def _vec_call(fn, *stripped_args):
     """Call scalar Rust fn element-wise over array args; return scalar or reshaped array."""
     vals, shape, is_arr = _prep(*stripped_args)
@@ -257,6 +340,14 @@ def potential_temperature(pressure, temperature):
     -------
     Quantity (K)
     """
+    if _BACKEND == "gpu":
+        result = _gpu_to_numpy(
+            _load_gpu_calc().potential_temperature(
+                _strip(pressure, "hPa"),
+                _strip(temperature, "degC"),
+            )
+        )
+        return result * units.K
     vals, shape, is_arr = _prep(_strip(pressure, "hPa"), _strip(temperature, "degC"))
     if is_arr:
         result = np.asarray(_calc.potential_temperature_array(vals[0], vals[1])).reshape(shape)
@@ -278,6 +369,15 @@ def equivalent_potential_temperature(pressure, temperature, dewpoint):
     -------
     Quantity (K)
     """
+    if _BACKEND == "gpu":
+        result = _gpu_to_numpy(
+            _load_gpu_calc().equivalent_potential_temperature(
+                _strip(pressure, "hPa"),
+                _strip(temperature, "degC"),
+                _strip(dewpoint, "degC"),
+            )
+        )
+        return result * units.K
     vals, shape, is_arr = _prep(_strip(pressure, "hPa"), _strip(temperature, "degC"), _strip(dewpoint, "degC"))
     if is_arr:
         result = np.asarray(_calc.equivalent_potential_temperature_array(vals[0], vals[1], vals[2])).reshape(shape)
@@ -1413,6 +1513,9 @@ def dewpoint(vapor_pressure_val):
     -------
     Quantity (degC)
     """
+    if _BACKEND == "gpu":
+        result = _gpu_to_numpy(_load_gpu_calc().dewpoint(_strip(vapor_pressure_val, "hPa")))
+        return result * units.degC
     vals, shape, is_arr = _prep(_strip(vapor_pressure_val, "hPa"))
     if is_arr:
         result = np.asarray(_calc.dewpoint_array(vals[0])).reshape(shape)
@@ -2966,6 +3069,22 @@ def vorticity(u, v, dx=None, dy=None, x_dim=-1, y_dim=-2,
     dx, dy = _resolve_dx_dy(u, dx=dx, dy=dy, latitude=latitude, longitude=longitude)
     if dx is None or dy is None:
         raise TypeError("vorticity requires dx/dy or inferable latitude/longitude coordinates")
+    if _gpu_uniform_grid_supported(
+        u, v, dx=dx, dy=dy,
+        parallel_scale=parallel_scale, meridional_scale=meridional_scale,
+        latitude=latitude, longitude=longitude, crs=crs,
+    ):
+        result = _gpu_to_numpy(
+            _load_gpu_calc().vorticity(
+                _as_2d(u, "m/s"),
+                _as_2d(v, "m/s"),
+                dx=_mean_spacing(dx, "m"),
+                dy=_mean_spacing(dy, "m"),
+                x_dim=x_dim,
+                y_dim=y_dim,
+            )
+        )
+        return _wrap_result_like(u, result, "1/s")
     u_arr = np.asarray(_strip(u, "m/s"), dtype=np.float64)
     v_arr = np.asarray(_strip(v, "m/s"), dtype=np.float64)
 
@@ -3122,6 +3241,23 @@ def frontogenesis(theta, u, v, dx=None, dy=None, x_dim=-1, y_dim=-2,
         dx, dy = _resolve_dx_dy(u, dx=dx, dy=dy, latitude=latitude, longitude=longitude)
     if dx is None or dy is None:
         raise TypeError("frontogenesis requires dx/dy or inferable latitude/longitude coordinates")
+    if _gpu_uniform_grid_supported(
+        theta, u, v, dx=dx, dy=dy,
+        parallel_scale=parallel_scale, meridional_scale=meridional_scale,
+        latitude=latitude, longitude=longitude, crs=crs,
+    ):
+        result = _gpu_to_numpy(
+            _load_gpu_calc().frontogenesis(
+                _as_2d(theta, "K"),
+                _as_2d(u, "m/s"),
+                _as_2d(v, "m/s"),
+                dx=_mean_spacing(dx, "m"),
+                dy=_mean_spacing(dy, "m"),
+                x_dim=x_dim,
+                y_dim=y_dim,
+            )
+        )
+        return _wrap_result_like(theta, result, "K/m/s")
     t_arr = np.asarray(_strip(theta, "K"), dtype=np.float64)
     u_arr = np.asarray(_strip(u, "m/s"), dtype=np.float64)
     v_arr = np.asarray(_strip(v, "m/s"), dtype=np.float64)
@@ -3569,6 +3705,21 @@ def q_vector(u, v, temperature, pressure, dx=None, dy=None, **kwargs):
         dx, dy = _resolve_dx_dy(u, dx=dx, dy=dy, latitude=latitude, longitude=longitude)
     if dx is None or dy is None:
         raise TypeError("q_vector requires dx/dy or inferable latitude/longitude coordinates")
+    if _gpu_uniform_grid_supported(
+        u, v, temperature, dx=dx, dy=dy, latitude=latitude, longitude=longitude,
+    ) and all(key in {"x_dim", "y_dim", "latitude", "longitude"} for key in kwargs):
+        q1, q2 = _gpu_to_numpy(
+            _load_gpu_calc().q_vector(
+                _as_2d(u, "m/s"),
+                _as_2d(v, "m/s"),
+                _as_2d(temperature, "K") if _can_convert(temperature, "K") else _as_2d(temperature, "degC"),
+                _as_float(_strip(pressure, "hPa")),
+                dx=_mean_spacing(dx, "m"),
+                dy=_mean_spacing(dy, "m"),
+                **kwargs,
+            )
+        )
+        return _wrap_result_like(u, q1), _wrap_result_like(v, q2)
     t_2d = _as_2d(temperature, "K") if _can_convert(temperature, "K") else _as_2d(temperature, "degC")
     u_2d = _as_2d(u, "m/s")
     v_2d = _as_2d(v, "m/s")
@@ -4789,6 +4940,26 @@ def compute_cape_cin(pressure_3d, temperature_c_3d, qvapor_3d,
 
     Returns (cape, cin, lcl_height, lfc_height) each shaped (ny, nx).
     """
+    if _BACKEND == "gpu":
+        cape, cin, lcl, lfc = _gpu_to_numpy(
+            _load_gpu_calc().compute_cape_cin(
+                _grid_strip(pressure_3d),
+                _grid_strip(temperature_c_3d),
+                _grid_strip(qvapor_3d),
+                _grid_strip(height_agl_3d),
+                _grid_strip(psfc),
+                _grid_strip(t2),
+                _grid_strip(q2),
+                parcel_type=parcel_type,
+                top_m=_scalar_strip(top_m, "m"),
+            )
+        )
+        return (
+            np.asarray(cape) * units("J/kg"),
+            np.asarray(cin) * units("J/kg"),
+            np.asarray(lcl) * units.m,
+            np.asarray(lfc) * units.m,
+        )
     p3, nx, ny, nz = _grid_flatten_3d(pressure_3d)
     t3 = _grid_strip(temperature_c_3d).ravel()
     q3 = _grid_strip(qvapor_3d).ravel()
@@ -4817,6 +4988,16 @@ def compute_srh(u_3d, v_3d, height_agl_3d, top_m=1000.0):
 
     Returns SRH shaped (ny, nx) in m^2/s^2.
     """
+    if _BACKEND == "gpu":
+        result = _gpu_to_numpy(
+            _load_gpu_calc().compute_srh(
+                _grid_strip(u_3d),
+                _grid_strip(v_3d),
+                _grid_strip(height_agl_3d),
+                top_m=_scalar_strip(top_m, "m"),
+            )
+        )
+        return np.asarray(result) * units("m**2/s**2")
     u3, nx, ny, nz = _grid_flatten_3d(u_3d)
     v3 = _grid_strip(v_3d).ravel()
     h3 = _grid_strip(height_agl_3d).ravel()
@@ -4832,6 +5013,17 @@ def compute_shear(u_3d, v_3d, height_agl_3d, bottom_m=0.0, top_m=6000.0):
 
     Returns shear magnitude shaped (ny, nx) in m/s.
     """
+    if _BACKEND == "gpu":
+        result = _gpu_to_numpy(
+            _load_gpu_calc().compute_shear(
+                _grid_strip(u_3d),
+                _grid_strip(v_3d),
+                _grid_strip(height_agl_3d),
+                bottom_m=_scalar_strip(bottom_m, "m"),
+                top_m=_scalar_strip(top_m, "m"),
+            )
+        )
+        return np.asarray(result) * units("m/s")
     u3, nx, ny, nz = _grid_flatten_3d(u_3d)
     v3 = _grid_strip(v_3d).ravel()
     h3 = _grid_strip(height_agl_3d).ravel()
@@ -4866,6 +5058,14 @@ def compute_pw(qvapor_3d, pressure_3d):
 
     Returns PW shaped (ny, nx) in mm.
     """
+    if _BACKEND == "gpu":
+        result = _gpu_to_numpy(
+            _load_gpu_calc().compute_pw(
+                _grid_strip(qvapor_3d),
+                _grid_strip(pressure_3d),
+            )
+        )
+        return np.asarray(result) * units.mm
     q3, nx, ny, nz = _grid_flatten_3d(qvapor_3d)
     p3 = _grid_strip(pressure_3d).ravel()
     result = _calc.compute_pw(q3, p3, nx, ny, nz)
@@ -5016,6 +5216,17 @@ def composite_reflectivity_from_hydrometeors(pressure_3d, temperature_c_3d,
 
     Returns composite reflectivity shaped (ny, nx) in dBZ.
     """
+    if _BACKEND == "gpu":
+        result = _gpu_to_numpy(
+            _load_gpu_calc().composite_reflectivity_from_hydrometeors(
+                _grid_strip(pressure_3d),
+                _grid_strip(temperature_c_3d),
+                _grid_strip(qrain_3d),
+                _grid_strip(qsnow_3d),
+                _grid_strip(qgraup_3d),
+            )
+        )
+        return np.asarray(result) * units.dimensionless
     p3, nx, ny, nz = _grid_flatten_3d(pressure_3d)
     t3 = _grid_strip(temperature_c_3d).ravel()
     qr = _grid_strip(qrain_3d).ravel()
@@ -5595,6 +5806,9 @@ def geodesic(crs, start, end, steps):
 # ============================================================================
 
 __all__ = [
+    "get_backend",
+    "set_backend",
+    "use_backend",
     # thermo -- existing
     "potential_temperature",
     "equivalent_potential_temperature",
