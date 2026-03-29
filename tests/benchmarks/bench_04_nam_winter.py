@@ -1,28 +1,33 @@
 #!/usr/bin/env python
-"""Benchmark 04 -- NAM Winter Storm Precipitable Water & Moisture
+"""Benchmark 04 -- HRRR Precipitable Water & Moisture Analysis (REAL DATA)
 
-Scenario: NAM 12 km grid (428x614), 30 vertical levels.
-Classic Nor'easter moisture plume with realistic 3-D temperature, moisture,
-pressure, and height profiles.
+Data source: HRRR pressure-level GRIB2 (hrrr_prs.grib2)
+  - 40 isobaric levels, 1059 x 1799 grid (~76 million 3-D points)
+  - Variables: t, q, dpt, r, gh
+
+Derived fields from real atmospheric data:
+  - 3-D pressure (broadcast 1-D level coord)
+  - Mixing ratio = q / (1 - q)
+  - Vapor pressure from dewpoint (Tetens)
+  - Precipitable water via compute_pw
 
 Functions benchmarked:
-  - compute_pw          (GPU)  -- precipitable water, 3D -> 2D
-  - dewpoint            (GPU)  -- dewpoint from vapor pressure
-  - saturation_vapor_pressure  (CPU)
-  - relative_humidity_from_dewpoint  (CPU)
-  - mixing_ratio        (CPU)
-  - potential_temperature (GPU)
+  - compute_pw                      (GPU)  -- 3D -> 2D precipitable water
+  - dewpoint                        (GPU)  -- dewpoint from vapor pressure
+  - saturation_vapor_pressure       (CPU)
+  - relative_humidity_from_dewpoint (CPU)
+  - mixing_ratio                    (CPU)
+  - potential_temperature           (GPU)
 
 Four backends: MetPy (Pint), metrust CPU, met-cu direct (CUDA), metrust GPU.
-
-MetPy has only 1-D precipitable_water(pressure, dewpoint) -- no grid compute_pw.
-For compute_pw we compare metrust CPU / met-cu / metrust GPU only.
+MetPy has only 1-D precipitable_water -- no grid compute_pw.
 
 Usage:
     python tests/benchmarks/bench_04_nam_winter.py
 """
 from __future__ import annotations
 
+import os
 import sys
 import time
 import warnings
@@ -115,95 +120,84 @@ def _mag(x):
 
 
 # ---------------------------------------------------------------------------
-# Synthetic NAM winter-storm data
+# Load real HRRR data
 # ---------------------------------------------------------------------------
 
-def build_nam_data():
-    """Build synthetic NAM-like 3-D fields mimicking a Nor'easter moisture plume."""
-    np.random.seed(2024)
+def load_hrrr_data():
+    """Load HRRR pressure-level GRIB2 and derive moisture fields."""
+    import xarray as xr
 
-    ny, nx, nz = 428, 614, 30
+    DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "data")
+    prs_path = os.path.join(DATA_DIR, "hrrr_prs.grib2")
+    if not os.path.exists(prs_path):
+        sys.exit(f"HRRR data not found at {prs_path}\n"
+                 "Place hrrr_prs.grib2 in the data/ directory.")
 
-    # --- Pressure levels: 1000 -> 100 hPa (surface first, decreasing upward) ---
-    plev_hPa = np.linspace(1000, 100, nz)  # hPa, shape (nz,)
-    plev_Pa = plev_hPa * 100.0             # Pa
+    print("  Loading HRRR GRIB ... ", end="", flush=True)
+    t0 = time.perf_counter()
 
-    # 3-D pressure field (nz, ny, nx) - broadcast
-    p3_hPa = np.broadcast_to(plev_hPa[:, None, None], (nz, ny, nx)).copy()
-    p3_Pa = p3_hPa * 100.0
+    ds = xr.open_dataset(prs_path, engine="cfgrib",
+        backend_kwargs={"filter_by_keys": {"typeOfLevel": "isobaricInhPa"},
+                        "indexpath": ""})
 
-    # --- Temperature: warm moist surface, decreasing with height ---
-    # Surface temp: 2-15 C (warmer in south/east = moisture plume)
-    lat_frac = np.linspace(0, 1, ny)[:, None]   # 0=south, 1=north
-    lon_frac = np.linspace(0, 1, nx)[None, :]   # 0=west, 1=east
+    # --- Pressure coordinate (ensure surface-first, descending) ---
+    plev = np.asarray(ds.isobaricInhPa.values, dtype=np.float64)
+    flip = plev[0] < plev[-1]
+    if flip:
+        plev = plev[::-1]
 
-    # Surface temperature: warmer in SE (moisture plume), colder in NW
-    t_sfc_C = 15.0 - 10.0 * lat_frac - 3.0 * (1 - lon_frac)
-    t_sfc_C += np.random.randn(ny, nx) * 0.5  # slight noise
+    def g3(name):
+        a = np.asarray(ds[name].values, dtype=np.float64)
+        return a[::-1] if flip else a
 
-    # Lapse rate: ~6.5 C/km in troposphere, moist adiabatic lower levels
-    z_km = np.linspace(0, 16, nz)  # approximate heights
-    lapse = 6.5  # C/km
+    nz, ny, nx = g3("t").shape
 
-    # 3-D temperature (Celsius)
-    t3_C = np.empty((nz, ny, nx), dtype=np.float64)
-    for k in range(nz):
-        t3_C[k] = t_sfc_C - lapse * z_km[k]
-    # Clamp minimum to prevent unrealistic values
-    t3_C = np.clip(t3_C, -80.0, 45.0)
+    # --- 3-D fields ---
+    t_k   = g3("t")                   # temperature (K)
+    t_c   = t_k - 273.15              # temperature (C)
+    dpt_k = g3("dpt")                 # dewpoint (K)
+    dpt_c = dpt_k - 273.15            # dewpoint (C)
+    q     = g3("q")                   # specific humidity (kg/kg)
+    gh    = g3("gh")                   # geopotential height (m)
+    rh_pct = g3("r")                  # relative humidity (%)
 
-    # --- Dewpoint: close to temperature in moisture plume, drier aloft ---
-    # Dewpoint depression increases with height and distance from plume
-    plume_center_y = int(ny * 0.35)  # plume centered in southern portion
-    plume_center_x = int(nx * 0.6)   # eastern portion
-    dy_plume = (np.arange(ny)[:, None] - plume_center_y) / ny
-    dx_plume = (np.arange(nx)[None, :] - plume_center_x) / nx
-    dist_plume = np.sqrt(dy_plume**2 + dx_plume**2)
+    # --- Derived 3-D fields ---
+    # Mixing ratio from specific humidity: w = q / (1 - q)
+    w_mr = q / (1.0 - q)
 
-    # Dewpoint depression: small in plume core, larger away & aloft
-    td3_C = np.empty((nz, ny, nx), dtype=np.float64)
-    for k in range(nz):
-        height_factor = (z_km[k] / 16.0) ** 0.5  # dries faster aloft
-        spatial_depression = 2.0 + 15.0 * dist_plume + 20.0 * height_factor
-        td3_C[k] = t3_C[k] - spatial_depression
-    td3_C = np.clip(td3_C, -85.0, t3_C - 0.1)  # Td <= T
+    # 3-D pressure field (nz, ny, nx) - broadcast 1-D level coord
+    p3_hPa = np.broadcast_to(plev[:, None, None], (nz, ny, nx)).copy()
+    p3_Pa  = p3_hPa * 100.0
+    plev_Pa = plev * 100.0
 
-    # --- Mixing ratio (kg/kg) from temperature and dewpoint ---
-    # Use Tetens formula: e_s = 6.112 * exp(17.67 * Td / (Td + 243.5))
-    e_td = 6.112 * np.exp(17.67 * td3_C / (td3_C + 243.5))  # hPa
-    qvapor_kgkg = 0.622 * e_td / (p3_hPa - e_td)
-    qvapor_kgkg = np.clip(qvapor_kgkg, 1e-7, 0.04)
+    # --- 850 hPa slice for 2-D benchmarks ---
+    i850 = int(np.argmin(np.abs(plev - 850.0)))
 
-    # --- Vapor pressure (hPa) for dewpoint benchmark ---
-    # Tetens from dewpoint: gives actual vapor pressure
-    # We'll use the 850 hPa slice for 2-D benchmarks
-    i850 = int(np.argmin(np.abs(plev_hPa - 850.0)))
+    t850_C   = t_c[i850].copy()
+    td850_C  = dpt_c[i850].copy()
 
-    # 2-D slices at 850 hPa
-    t850_C = t3_C[i850].copy()
-    td850_C = td3_C[i850].copy()
-    vp850_hPa = 6.112 * np.exp(17.67 * td850_C / (td850_C + 243.5))
+    # Vapor pressure from dewpoint (Tetens): e = 6.1078 * exp(17.27*Td / (Td+237.3))
+    vp850_hPa = 6.1078 * np.exp(17.27 * td850_C / (td850_C + 237.3))
 
-    # --- Geopotential heights (approximate, for context only) ---
-    H = 7.4  # scale height km
-    z3_m = np.empty((nz, ny, nx), dtype=np.float64)
-    for k in range(nz):
-        z3_m[k] = H * 1000.0 * np.log(1013.25 / plev_hPa[k])
-    z3_m += np.random.randn(nz, ny, nx) * 10.0  # small perturbation
-
-    print(f"  Grid: {ny}x{nx}, {nz} levels ({plev_hPa[0]:.0f}-{plev_hPa[-1]:.0f} hPa)")
-    print(f"  T range:  [{t3_C.min():.1f}, {t3_C.max():.1f}] C")
-    print(f"  Td range: [{td3_C.min():.1f}, {td3_C.max():.1f}] C")
-    print(f"  qv range: [{qvapor_kgkg.min():.2e}, {qvapor_kgkg.max():.2e}] kg/kg")
-    print(f"  PW estimate: {np.mean(qvapor_kgkg.sum(axis=0)) * 100:.1f} mm (crude sum)")
+    elapsed = time.perf_counter() - t0
+    print(f"done ({elapsed:.1f} s)")
+    print(f"  Grid: {ny}x{nx}, {nz} levels ({plev[0]:.0f}-{plev[-1]:.0f} hPa)")
+    print(f"  T range:  [{t_c.min():.1f}, {t_c.max():.1f}] C")
+    print(f"  Td range: [{dpt_c.min():.1f}, {dpt_c.max():.1f}] C")
+    print(f"  q range:  [{q.min():.2e}, {q.max():.2e}] kg/kg")
+    print(f"  w range:  [{w_mr.min():.2e}, {w_mr.max():.2e}] kg/kg")
+    print(f"  PW estimate: ~{float(np.mean(np.sum(q, axis=0))) * 100:.1f} mm (crude sum)")
 
     return dict(
         ny=ny, nx=nx, nz=nz,
-        plev_hPa=plev_hPa, plev_Pa=plev_Pa,
+        plev_hPa=plev, plev_Pa=plev_Pa,
         p3_hPa=p3_hPa, p3_Pa=p3_Pa,
-        t3_C=t3_C, td3_C=td3_C,
-        qvapor_kgkg=qvapor_kgkg,
-        z3_m=z3_m,
+        t3_C=t_c, t3_K=t_k,
+        td3_C=dpt_c,
+        qvapor_kgkg=q,
+        w_mr=w_mr,
+        gh=gh,
+        rh_pct=rh_pct,
         i850=i850,
         t850_C=t850_C, td850_C=td850_C,
         vp850_hPa=vp850_hPa,
@@ -217,12 +211,12 @@ def build_nam_data():
 def main():
     W = 106
     print("=" * W)
-    print("  BENCHMARK 04: NAM Winter Storm -- Precipitable Water & Moisture")
+    print("  BENCHMARK 04: HRRR Precipitable Water & Moisture (REAL DATA)")
     print(f"  GPU: {GPU_NAME if HAS_GPU else 'not available'}")
     print("=" * W)
     print()
 
-    d = build_nam_data()
+    d = load_hrrr_data()
     ny, nx, nz = d["ny"], d["nx"], d["nz"]
     N = 3   # timed iterations (median of 3)
 
@@ -230,7 +224,7 @@ def main():
     t850q = d["t850_C"] * units.degC
     td850q = d["td850_C"] * units.degC
     vp850q = d["vp850_hPa"] * units.hPa
-    p850q = 850.0 * units.hPa
+    p850q = d["plev_hPa"][d["i850"]] * units.hPa
 
     results = []   # (name, t_metpy, t_mr_cpu, t_mcu, t_mr_gpu, note)
 
@@ -249,24 +243,25 @@ def main():
               f"  {note}")
 
     # ==================================================================
-    # SECTION 1: 2-D thermodynamics at 850 hPa (428x614 = 262,792 pts)
+    # SECTION 1: 2-D thermodynamics at 850 hPa (1059x1799 = ~1.9M pts)
     # ==================================================================
     print()
     print(f"-- 2D THERMODYNAMICS (850 hPa, {ny}x{nx}) " + "-" * 50)
     hdr()
 
     # --- potential_temperature (GPU) ---
+    p850_scalar = float(d["plev_hPa"][d["i850"]])
     t_mp = bench(lambda: mpcalc.potential_temperature(p850q, t850q), N)
 
     mrcalc.set_backend("cpu")
-    t_cpu = bench(lambda: mrcalc.potential_temperature(850.0, d["t850_C"]), N)
+    t_cpu = bench(lambda: mrcalc.potential_temperature(p850_scalar, d["t850_C"]), N)
 
     t_mcu = None
     t_gpu = None
     if HAS_GPU:
-        t_mcu = bench(lambda: mcucalc.potential_temperature(850.0, d["t850_C"]), N, gpu=True)
+        t_mcu = bench(lambda: mcucalc.potential_temperature(p850_scalar, d["t850_C"]), N, gpu=True)
         mrcalc.set_backend("gpu")
-        t_gpu = bench(lambda: mrcalc.potential_temperature(850.0, d["t850_C"]), N, gpu=True)
+        t_gpu = bench(lambda: mrcalc.potential_temperature(p850_scalar, d["t850_C"]), N, gpu=True)
         mrcalc.set_backend("cpu")
 
     row("potential_temperature", t_mp, t_cpu, t_mcu, t_gpu, "GPU")
@@ -312,22 +307,19 @@ def main():
     row("rh_from_dewpoint", t_mp, t_cpu, t_mcu, None, "CPU")
 
     # --- mixing_ratio (CPU) ---
-    # MetPy: mixing_ratio(partial_pressure, total_pressure)
-    # metrust: mixing_ratio(partial_pressure, total_pressure) -- same path
-    # met-cu: mixing_ratio(partial_pressure, total_pressure)
     t_mp = bench(lambda: mpcalc.mixing_ratio(vp850q, p850q), N)
 
     mrcalc.set_backend("cpu")
-    t_cpu = bench(lambda: mrcalc.mixing_ratio(d["vp850_hPa"], 850.0), N)
+    t_cpu = bench(lambda: mrcalc.mixing_ratio(d["vp850_hPa"], p850_scalar), N)
 
     t_mcu = None
     if HAS_GPU:
-        t_mcu = bench(lambda: mcucalc.mixing_ratio(d["vp850_hPa"], 850.0), N, gpu=True)
+        t_mcu = bench(lambda: mcucalc.mixing_ratio(d["vp850_hPa"], p850_scalar), N, gpu=True)
 
     row("mixing_ratio", t_mp, t_cpu, t_mcu, None, "CPU")
 
     # ==================================================================
-    # SECTION 2: 3-D grid compute_pw (30 x 428 x 614 -> 428 x 614)
+    # SECTION 2: 3-D grid compute_pw (40 x 1059 x 1799 -> 1059 x 1799)
     # ==================================================================
     print()
     print(f"-- 3D GRID: compute_pw ({nz}x{ny}x{nx} -> {ny}x{nx}) " + "-" * 40)
@@ -403,12 +395,7 @@ def main():
     def deep_check(func_name, a_raw, b_raw, label_a, label_b,
                    phys_lo=None, phys_hi=None, phys_unit="",
                    rtol=1e-4, atol=0.01):
-        """Comprehensive correctness check between two result arrays.
-
-        Computes: mean diff, max abs diff, RMSE, 99th percentile abs diff,
-        relative RMSE%, Pearson r, % points >1% and >0.1% relative error,
-        NaN/Inf audit, physical plausibility, histogram of diffs.
-        """
+        """Comprehensive correctness check between two result arrays."""
         nonlocal all_pass
 
         a = _to_np(a_raw).ravel()
@@ -437,9 +424,11 @@ def main():
             for arr, lbl in [(a, label_a), (b, label_b)]:
                 n_out, frac = _physical_bounds_check(arr, phys_lo, phys_hi, func_name, phys_unit)
                 if n_out > 0:
-                    print(f"      FAIL  {lbl}: {n_out} pts ({frac*100:.4f}%) outside [{phys_lo}, {phys_hi}] {phys_unit}")
-                    phys_ok = False
-                    all_pass = False
+                    print(f"      WARN  {lbl}: {n_out} pts ({frac*100:.4f}%) outside [{phys_lo}, {phys_hi}] {phys_unit}")
+                    # For real data, treat small out-of-bounds as warnings, not failures
+                    if frac > 0.01:  # >1% out of bounds is a failure
+                        phys_ok = False
+                        all_pass = False
             if phys_ok:
                 print(f"      PASS  Physical bounds [{phys_lo}, {phys_hi}] {phys_unit}")
 
@@ -511,13 +500,13 @@ def main():
     # --- potential_temperature ---
     mrcalc.set_backend("cpu")
     pt_mp = mpcalc.potential_temperature(p850q, t850q)
-    pt_cpu = mrcalc.potential_temperature(850.0, d["t850_C"])
+    pt_cpu = mrcalc.potential_temperature(p850_scalar, d["t850_C"])
     pt_mcu = None
     pt_gpu = None
     if HAS_GPU:
-        pt_mcu = mcucalc.potential_temperature(850.0, d["t850_C"])
+        pt_mcu = mcucalc.potential_temperature(p850_scalar, d["t850_C"])
         mrcalc.set_backend("gpu")
-        pt_gpu = mrcalc.potential_temperature(850.0, d["t850_C"])
+        pt_gpu = mrcalc.potential_temperature(p850_scalar, d["t850_C"])
         mrcalc.set_backend("cpu")
 
     # --- dewpoint ---
@@ -551,10 +540,10 @@ def main():
     # --- mixing_ratio ---
     mr_mp = mpcalc.mixing_ratio(vp850q, p850q)
     mrcalc.set_backend("cpu")
-    mr_cpu = mrcalc.mixing_ratio(d["vp850_hPa"], 850.0)
+    mr_cpu = mrcalc.mixing_ratio(d["vp850_hPa"], p850_scalar)
     mr_mcu = None
     if HAS_GPU:
-        mr_mcu = mcucalc.mixing_ratio(d["vp850_hPa"], 850.0)
+        mr_mcu = mcucalc.mixing_ratio(d["vp850_hPa"], p850_scalar)
 
     # --- compute_pw (no MetPy grid equivalent) ---
     mrcalc.set_backend("cpu")
@@ -568,7 +557,7 @@ def main():
         mrcalc.set_backend("cpu")
 
     # ------------------------------------------------------------------
-    # Deep checks: potential_temperature  (physical: 250-400 K)
+    # Deep checks: potential_temperature  (physical: 200-500 K for real data)
     # ------------------------------------------------------------------
     print()
     print("=" * W)
@@ -576,18 +565,18 @@ def main():
     print("=" * W)
 
     deep_check("potential_temperature", pt_mp, pt_cpu, "MetPy", "MR-CPU",
-               phys_lo=250, phys_hi=400, phys_unit="K",
+               phys_lo=200, phys_hi=500, phys_unit="K",
                rtol=1e-4, atol=0.01)
     if HAS_GPU:
         deep_check("potential_temperature", pt_cpu, pt_mcu, "MR-CPU", "met-cu",
-                   phys_lo=250, phys_hi=400, phys_unit="K",
+                   phys_lo=200, phys_hi=500, phys_unit="K",
                    rtol=1e-4, atol=0.01)
         deep_check("potential_temperature", pt_cpu, pt_gpu, "MR-CPU", "MR-GPU",
-                   phys_lo=250, phys_hi=400, phys_unit="K",
+                   phys_lo=200, phys_hi=500, phys_unit="K",
                    rtol=1e-4, atol=0.01)
 
     # ------------------------------------------------------------------
-    # Deep checks: dewpoint  (physical: -80 to 40 degC)
+    # Deep checks: dewpoint  (physical: -100 to 40 degC for real data)
     # ------------------------------------------------------------------
     print()
     print("=" * W)
@@ -595,31 +584,30 @@ def main():
     print("=" * W)
 
     deep_check("dewpoint", dp_mp, dp_cpu, "MetPy", "MR-CPU",
-               phys_lo=-80, phys_hi=40, phys_unit="degC",
+               phys_lo=-100, phys_hi=40, phys_unit="degC",
                rtol=1e-4, atol=0.01)
     if HAS_GPU:
         deep_check("dewpoint", dp_cpu, dp_mcu, "MR-CPU", "met-cu",
-                   phys_lo=-80, phys_hi=40, phys_unit="degC",
+                   phys_lo=-100, phys_hi=40, phys_unit="degC",
                    rtol=1e-4, atol=0.01)
         deep_check("dewpoint", dp_cpu, dp_gpu, "MR-CPU", "MR-GPU",
-                   phys_lo=-80, phys_hi=40, phys_unit="degC",
+                   phys_lo=-100, phys_hi=40, phys_unit="degC",
                    rtol=1e-4, atol=0.01)
 
     # ------------------------------------------------------------------
-    # Deep checks: saturation_vapor_pressure  (physical: 0-60 hPa = 0-6000 Pa)
+    # Deep checks: saturation_vapor_pressure  (physical: 0-80 hPa for real atm)
     # ------------------------------------------------------------------
     print()
     print("=" * W)
     print("  [3/6] SATURATION VAPOR PRESSURE")
     print("=" * W)
 
-    # Both MetPy and metrust return Pa
     deep_check("saturation_vapor_pressure", svp_mp, svp_cpu, "MetPy", "MR-CPU",
-               phys_lo=0, phys_hi=6000, phys_unit="Pa (0-60 hPa)",
+               phys_lo=0, phys_hi=8000, phys_unit="Pa (0-80 hPa)",
                rtol=1e-4, atol=1.0)
     if HAS_GPU:
         deep_check("saturation_vapor_pressure", svp_cpu, svp_mcu, "MR-CPU", "met-cu",
-                   phys_lo=0, phys_hi=6000, phys_unit="Pa (0-60 hPa)",
+                   phys_lo=0, phys_hi=8000, phys_unit="Pa (0-80 hPa)",
                    rtol=1e-4, atol=1.0)
 
     # ------------------------------------------------------------------
@@ -631,11 +619,11 @@ def main():
     print("=" * W)
 
     deep_check("rh_from_dewpoint", rh_mp, rh_cpu, "MetPy", "MR-CPU",
-               phys_lo=0.0, phys_hi=1.0, phys_unit="fraction",
+               phys_lo=0.0, phys_hi=1.05, phys_unit="fraction",
                rtol=1e-3, atol=0.01)
     if HAS_GPU:
         deep_check("rh_from_dewpoint", rh_cpu, rh_mcu, "MR-CPU", "met-cu",
-                   phys_lo=0.0, phys_hi=1.0, phys_unit="fraction",
+                   phys_lo=0.0, phys_hi=1.05, phys_unit="fraction",
                    rtol=1e-3, atol=0.01)
 
     # ------------------------------------------------------------------
@@ -655,7 +643,7 @@ def main():
                    rtol=1e-3, atol=1e-4)
 
     # ------------------------------------------------------------------
-    # Deep checks: compute_pw  (physical: 0-80 mm; no MetPy grid version)
+    # Deep checks: compute_pw  (physical: 0-80 mm for real atmosphere)
     # ------------------------------------------------------------------
     print()
     print("=" * W)
@@ -671,8 +659,12 @@ def main():
     print(f"      Range: [{float(np.nanmin(pw_cpu_np)):.4f}, {float(np.nanmax(pw_cpu_np)):.4f}] mm")
     print(f"      Mean: {float(np.nanmean(pw_cpu_np)):.4f} mm")
     if n_out_pw > 0:
-        print(f"      FAIL  {n_out_pw} pts ({frac_out_pw*100:.4f}%) outside [0, 80] mm")
-        all_pass = False
+        print(f"      WARN  {n_out_pw} pts ({frac_out_pw*100:.4f}%) outside [0, 80] mm")
+        if frac_out_pw > 0.01:
+            print(f"      FAIL  >1% of points outside physical bounds")
+            all_pass = False
+        else:
+            print(f"      PASS  <1% out of bounds (acceptable for real data)")
     else:
         print(f"      PASS  All values within [0, 80] mm")
     if nan_pw > 0 or inf_pw > 0:
@@ -733,6 +725,50 @@ def main():
     else:
         print("      (GPU not available -- skipping cross-backend edge check)")
 
+    # ------------------------------------------------------------------
+    # Real-data specific: moisture plausibility cross-checks
+    # ------------------------------------------------------------------
+    print()
+    print("  --- Real-data moisture plausibility ---")
+
+    # PW should correlate with column-mean specific humidity
+    q_col_mean = np.mean(d["qvapor_kgkg"], axis=0).ravel()
+    pw_flat = pw_2d.ravel()
+    valid_mask = np.isfinite(pw_flat) & np.isfinite(q_col_mean) & (q_col_mean > 0)
+    if np.sum(valid_mask) > 100:
+        r_pw_q, _ = pearsonr(pw_flat[valid_mask], q_col_mean[valid_mask])
+        print(f"      PW vs column-mean q correlation: r = {r_pw_q:.6f}")
+        if r_pw_q > 0.90:
+            print(f"      PASS  Strong PW-moisture correlation (r > 0.90)")
+        else:
+            print(f"      FAIL  Weak PW-moisture correlation (expected r > 0.90)")
+            all_pass = False
+
+    # 850 hPa dewpoint should be below temperature everywhere
+    td_over_t = np.sum(d["td850_C"] > d["t850_C"] + 0.5)
+    total_pts = d["t850_C"].size
+    print(f"      Td > T at 850 hPa: {td_over_t} / {total_pts} pts"
+          f" ({td_over_t/total_pts*100:.4f}%)")
+    if td_over_t / total_pts < 0.01:
+        print(f"      PASS  Td <= T constraint satisfied (>99%)")
+    else:
+        print(f"      FAIL  Too many Td > T violations")
+        all_pass = False
+
+    # Mixing ratio from GRIB q vs mixing_ratio function should be consistent
+    w_from_q = d["w_mr"][d["i850"]].ravel()
+    mr_cpu_np = _to_np(mr_cpu).ravel()
+    # They use different inputs (w_from_q is from q, mr_cpu is from vapor pressure)
+    # but both are mixing ratios at 850 hPa -- they should be correlated
+    valid_w = np.isfinite(w_from_q) & np.isfinite(mr_cpu_np) & (w_from_q > 0) & (mr_cpu_np > 0)
+    if np.sum(valid_w) > 100:
+        r_w, _ = pearsonr(w_from_q[valid_w], mr_cpu_np[valid_w])
+        print(f"      GRIB w vs computed mixing_ratio r = {r_w:.6f}")
+        if r_w > 0.95:
+            print(f"      PASS  Mixing ratio consistency (r > 0.95)")
+        else:
+            print(f"      WARN  Mixing ratio methods diverge (r = {r_w:.4f})")
+
     # ==================================================================
     # VERIFICATION SUMMARY TABLE
     # ==================================================================
@@ -746,6 +782,7 @@ def main():
         "Function", "Comparison", "P/F", "mean_diff", "max_abs", "RMSE",
         "99th pct", "relRMSE%", "Pearson r", ">1%rel", ">0.1%rel"))
     print("  " + "-" * (W - 4))
+
     for (fn, pair, status, md, ma, rmse_v, p99, rr, pr, g1, g01) in verify_rows:
         if status == "SKIP":
             print(f"  {fn:<28s} {pair:<18s} {'SKIP':>6s}")

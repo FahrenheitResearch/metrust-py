@@ -1,14 +1,13 @@
 #!/usr/bin/env python
-"""Bench 11 -- GFS Cold Air Outbreak verification benchmark.
+"""Bench 11 -- GFS Cold Air Outbreak verification benchmark (REAL DATA).
 
 Scenario
 --------
-GFS 0.25-deg grid (400 x 600), 850 hPa level.
-Arctic air mass plunging south over the Great Plains:
-  - Temperature: -30 C (north) to +5 C (south), strong meridional gradient
-  - Winds: NW 15-30 m/s (cold advection regime)
-  - Dewpoints: very low in cold sector (-45 C north, -5 C south)
-  - dx = 20 000 m, dy = 27 800 m  (GFS mid-latitude spacing)
+Real GFS 0.25-deg analysis at 850 hPa from ``data/gfs_0p25.grib2``.
+Mid-latitude baroclinic zone slice: 30-70 N (161 x 1440).
+  - Temperature, winds, specific humidity read directly from GRIB2
+  - Dewpoint derived from specific humidity via vapor pressure
+  - dx = dy = 27 800 m  (GFS 0.25-deg mid-latitude spacing)
 
 Functions
 ---------
@@ -17,8 +16,8 @@ Functions
   dewpoint (from vapor pressure)  (GPU-eligible)
   vorticity                       (GPU-eligible)
   frontogenesis                   (GPU-eligible)
-  saturation_mixing_ratio         (CPU)
-  virtual_temperature             (CPU)
+  saturation_mixing_ratio         (CPU + met-cu)
+  virtual_temperature             (CPU + met-cu)
 
 Backends: MetPy (Pint), metrust CPU, met-cu direct, metrust GPU.
 
@@ -31,12 +30,13 @@ For every function, every backend vs MetPy reference:
   - Pearson correlation coefficient
   - Percentage of points > 1% and > 0.1% relative error
   - Histogram of diffs (text)
-  - Edge cases: coldest point (north), warmest point (south), strongest gradient
+  - Edge cases: coldest point, warmest point, strongest gradient
 
 Timing: perf_counter, cupy sync, 1 warmup + 5 timed, median.
 """
 from __future__ import annotations
 
+import os
 import sys
 import time
 import warnings
@@ -49,55 +49,82 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 # ---------------------------------------------------------------------------
-# Grid parameters
+# Load REAL GFS 850 hPa data
 # ---------------------------------------------------------------------------
-NY, NX = 400, 600
-DX = 20_000.0   # metres
-DY = 27_800.0   # metres
-P_HPA = 850.0   # pressure level
+import xarray as xr
 
-np.random.seed(2024)
+GRIB_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "data", "gfs_0p25.grib2")
+GRIB_PATH = os.path.normpath(GRIB_PATH)
+if not os.path.isfile(GRIB_PATH):
+    # fallback: try relative to cwd
+    GRIB_PATH = os.path.normpath("data/gfs_0p25.grib2")
+
+print(f"Loading GRIB2: {GRIB_PATH}")
+ds = xr.open_dataset(
+    GRIB_PATH,
+    engine="cfgrib",
+    backend_kwargs={
+        "indexpath": "",
+        "filter_by_keys": {"typeOfLevel": "isobaricInhPa", "level": 850},
+    },
+    errors="ignore",
+)
+
+# Latitude slice: 30-70 N (baroclinic zone)
+# GFS lat: 90 -> -90 in 0.25 steps.  Index for 70N = (90-70)/0.25 = 80
+# Index for 30N = (90-30)/0.25 = 240 (inclusive) so slice is [80:241]
+LAT_70N = int((90 - 70) / 0.25)       # 80
+LAT_30N = int((90 - 30) / 0.25) + 1   # 241
+lat_vals = ds.latitude.values[LAT_70N:LAT_30N]
+
+NY = LAT_30N - LAT_70N   # 161
+NX = 1440
+DX = 27_800.0   # metres -- approximate GFS 0.25-deg at mid-latitudes
+DY = 27_800.0
+P_HPA = 850.0
+
+# Extract 2-D slices as contiguous float64
+t_K_arr  = np.ascontiguousarray(ds["t"].values[LAT_70N:LAT_30N, :], dtype=np.float64)   # Kelvin
+t_arr    = t_K_arr - 273.15                                                               # Celsius
+u_arr    = np.ascontiguousarray(ds["u"].values[LAT_70N:LAT_30N, :], dtype=np.float64)   # m/s
+v_arr    = np.ascontiguousarray(ds["v"].values[LAT_70N:LAT_30N, :], dtype=np.float64)   # m/s
+q_arr    = np.ascontiguousarray(ds["q"].values[LAT_70N:LAT_30N, :], dtype=np.float64)   # kg/kg specific humidity
+
+ds.close()
+
+print(f"  Grid: {NY} x {NX}   lat {lat_vals[0]:.2f} N to {lat_vals[-1]:.2f} N")
+print(f"  T(C) range : [{t_arr.min():.2f}, {t_arr.max():.2f}]")
+print(f"  u range    : [{u_arr.min():.2f}, {u_arr.max():.2f}] m/s")
+print(f"  v range    : [{v_arr.min():.2f}, {v_arr.max():.2f}] m/s")
+print(f"  q range    : [{q_arr.min():.6f}, {q_arr.max():.6f}] kg/kg")
 
 # ---------------------------------------------------------------------------
-# Synthetic cold-air-outbreak fields
+# Derived fields
 # ---------------------------------------------------------------------------
-# latitude proxy: row 0 = south (+5 C), row NY-1 = north (-30 C)
-lat_frac = np.linspace(0.0, 1.0, NY).reshape(NY, 1)  # 0=south, 1=north
+# Dewpoint: compute vapor pressure from specific humidity, then invert Bolton
+#   e = q * p / (0.622 + 0.378 * q)   [hPa]
+vp_arr = np.ascontiguousarray(q_arr * P_HPA / (0.62197 + 0.37803 * q_arr), dtype=np.float64)
+# Bolton inversion: Td(C) = 243.5 * ln(e/6.112) / (17.67 - ln(e/6.112))
+_log_ratio = np.log(vp_arr / 6.112)
+td_arr = np.ascontiguousarray(243.5 * _log_ratio / (17.67 - _log_ratio), dtype=np.float64)
+# Ensure Td <= T - 0.1 (physical constraint)
+td_arr = np.minimum(td_arr, t_arr - 0.1)
 
-# Temperature: +5 C south to -30 C north, with mesoscale perturbation
-t_base = 5.0 - 35.0 * lat_frac                         # (NY,1)
-t_perturb = 1.5 * np.random.randn(NY, NX)
-t_arr = np.ascontiguousarray((t_base + t_perturb).astype(np.float64))  # degC
-
-# Dewpoint: -5 C south to -45 C north (very dry cold air)
-td_base = -5.0 - 40.0 * lat_frac
-td_perturb = 1.0 * np.random.randn(NY, NX)
-td_arr = np.ascontiguousarray(np.minimum(td_base + td_perturb, t_arr - 0.5).astype(np.float64))
-
-# Winds: strong northwesterly, intensifying northward
-# u-component (westerly): 15 south to 30 north (m/s)
-u_base = 15.0 + 15.0 * lat_frac
-u_perturb = 2.0 * np.random.randn(NY, NX)
-u_arr = np.ascontiguousarray((u_base + u_perturb).astype(np.float64))
-
-# v-component (southerly negative = northerly): -15 south to -25 north
-v_base = -15.0 - 10.0 * lat_frac
-v_perturb = 2.0 * np.random.randn(NY, NX)
-v_arr = np.ascontiguousarray((v_base + v_perturb).astype(np.float64))
-
-# Potential temperature field for frontogenesis (K)
-theta_arr = np.ascontiguousarray((t_arr + 273.15 + 15.0 * lat_frac + 0.5 * np.random.randn(NY, NX)).astype(np.float64))
-
-# Vapor pressure for dewpoint-from-VP benchmark (Bolton formula, hPa)
-vp_arr = np.ascontiguousarray((6.112 * np.exp(17.67 * td_arr / (td_arr + 243.5))).astype(np.float64))
-
-# Mixing ratio for virtual_temperature (kg/kg)
-# From saturation mixing ratio at dewpoint: w = 0.622 * e / (p - e)
-mr_arr = np.ascontiguousarray((0.62197 * (vp_arr) / (P_HPA - vp_arr)).astype(np.float64))
+# Mixing ratio from specific humidity:  w = q / (1 - q)
+mr_arr = np.ascontiguousarray(q_arr / (1.0 - q_arr), dtype=np.float64)
 mr_arr = np.clip(mr_arr, 0.0, None)
+
+# Potential temperature field for frontogenesis (compute from T and p)
+# theta = T * (1000/p)^(R/cp),  R/cp = 0.2854
+theta_arr = np.ascontiguousarray(t_K_arr * (1000.0 / P_HPA) ** 0.2854, dtype=np.float64)
 
 # Full pressure array (GPU kernels need broadcasted arrays, not scalars)
 p_arr = np.full((NY, NX), P_HPA, dtype=np.float64)
+
+print(f"  Td(C) range: [{td_arr.min():.2f}, {td_arr.max():.2f}]")
+print(f"  VP range   : [{vp_arr.min():.4f}, {vp_arr.max():.4f}] hPa")
+print(f"  w range    : [{mr_arr.min():.6f}, {mr_arr.max():.6f}] kg/kg")
+print(f"  theta range: [{theta_arr.min():.2f}, {theta_arr.max():.2f}] K")
 
 # ---------------------------------------------------------------------------
 # Imports -- MetPy, metrust, met-cu
@@ -123,16 +150,16 @@ except Exception:
 # ---------------------------------------------------------------------------
 # Pint-wrapped fields for MetPy
 # ---------------------------------------------------------------------------
-p_q = P_HPA * units.hPa
-t_q = (t_arr + 273.15) * units.K     # MetPy expects Kelvin
-td_q = (td_arr + 273.15) * units.K
-u_q = u_arr * units("m/s")
-v_q = v_arr * units("m/s")
+p_q     = P_HPA * units.hPa
+t_q     = t_K_arr * units.K          # MetPy expects Kelvin
+td_q    = (td_arr + 273.15) * units.K
+u_q     = u_arr * units("m/s")
+v_q     = v_arr * units("m/s")
 theta_q = theta_arr * units.K
-dx_q = DX * units.m
-dy_q = DY * units.m
-vp_q = vp_arr * units.hPa
-mr_q = mr_arr * units("kg/kg")       # MetPy: dimensionless (kg/kg)
+dx_q    = DX * units.m
+dy_q    = DY * units.m
+vp_q    = vp_arr * units.hPa
+mr_q    = mr_arr * units("kg/kg")
 
 # ---------------------------------------------------------------------------
 # Timing harness
@@ -180,14 +207,17 @@ def spd(ref, val):
 
 
 # ---------------------------------------------------------------------------
-# Edge-case indices: coldest (north), warmest (south), strongest gradient
+# Edge-case indices: coldest, warmest, strongest gradient
 # ---------------------------------------------------------------------------
-# Coldest point: top-right quadrant (extreme north)
-IDX_COLD = (NY - 1, NX // 2)      # last row, mid-column
-# Warmest point: bottom-left quadrant (extreme south)
-IDX_WARM = (0, NX // 2)           # first row, mid-column
-# Strongest gradient: middle of domain where baroclinic zone is steepest
-# Gradient of temperature along y
+# Coldest point: find actual minimum T in array
+_flat_cold = np.argmin(t_arr)
+IDX_COLD = np.unravel_index(_flat_cold, t_arr.shape)
+
+# Warmest point: find actual maximum T in array
+_flat_warm = np.argmax(t_arr)
+IDX_WARM = np.unravel_index(_flat_warm, t_arr.shape)
+
+# Strongest gradient: highest dT/dy magnitude in interior
 t_grad_y = np.abs(np.gradient(t_arr, axis=0))
 _grad_flat = t_grad_y[2:-2, 2:-2].ravel()
 _grad_idx = np.argmax(_grad_flat)
@@ -195,9 +225,9 @@ _gy, _gx = np.unravel_index(_grad_idx, t_grad_y[2:-2, 2:-2].shape)
 IDX_GRAD = (_gy + 2, _gx + 2)
 
 EDGE_LABELS = {
-    "coldest (north)": IDX_COLD,
-    "warmest (south)": IDX_WARM,
-    "max gradient":    IDX_GRAD,
+    "coldest":      IDX_COLD,
+    "warmest":      IDX_WARM,
+    "max gradient": IDX_GRAD,
 }
 
 
@@ -425,14 +455,15 @@ def record(name, t_mp, t_cpu, t_gpu_direct, t_gpu_metrust, verified):
 # ===========================================================================
 # Header
 # ===========================================================================
+print()
 print("=" * 120)
-print("BENCH 11 -- GFS Cold Air Outbreak  |  grid %d x %d  |  850 hPa" % (NY, NX))
+print("BENCH 11 -- GFS 850 hPa Real Data  |  grid %d x %d  |  30-70 N baroclinic zone" % (NY, NX))
 print("  DEEP DATA CORRECTNESS VERIFICATION")
 print("=" * 120)
 print(f"  GPU: {GPU_NAME}" if HAS_GPU else "  GPU: not available")
 print(f"  Edge-case indices:")
 for label, idx in EDGE_LABELS.items():
-    print(f"    {label:20s} : row={idx[0]:3d}  col={idx[1]:3d}  "
+    print(f"    {label:20s} : row={idx[0]:3d}  col={idx[1]:4d}  "
           f"T={t_arr[idx]:.1f} C  Td={td_arr[idx]:.1f} C")
 print()
 
@@ -440,17 +471,16 @@ print()
 # ===========================================================================
 # Physical plausibility bounds for each function
 # ===========================================================================
-# (lo, hi, unit_label)
+# Based on real 850 hPa mid-latitude data ranges (30-70N).
+# T ranges roughly -36 C to +30 C at 850 hPa.
 PHYS_BOUNDS = {
-    "potential_temperature":            (240.0, 300.0, "K"),
-    "equivalent_potential_temperature": (240.0, 330.0, "K"),
-    "dewpoint":                         (-50.0, 10.0,  "degC"),
-    "vorticity":                        (-2e-3, 2e-3,  "1/s"),
-    "frontogenesis":                    (-5e-7, 5e-7,  "K/m/s"),
-    "saturation_mixing_ratio":          (0.0,   0.015, "kg/kg"),
-    # Virtual temp is slightly warmer than dry-bulb due to moisture correction;
-    # southern warm sector can reach ~12 C Tv, northern extreme ~-35 C.
-    "virtual_temperature":              (-36.0, 13.0,  "degC"),
+    "potential_temperature":            (245.0, 325.0, "K"),
+    "equivalent_potential_temperature": (245.0, 380.0, "K"),
+    "dewpoint":                         (-70.0, 30.0,  "degC"),
+    "vorticity":                        (-5e-3, 5e-3,  "1/s"),
+    "frontogenesis":                    (-1e-6, 1e-6,  "K/m/s"),
+    "saturation_mixing_ratio":          (0.0,   0.040, "kg/kg"),
+    "virtual_temperature":              (-40.0, 35.0,  "degC"),
 }
 
 
@@ -501,14 +531,14 @@ print("-" * 120)
 # -- MetPy reference --
 ref_pt = mpcalc.potential_temperature(p_q, t_q).to("K").magnitude
 
-# -- metrust CPU --
+# -- metrust CPU (takes hPa scalar, Celsius array) --
 mrcalc.set_backend("cpu")
 mr_pt = mrcalc.potential_temperature(P_HPA, t_arr)
 if hasattr(mr_pt, "magnitude"):
     mr_pt = mr_pt.magnitude
 mr_pt = np.asarray(mr_pt, dtype=np.float64)
 
-# -- met-cu direct --
+# -- met-cu direct (needs 2-D pressure array) --
 mcu_pt = None
 if HAS_GPU:
     mcu_pt_raw = mcucalc.potential_temperature(p_arr, t_arr)
@@ -542,26 +572,25 @@ record("potential_temperature", t_mp, t_cpu, t_gpu_d, t_gpu_mr, verified)
 
 # ===========================================================================
 # 2. equivalent_potential_temperature  (GPU-eligible)
-#    NOTE: scalar pressure bug in GPU dispatch has been FIXED -- re-test.
 # ===========================================================================
 
 # -- MetPy reference --
 ref_ept = mpcalc.equivalent_potential_temperature(p_q, t_q, td_q).to("K").magnitude
 
-# -- metrust CPU --
+# -- metrust CPU (scalar pressure, Celsius arrays) --
 mrcalc.set_backend("cpu")
 mr_ept = mrcalc.equivalent_potential_temperature(P_HPA, t_arr, td_arr)
 if hasattr(mr_ept, "magnitude"):
     mr_ept = mr_ept.magnitude
 mr_ept = np.asarray(mr_ept, dtype=np.float64)
 
-# -- met-cu direct (pressure passed as 2-D array) --
+# -- met-cu direct (broadcast scalar pressure to 2-D array for GPU) --
 mcu_ept = None
 if HAS_GPU:
     mcu_ept_raw = mcucalc.equivalent_potential_temperature(p_arr, t_arr, td_arr)
     mcu_ept = mcu_ept_raw.get() if hasattr(mcu_ept_raw, "get") else np.asarray(mcu_ept_raw)
 
-# -- metrust GPU (re-test with scalar pressure fix) --
+# -- metrust GPU --
 mrgpu_ept = None
 if HAS_GPU:
     mrcalc.set_backend("gpu")
@@ -691,9 +720,9 @@ record("vorticity", t_mp, t_cpu, t_gpu_d, t_gpu_mr, verified)
 # -- MetPy reference --
 ref_fronto = mpcalc.frontogenesis(theta_q, u_q, v_q, dx=dx_q, dy=dy_q).to("K/m/s").magnitude
 
-# -- metrust CPU --
+# -- metrust CPU (raw arrays, scalar dx/dy) --
 mrcalc.set_backend("cpu")
-mr_fronto = mrcalc.frontogenesis(theta_arr * units.K, u_q, v_q, dx=dx_q, dy=dy_q)
+mr_fronto = mrcalc.frontogenesis(theta_arr, u_arr, v_arr, dx=DX, dy=DY)
 if hasattr(mr_fronto, "magnitude"):
     mr_fronto = mr_fronto.magnitude
 mr_fronto = np.asarray(mr_fronto, dtype=np.float64)
@@ -708,7 +737,7 @@ if HAS_GPU:
 mrgpu_fronto = None
 if HAS_GPU:
     mrcalc.set_backend("gpu")
-    mrgpu_fronto_raw = mrcalc.frontogenesis(theta_arr * units.K, u_q, v_q, dx=dx_q, dy=dy_q)
+    mrgpu_fronto_raw = mrcalc.frontogenesis(theta_arr, u_arr, v_arr, dx=DX, dy=DY)
     if hasattr(mrgpu_fronto_raw, "magnitude"):
         mrgpu_fronto_raw = mrgpu_fronto_raw.magnitude
     mrgpu_fronto = mrgpu_fronto_raw.get() if hasattr(mrgpu_fronto_raw, "get") else np.asarray(mrgpu_fronto_raw)
@@ -721,35 +750,35 @@ verified = verify_all_backends("frontogenesis", ref_fronto, mr_fronto,
 # -- Timing --
 t_mp = bench(lambda: mpcalc.frontogenesis(theta_q, u_q, v_q, dx=dx_q, dy=dy_q))
 mrcalc.set_backend("cpu")
-t_cpu = bench(lambda: mrcalc.frontogenesis(theta_arr * units.K, u_q, v_q, dx=dx_q, dy=dy_q))
+t_cpu = bench(lambda: mrcalc.frontogenesis(theta_arr, u_arr, v_arr, dx=DX, dy=DY))
 t_gpu_d = bench(lambda: mcucalc.frontogenesis(theta_arr, u_arr, v_arr, dx=DX, dy=DY), gpu=True) if HAS_GPU else None
 if HAS_GPU:
     mrcalc.set_backend("gpu")
-t_gpu_mr = bench(lambda: mrcalc.frontogenesis(theta_arr * units.K, u_q, v_q, dx=dx_q, dy=dy_q), gpu=True) if HAS_GPU else None
+t_gpu_mr = bench(lambda: mrcalc.frontogenesis(theta_arr, u_arr, v_arr, dx=DX, dy=DY), gpu=True) if HAS_GPU else None
 if HAS_GPU:
     mrcalc.set_backend("cpu")
 
 record("frontogenesis", t_mp, t_cpu, t_gpu_d, t_gpu_mr, verified)
 
 # ===========================================================================
-# 6. saturation_mixing_ratio  (CPU only)
+# 6. saturation_mixing_ratio  (CPU + met-cu)
 # ===========================================================================
 print()
 print("-" * 120)
-print("CPU-ONLY FUNCTIONS")
+print("MOISTURE / VIRTUAL TEMP FUNCTIONS")
 print("-" * 120)
 
-# -- MetPy reference --
+# -- MetPy reference (takes pressure in hPa, temperature in K) --
 ref_smr = mpcalc.saturation_mixing_ratio(p_q, t_q).to("kg/kg").magnitude
 
-# -- metrust CPU --
+# -- metrust CPU (scalar pressure hPa, Celsius array) --
 mrcalc.set_backend("cpu")
 mr_smr = mrcalc.saturation_mixing_ratio(P_HPA, t_arr)
 if hasattr(mr_smr, "magnitude"):
     mr_smr = mr_smr.magnitude
 mr_smr = np.asarray(mr_smr, dtype=np.float64)
 
-# -- met-cu direct (runs kernel on GPU, returns kg/kg) --
+# -- met-cu direct (needs 2-D pressure array for GPU kernel) --
 mcu_smr = None
 if HAS_GPU:
     mcu_smr_raw = mcucalc.saturation_mixing_ratio(p_arr, t_arr)
@@ -768,20 +797,20 @@ t_gpu_d = bench(lambda: mcucalc.saturation_mixing_ratio(p_arr, t_arr), gpu=True)
 record("saturation_mixing_ratio", t_mp, t_cpu, t_gpu_d, None, verified)
 
 # ===========================================================================
-# 7. virtual_temperature  (CPU only)
+# 7. virtual_temperature  (CPU + met-cu)
 # ===========================================================================
 
-# MetPy: virtual_temperature(temperature_K, mixing_ratio_kg/kg)
+# MetPy: virtual_temperature(temperature_K, mixing_ratio_kg/kg) -> K
 ref_vt = mpcalc.virtual_temperature(t_q, mr_q).to("degC").magnitude
 
-# -- metrust CPU: virtual_temperature(T_degC, mixing_ratio_kg/kg) --
+# -- metrust CPU: virtual_temperature(T_degC, mixing_ratio_kg/kg) -> degC --
 mrcalc.set_backend("cpu")
 mr_vt = mrcalc.virtual_temperature(t_arr, mr_arr)
 if hasattr(mr_vt, "magnitude"):
     mr_vt = mr_vt.magnitude
 mr_vt = np.asarray(mr_vt, dtype=np.float64)
 
-# -- met-cu direct: virtual_temperature(T_degC, mixing_ratio_kg/kg) --
+# -- met-cu direct: virtual_temperature(T_degC, mixing_ratio_kg/kg) -> degC --
 mcu_vt = None
 if HAS_GPU:
     mcu_vt_raw = mcucalc.virtual_temperature(t_arr, mr_arr)

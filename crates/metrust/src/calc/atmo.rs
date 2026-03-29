@@ -225,10 +225,13 @@ pub fn heat_index(temperature_c: f64, relative_humidity_pct: f64) -> f64 {
     let t_f = temperature_c * 9.0 / 5.0 + 32.0;
     let rh = relative_humidity_pct;
 
-    // Below 80 F, use the simpler Steadman formula
-    if t_f < 80.0 {
-        let hi_f = 0.5 * (t_f + 61.0 + (t_f - 68.0) * 1.2 + rh * 0.094);
-        return (hi_f - 32.0) * 5.0 / 9.0;
+    // NWS two-step: compute Steadman, average with T, then decide
+    let steadman = 0.5 * (t_f + 61.0 + (t_f - 68.0) * 1.2 + rh * 0.094);
+    let hi_avg = (steadman + t_f) / 2.0;
+
+    if hi_avg < 80.0 {
+        // Below threshold, return the averaged Steadman result
+        return (hi_avg - 32.0) * 5.0 / 9.0;
     }
 
     // Rothfusz regression

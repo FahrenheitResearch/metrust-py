@@ -456,7 +456,12 @@ pub fn cape_cin_core(
                     let tv_parc_prev = virtual_temp(t_parc_prev, p_prev, t_parc_prev);
                     let buoy_prev = tv_parc_prev - tv_env_prev;
 
-                    if buoyancy != buoy_prev {
+                    if buoy_prev >= 0.0 {
+                        // Previous level is also buoyant — no real crossing.
+                        // The parcel is buoyant from the LCL (or surface)
+                        // upward, so the LFC is at the LCL pressure.
+                        p_lcl
+                    } else if buoyancy != buoy_prev {
                         let frac = (0.0 - buoy_prev) / (buoyancy - buoy_prev);
                         p_prev + frac * (p_curr - p_prev)
                     } else {
@@ -1423,9 +1428,12 @@ pub fn sigma_to_pressure(sigma: f64, p_sfc: f64, p_top: f64) -> f64 {
 /// t_f: temperature (Fahrenheit), rh: relative humidity (%).
 /// Returns heat index in Fahrenheit.
 pub fn heat_index(t_f: f64, rh: f64) -> f64 {
-    // Below 80F, use simple formula
-    if t_f < 80.0 {
-        return 0.5 * (t_f + 61.0 + (t_f - 68.0) * 1.2 + rh * 0.094);
+    // NWS two-step: compute Steadman, average with T, then decide
+    let steadman = 0.5 * (t_f + 61.0 + (t_f - 68.0) * 1.2 + rh * 0.094);
+    let hi_avg = (steadman + t_f) / 2.0;
+
+    if hi_avg < 80.0 {
+        return hi_avg;
     }
 
     // Rothfusz regression
@@ -3176,9 +3184,10 @@ mod tests {
 
     #[test]
     fn test_heat_index_below_80f() {
-        // Below 80F, uses simple formula: 0.5*(T + 61 + (T-68)*1.2 + RH*0.094)
+        // NWS two-step: Steadman averaged with T when avg < 80F
         let hi = heat_index(70.0, 50.0);
-        let expected = 0.5 * (70.0 + 61.0 + (70.0 - 68.0) * 1.2 + 50.0 * 0.094);
+        let steadman = 0.5 * (70.0 + 61.0 + (70.0 - 68.0) * 1.2 + 50.0 * 0.094);
+        let expected = (steadman + 70.0) / 2.0;
         assert!(
             (hi - expected).abs() < 1e-10,
             "Heat index at 70F/50%: got={hi}, expected={expected}"

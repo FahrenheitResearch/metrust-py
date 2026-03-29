@@ -1,11 +1,10 @@
-"""Benchmark 02: GFS 500 hPa Upper-Air Analysis
+"""Benchmark 02: GFS 500 hPa Upper-Air Analysis -- REAL DATA
 
 Scenario
 --------
 Global 0.25-degree grid (721 x 1440), single level.
-Synthetic data mimics a strong mid-latitude trough with an embedded
-shortwave: 500 hPa heights 5200-5880 gpm, winds 10-60 m/s,
-temperatures -10 to -30 C.
+Real GFS 0.25 analysis data from 2026-03-28 00Z (gfs_0p25.grib2).
+500 hPa heights, winds, temperature extracted from isobaric GRIB file.
 
 Functions benchmarked
 ---------------------
@@ -23,6 +22,7 @@ Four backends: MetPy, metrust CPU, met-cu (direct GPU), metrust GPU.
 import time
 import statistics
 import sys
+import os
 import numpy as np
 
 # ---------------------------------------------------------------------------
@@ -31,70 +31,69 @@ import numpy as np
 
 NY, NX = 721, 1440
 PRESSURE_HPA = 500.0               # 500 hPa level
-DX = 19_600.0                      # ~19.6 km at 45 N (meters)
+DX = 27_800.0                      # ~27.8 km representative mid-latitude
 DY = 27_800.0                      # ~27.8 km meridional (meters)
 
 N_WARMUP = 1
 N_TIMED  = 3
 RTOL     = 1e-4
 
-np.random.seed(2024)
-
 # ---------------------------------------------------------------------------
-# Synthetic 500 hPa data generation
+# Load REAL GFS data from GRIB2
 # ---------------------------------------------------------------------------
 
 print("=" * 80)
-print("BENCHMARK 02 -- GFS 500 hPa Upper-Air Analysis  (721 x 1440)")
+print("BENCHMARK 02 -- GFS 500 hPa Upper-Air Analysis  (721 x 1440)  REAL DATA")
 print("=" * 80)
 print()
-print("Generating synthetic mid-latitude trough data ...")
 
-lats = np.linspace(90, -90, NY)
-lons = np.linspace(0, 360, NX, endpoint=False)
-LON, LAT = np.meshgrid(lons, lats)
+GRIB_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "data", "gfs_0p25.grib2")
+GRIB_PATH = os.path.normpath(GRIB_PATH)
 
-# --- Heights: large-scale trough + embedded shortwave (gpm) ---------------
-hgt_mean = 5540.0
-trough_amp = 240.0   # deep trough
-sw_amp = 60.0         # shortwave
-heights = (
-    hgt_mean
-    - trough_amp * np.sin(np.radians(LAT * 2)) * np.cos(np.radians(LON - 250))
-    + sw_amp * np.sin(np.radians(LAT * 4)) * np.cos(np.radians(LON * 3 - 100))
-    + np.random.randn(NY, NX) * 8.0
+print(f"Loading GFS GRIB2: {GRIB_PATH}")
+if not os.path.isfile(GRIB_PATH):
+    print(f"  ERROR: file not found -- {GRIB_PATH}")
+    sys.exit(1)
+
+import xarray as xr
+
+ds = xr.open_dataset(
+    GRIB_PATH,
+    engine="cfgrib",
+    backend_kwargs={
+        "filter_by_keys": {"typeOfLevel": "isobaricInhPa"},
+        "indexpath": "",
+    },
 )
-heights = np.clip(heights, 5200, 5880).astype(np.float64)
 
-# --- Temperature: -10 to -30 C at 500 hPa ---------------------------------
-temp_mean = -20.0
-temp = (
-    temp_mean
-    + 10.0 * np.sin(np.radians(LAT))
-    + 3.0 * np.cos(np.radians(LON * 2 - 60))
-    + np.random.randn(NY, NX) * 1.5
-)
-temp = np.clip(temp, -30, -10).astype(np.float64)
+# Find nearest 500 hPa level index
+levels = ds.coords["isobaricInhPa"].values
+idx_500 = int(np.argmin(np.abs(levels - PRESSURE_HPA)))
+actual_level = levels[idx_500]
+print(f"  500 hPa level index: {idx_500}  (actual: {actual_level:.0f} hPa)")
 
-# --- Wind: geostrophic-ish + perturbations, 10-60 m/s ---------------------
-u_base = -15.0 * np.cos(np.radians(LAT)) + 8.0 * np.sin(np.radians(LON - 200))
-v_base = 5.0 * np.sin(np.radians(LAT * 2)) + 4.0 * np.cos(np.radians(LON - 180))
-u_wind = (u_base + np.random.randn(NY, NX) * 5.0).astype(np.float64)
-v_wind = (v_base + np.random.randn(NY, NX) * 4.0).astype(np.float64)
+# Extract 500 hPa slices -- GRIB temperature is Kelvin
+temp_K = np.ascontiguousarray(ds["t"].values[idx_500], dtype=np.float64)    # K
+u_wind = np.ascontiguousarray(ds["u"].values[idx_500], dtype=np.float64)    # m/s
+v_wind = np.ascontiguousarray(ds["v"].values[idx_500], dtype=np.float64)    # m/s
+heights = np.ascontiguousarray(ds["gh"].values[idx_500], dtype=np.float64)  # gpm
 
-# Potential temperature at 500 hPa (for frontogenesis)
-# theta = T * (1000/p)^(R/cp),  T in Kelvin
-temp_K = temp + 273.15
+# Convert Kelvin -> Celsius for potential_temperature input
+temp = temp_K - 273.15  # degC
+
+# Potential temperature at 500 hPa: theta = T_K * (1000/p)^(R/cp)
 theta = temp_K * (1000.0 / PRESSURE_HPA) ** 0.286
 theta = np.ascontiguousarray(theta, dtype=np.float64)
 
 # Pressure field for potential_temperature benchmark (uniform 500 hPa)
 pressure_field = np.full((NY, NX), PRESSURE_HPA, dtype=np.float64)
 
+ds.close()
+
+speed_check = np.sqrt(u_wind**2 + v_wind**2)
 print(f"  Grid shape:    {NY} x {NX}  ({NY * NX:,} points)")
 print(f"  Heights range: {heights.min():.0f} - {heights.max():.0f} gpm")
 print(f"  Temp range:    {temp.min():.1f} - {temp.max():.1f} C")
-speed_check = np.sqrt(u_wind**2 + v_wind**2)
 print(f"  Wind speed:    {speed_check.min():.1f} - {speed_check.max():.1f} m/s")
 print(f"  Theta range:   {theta.min():.1f} - {theta.max():.1f} K")
 print(f"  dx = {DX:.0f} m,  dy = {DY:.0f} m")
@@ -432,6 +431,7 @@ print(f"  metrust CPU: {fmt_ms(t):>12s}")
 
 if HAS_METCU:
     # met-cu expects hPa for pressure, Celsius for temperature
+    # Broadcast scalar pressure to array shape for met-cu
     t, r = timed(lambda: mcucalc.potential_temperature(pressure_field, temp), sync_gpu=True)
     record("potential_temperature", "met-cu GPU", t, r)
     print(f"  met-cu GPU:  {fmt_ms(t):>12s}")
@@ -453,18 +453,17 @@ from scipy.stats import pearsonr
 import math
 
 # -- Physical plausibility bounds per function --
-# Bounds reflect realistic extremes for a 0.25-deg GFS grid with an
-# intense mid-latitude trough and random perturbations (dx ~ 19.6 km).
-# Small-scale noise steepens finite-difference gradients beyond textbook
-# synoptic values, but these are physically plausible for mesoscale grids.
+# Bounds reflect realistic extremes for a 0.25-deg GFS grid with real
+# 500 hPa atmospheric data.  Finite-difference gradients on the 27.8 km
+# grid can produce values larger than textbook synoptic estimates.
 PHYS_BOUNDS = {
-    "vorticity":             (-5e-3, 5e-3),      # 1/s  (intense mesoscale vortex OK)
-    "divergence":            (-5e-3, 5e-3),       # 1/s  (strong conv/div with noise)
+    "vorticity":             (-5e-3, 5e-3),      # 1/s  (real vorticity, mesoscale OK)
+    "divergence":            (-5e-3, 5e-3),       # 1/s  (real divergence)
     "advection":             (-1.0, 1.0),          # K/s  (temperature advection)
     "frontogenesis":         (-1e-4, 1e-4),        # K/m/s (Petterssen frontogenesis)
-    "wind_speed":            (0.0, 100.0),         # m/s
+    "wind_speed":            (0.0, 100.0),         # m/s  (max ~71 m/s in data)
     "wind_direction":        (0.0, 360.0),         # degrees
-    "potential_temperature": (280.0, 350.0),       # K
+    "potential_temperature": (260.0, 350.0),       # K  (real range ~273-333 K)
 }
 
 # -- Thresholds for PASS/FAIL --
@@ -489,6 +488,7 @@ print()
 print("=" * 80)
 print("COMPREHENSIVE DATA CORRECTNESS VERIFICATION")
 print("  Ground truth: MetPy   |   Grid: 721 x 1440  (1,038,240 pts)")
+print("  Data source:  GFS 0.25 analysis  2026-03-28 00Z  500 hPa")
 print("=" * 80)
 
 
@@ -791,7 +791,7 @@ else:
 
 print()
 print("=" * 80)
-print("TIMING SUMMARY  (median of 3 runs, 721x1440 grid)")
+print("TIMING SUMMARY  (median of 3 runs, 721x1440 grid, REAL GFS data)")
 print("=" * 80)
 
 header = f"  {'Function':25s}"

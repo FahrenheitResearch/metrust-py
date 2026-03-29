@@ -1,11 +1,12 @@
-"""Benchmark 01: HRRR Severe Thunderstorm Environment
+"""Benchmark 01: HRRR Severe Thunderstorm Environment (REAL DATA)
 
-Synthetic 3-km HRRR subdomain (500x500, 30 vertical levels) mimicking a
-classic Great Plains severe convective environment with:
-  - Capping inversion near 850 hPa
-  - Rich low-level moisture (dewpoints 18-22 C at surface)
-  - Strong deep-layer shear (backing SE sfc winds, veering SW aloft)
-  - Steep mid-level lapse rates
+Uses actual HRRR GRIB2 model output:
+  - hrrr_prs.grib2: 40 isobaric levels (1059 x 1799), fields t/u/v/q/gh
+  - hrrr_sfc.grib2: surface pressure (sp), orography (orog), 2m T/Td/q
+
+The full 1059x1799 grid is used for thermodynamic and wind functions.
+A configurable subdomain is used for the expensive grid-column composites
+(CAPE/CIN, SRH, shear).
 
 Compares 4 backends:
   1. MetPy     (Pint-unit arrays)
@@ -17,6 +18,7 @@ Prints PASS/FAIL for cross-backend numerical agreement and median timing.
 """
 
 import sys
+import os
 import time
 import statistics
 import numpy as np
@@ -25,147 +27,153 @@ import numpy as np
 # Configuration
 # ============================================================================
 
-NY, NX, NZ = 500, 500, 30       # HRRR 3-km subdomain with 30 levels
+DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "data")
+PRS_GRIB = os.path.join(DATA_DIR, "hrrr_prs.grib2")
+SFC_GRIB = os.path.join(DATA_DIR, "hrrr_sfc.grib2")
+
 THERMO_RTOL, THERMO_ATOL = 1e-4, 1e-2
 GRID_RTOL, GRID_ATOL = 1e-3, 0.5   # grid composites can differ more
+CAPE_RTOL, CAPE_ATOL = 1e-3, 1.0   # CAPE: real data 40-level lifting can differ ~1 J/kg
 WARMUP = 1
 TIMED_RUNS = 3
 
-np.random.seed(42)
+# Subdomain for expensive column composites (CAPE/CIN, SRH, shear).
+# Full grid is 1059x1799.  Use a generous subdomain for real-data coverage.
+CAPE_NY, CAPE_NX = 200, 200
 
 # ============================================================================
-# Synthetic Great Plains Severe Environment
+# Load real HRRR data
 # ============================================================================
 
-def build_environment():
-    """Build realistic 3-D fields for a Great Plains severe convective event.
+def load_hrrr_environment():
+    """Load 3-D and surface fields from real HRRR GRIB2 files.
 
     Returns a dict with all arrays needed by the benchmarked functions.
     """
-    # --- Pressure levels (hPa) from surface (~970) to ~100 hPa ---
-    # Non-uniform: dense near surface, sparser aloft (typical model levels)
-    p_levels_hPa = np.array([
-        970, 960, 950, 940, 925, 900, 875, 850, 825, 800,
-        775, 750, 725, 700, 650, 600, 550, 500, 450, 400,
-        350, 300, 275, 250, 225, 200, 175, 150, 125, 100,
-    ], dtype=np.float64)
-    assert len(p_levels_hPa) == NZ
+    import xarray as xr
 
-    # Heights AGL (m) -- approximate hydrostatic, realistic for Great Plains
-    # (surface ~350 m MSL, so AGL starts at 0)
-    h_levels_m = np.array([
-        0, 100, 200, 320, 500, 750, 1050, 1400, 1800, 2200,
-        2650, 3100, 3600, 4100, 5200, 6400, 7600, 8900, 10200, 11600,
-        13000, 14500, 15400, 16200, 17100, 18000, 19000, 20100, 21300, 22600,
-    ], dtype=np.float64)
+    print("  Loading HRRR pressure levels ...")
+    ds_prs = xr.open_dataset(
+        PRS_GRIB, engine="cfgrib",
+        backend_kwargs={
+            "filter_by_keys": {"typeOfLevel": "isobaricInhPa"},
+            "indexpath": "",
+        },
+    )
 
-    # --- Temperature profile (C) ---
-    # Warm, moist BL (~30 C sfc), capping inversion near 850 hPa,
-    # then steep lapse rate above cap, standard cooling aloft.
-    t_profile_C = np.array([
-        30.0, 29.0, 28.0, 27.0, 25.5, 23.0, 21.0, 20.5, 18.0, 15.5,
-        13.0, 10.5,  8.0,  5.5,  0.5, -5.0, -11.0, -18.0, -26.0, -35.0,
-        -44.0, -55.0, -59.0, -62.0, -64.0, -65.0, -67.0, -70.0, -73.0, -76.0,
-    ], dtype=np.float64)
+    print("  Loading HRRR surface fields ...")
+    ds_sfc = xr.open_dataset(
+        SFC_GRIB, engine="cfgrib",
+        backend_kwargs={
+            "filter_by_keys": {
+                "typeOfLevel": "surface",
+                "shortName": ["sp", "orog"],
+            },
+            "indexpath": "",
+        },
+    )
 
-    # --- Dewpoint profile (C) ---
-    # Very moist BL (Td near T), sharp dryline-type drop above 850,
-    # very dry mid/upper levels.
-    td_profile_C = np.array([
-        22.0, 21.5, 21.0, 20.5, 19.0, 17.0, 14.0,  8.0,  4.0,  0.0,
-        -4.0, -8.0, -13.0, -18.0, -28.0, -35.0, -40.0, -45.0, -52.0, -58.0,
-        -62.0, -68.0, -70.0, -72.0, -74.0, -76.0, -78.0, -80.0, -82.0, -84.0,
-    ], dtype=np.float64)
+    print("  Loading HRRR 2-m fields ...")
+    ds_2m = xr.open_dataset(
+        SFC_GRIB, engine="cfgrib",
+        backend_kwargs={
+            "filter_by_keys": {
+                "typeOfLevel": "heightAboveGround",
+                "level": 2,
+                "shortName": ["2t", "2d", "2sh"],
+            },
+            "indexpath": "",
+        },
+    )
 
-    # --- Wind profile (m/s) ---
-    # Classic Great Plains shear:
-    #   Surface: SE at 8 m/s (u~+3, v~-7)  -- warm, moist inflow
-    #   850 hPa: SSE at 15 m/s (backed)
-    #   500 hPa: WSW at 25 m/s (veering)
-    #   300 hPa: W at 40 m/s (jet)
-    #   200 hPa: W at 50 m/s
-    u_profile = np.array([
-        3.0,  3.5,  4.0,  5.0,  6.0,  8.0, 10.0, 12.0, 14.0, 16.0,
-        17.0, 18.0, 19.0, 20.0, 22.0, 24.0, 26.0, 28.0, 32.0, 36.0,
-        38.0, 40.0, 42.0, 44.0, 46.0, 48.0, 49.0, 50.0, 50.0, 50.0,
-    ], dtype=np.float64)
-    v_profile = np.array([
-        -7.0, -7.5, -8.0, -8.0, -7.0, -5.0, -3.0, -1.0,  1.0,  3.0,
-         4.0,  5.0,  5.5,  6.0,  5.0,  4.0,  2.0,  0.0, -2.0, -4.0,
-        -5.0, -6.0, -6.0, -5.0, -4.0, -3.0, -2.0, -1.0,  0.0,  0.0,
-    ], dtype=np.float64)
+    # --- Extract numpy arrays (float64 for precision) ---
+    p_levels_hPa = ds_prs.coords["isobaricInhPa"].values.astype(np.float64)
+    NZ = len(p_levels_hPa)
+    NY, NX = ds_prs.sizes["y"], ds_prs.sizes["x"]
 
-    # --- Broadcast to 3-D (nz, ny, nx) with small spatial perturbations ---
-    # Add realistic mesoscale variability (few degrees T, few m/s wind)
-    rng = np.random.default_rng(12345)
+    # 3-D fields: (nz, ny, nx)
+    # Temperature: GRIB stores in Kelvin -> convert to Celsius
+    temperature_K = ds_prs["t"].values.astype(np.float64)   # (nz, ny, nx)
+    temperature_C = temperature_K - 273.15
 
-    # Spatial perturbation fields (ny, nx) -- smooth-ish
-    t_perturb = rng.normal(0, 1.5, (NY, NX)).astype(np.float64)
-    td_perturb = rng.normal(0, 1.0, (NY, NX)).astype(np.float64)
-    u_perturb = rng.normal(0, 1.0, (NY, NX)).astype(np.float64)
-    v_perturb = rng.normal(0, 1.0, (NY, NX)).astype(np.float64)
+    # Wind components (m/s)
+    u_3d = ds_prs["u"].values.astype(np.float64)
+    v_3d = ds_prs["v"].values.astype(np.float64)
 
-    # 3-D arrays: profile along axis-0, spatial perturbation scaled by level
-    temperature_3d = np.empty((NZ, NY, NX), dtype=np.float64)
-    dewpoint_3d = np.empty((NZ, NY, NX), dtype=np.float64)
-    u_3d = np.empty((NZ, NY, NX), dtype=np.float64)
-    v_3d = np.empty((NZ, NY, NX), dtype=np.float64)
-    pressure_3d = np.empty((NZ, NY, NX), dtype=np.float64)
-    height_agl_3d = np.empty((NZ, NY, NX), dtype=np.float64)
+    # Specific humidity (kg/kg) -> mixing ratio (kg/kg): w = q / (1 - q)
+    q_3d = ds_prs["q"].values.astype(np.float64)
+    qvapor_3d = q_3d / (1.0 - q_3d)
+    qvapor_3d = np.maximum(qvapor_3d, 1e-10)
 
-    for k in range(NZ):
-        # Perturbation amplitude decreases with height
-        amp = max(0.1, 1.0 - k / NZ)
-        temperature_3d[k] = t_profile_C[k] + amp * t_perturb
-        dewpoint_3d[k] = td_profile_C[k] + amp * td_perturb
-        # Ensure dewpoint <= temperature
-        dewpoint_3d[k] = np.minimum(dewpoint_3d[k], temperature_3d[k])
-        u_3d[k] = u_profile[k] + amp * u_perturb
-        v_3d[k] = v_profile[k] + amp * v_perturb
-        # Pressure: small horizontal variations (+/- 2 hPa)
-        p_pert = rng.normal(0, 0.5, (NY, NX)) * amp
-        pressure_3d[k] = p_levels_hPa[k] + p_pert
-        # Height AGL: small terrain variations (+/- 30 m) at low levels
-        h_pert = rng.normal(0, 10, (NY, NX)) * amp
-        height_agl_3d[k] = h_levels_m[k] + h_pert
-        # Ensure height_agl >= 0
-        height_agl_3d[k] = np.maximum(height_agl_3d[k], 0.0)
+    # Geopotential height (m)
+    gh_3d = ds_prs["gh"].values.astype(np.float64)
 
-    # Ensure heights are monotonically increasing with level index
+    # Dewpoint: GRIB stores in Kelvin -> convert to Celsius
+    dewpoint_K = ds_prs["dpt"].values.astype(np.float64)
+    dewpoint_C = dewpoint_K - 273.15
+
+    # --- Surface / 2-m fields: (ny, nx) ---
+    sp_Pa = ds_sfc["sp"].values.astype(np.float64)      # surface pressure (Pa)
+    orog = ds_sfc["orog"].values.astype(np.float64)       # orography (m MSL)
+
+    t2m_K = ds_2m["t2m"].values.astype(np.float64)        # 2-m temperature (K)
+    # 2-m specific humidity -> mixing ratio
+    sh2 = ds_2m["sh2"].values.astype(np.float64)           # kg/kg
+    q2_kgkg = sh2 / (1.0 - sh2)
+    q2_kgkg = np.maximum(q2_kgkg, 1e-10)
+
+    # --- Derived fields ---
+    # Pressure 3-D: broadcast isobaric levels to full (nz, ny, nx)
+    pressure_3d_hPa = np.broadcast_to(
+        p_levels_hPa[:, np.newaxis, np.newaxis], (NZ, NY, NX)
+    ).copy().astype(np.float64)
+
+    # Height AGL = geopotential height - surface orography
+    height_agl_3d = gh_3d - orog[np.newaxis, :, :]
+    # Clamp to non-negative (lowest level can dip slightly below surface)
+    height_agl_3d = np.maximum(height_agl_3d, 0.0)
+
+    # Ensure heights are monotonically increasing with level index.
+    # HRRR pressure levels go 1013 -> 50 hPa, so gh should already increase,
+    # but there can be sub-surface interpolation artefacts at the lowest levels.
     for k in range(1, NZ):
-        height_agl_3d[k] = np.maximum(height_agl_3d[k], height_agl_3d[k - 1] + 10.0)
+        height_agl_3d[k] = np.maximum(height_agl_3d[k],
+                                       height_agl_3d[k - 1] + 1.0)
 
-    # Surface fields for CAPE/CIN
-    psfc_Pa = pressure_3d[0] * 100.0  # Convert surface pressure to Pa
-    t2m_K = temperature_3d[0] + 273.15  # T2m in Kelvin
-    # Mixing ratio from dewpoint: approximate Bolton formula
-    e_td = 6.112 * np.exp(17.67 * dewpoint_3d[0] / (dewpoint_3d[0] + 243.5))
-    q2_kgkg = 0.622 * e_td / (pressure_3d[0] - e_td)  # kg/kg
+    # Pressure 3-D in Pa for CAPE/CIN
+    pressure_3d_Pa = pressure_3d_hPa * 100.0
 
-    # Mixing ratio 3-D (kg/kg) from dewpoint via Bolton
-    e_td_3d = 6.112 * np.exp(17.67 * dewpoint_3d / (dewpoint_3d + 243.5))
-    qvapor_3d = 0.622 * e_td_3d / (pressure_3d - e_td_3d)
-    qvapor_3d = np.maximum(qvapor_3d, 1e-7)
+    # Surface pressure in hPa (for reference)
+    psfc_hPa = sp_Pa / 100.0
 
-    # Pressure 3-D in Pa for CAPE/CIN (both metrust and met-cu expect Pa)
-    pressure_3d_Pa = pressure_3d * 100.0
+    # Close datasets
+    ds_prs.close()
+    ds_sfc.close()
+    ds_2m.close()
+
+    print(f"  Grid: {NX}x{NY} horizontal, {NZ} vertical levels")
+    print(f"  Pressure levels: {p_levels_hPa[0]:.0f} - {p_levels_hPa[-1]:.0f} hPa")
 
     return {
-        # Pressure in hPa for thermo functions
-        "pressure_hPa": pressure_3d,
-        # Temperature in C
-        "temperature_C": temperature_3d,
-        # Dewpoint in C
-        "dewpoint_C": dewpoint_3d,
-        # Wind components (m/s)
+        # Shape info
+        "NZ": NZ, "NY": NY, "NX": NX,
+        # Pressure in hPa for thermo functions (nz, ny, nx)
+        "pressure_hPa": pressure_3d_hPa,
+        # Temperature in Celsius (nz, ny, nx)
+        "temperature_C": temperature_C,
+        # Dewpoint in Celsius (nz, ny, nx)
+        "dewpoint_C": dewpoint_C,
+        # Wind components m/s (nz, ny, nx)
         "u": u_3d,
         "v": v_3d,
-        # Heights AGL (m)
+        # Heights AGL m (nz, ny, nx)
         "height_agl": height_agl_3d,
-        # CAPE/CIN inputs
-        "pressure_3d_Pa": pressure_3d_Pa,
+        # Mixing ratio kg/kg (nz, ny, nx)
         "qvapor_kgkg": qvapor_3d,
-        "psfc_Pa": psfc_Pa,
+        # CAPE/CIN 3-D pressure in Pa (nz, ny, nx)
+        "pressure_3d_Pa": pressure_3d_Pa,
+        # Surface fields (ny, nx)
+        "psfc_Pa": sp_Pa,
         "t2m_K": t2m_K,
         "q2_kgkg": q2_kgkg,
     }
@@ -176,9 +184,7 @@ def build_environment():
 # ============================================================================
 
 print("=" * 78)
-print("BENCHMARK 01: HRRR Severe Thunderstorm Environment")
-print(f"  Grid: {NX}x{NY} horizontal, {NZ} vertical levels")
-print(f"  Timing: {WARMUP} warmup + {TIMED_RUNS} timed runs (median)")
+print("BENCHMARK 01: HRRR Severe Thunderstorm Environment (REAL DATA)")
 print("=" * 78)
 print()
 
@@ -197,24 +203,32 @@ import metcu.calc as mcucalc
 import cupy as cp
 print(f"[OK] met-cu imported (GPU: {cp.cuda.runtime.getDeviceCount()} device(s))")
 
-# 4. metrust GPU (routes to met-cu)
-# We'll switch backend as needed; same import
+# 4. metrust GPU (routes to met-cu) -- same import, switch backend as needed
 
 print()
 
 # ============================================================================
-# Build environment
+# Load environment
 # ============================================================================
 
-print("Building synthetic HRRR severe environment...")
-env = build_environment()
-print(f"  pressure_hPa shape: {env['pressure_hPa'].shape}")
-print(f"  temperature_C range: [{env['temperature_C'].min():.1f}, {env['temperature_C'].max():.1f}] C")
-print(f"  dewpoint_C range: [{env['dewpoint_C'].min():.1f}, {env['dewpoint_C'].max():.1f}] C")
-print(f"  wind speed range: [{np.sqrt(env['u']**2 + env['v']**2).min():.1f}, "
-      f"{np.sqrt(env['u']**2 + env['v']**2).max():.1f}] m/s")
-print(f"  CAPE pressure range: [{env['pressure_3d_Pa'].min()/100:.0f}, "
-      f"{env['pressure_3d_Pa'].max()/100:.0f}] hPa")
+print("Loading real HRRR data ...")
+env = load_hrrr_environment()
+NZ, NY, NX = env["NZ"], env["NY"], env["NX"]
+
+print(f"  temperature_C range: [{env['temperature_C'].min():.1f}, "
+      f"{env['temperature_C'].max():.1f}] C")
+print(f"  dewpoint_C range: [{env['dewpoint_C'].min():.1f}, "
+      f"{env['dewpoint_C'].max():.1f}] C")
+ws = np.sqrt(env["u"]**2 + env["v"]**2)
+print(f"  wind speed range: [{ws.min():.1f}, {ws.max():.1f}] m/s")
+print(f"  height AGL range: [{env['height_agl'].min():.1f}, "
+      f"{env['height_agl'].max():.1f}] m")
+print(f"  qvapor range: [{env['qvapor_kgkg'].min():.8f}, "
+      f"{env['qvapor_kgkg'].max():.6f}] kg/kg")
+print(f"  surface pressure range: [{env['psfc_Pa'].min()/100:.0f}, "
+      f"{env['psfc_Pa'].max()/100:.0f}] hPa")
+print(f"  t2m range: [{env['t2m_K'].min():.1f}, {env['t2m_K'].max():.1f}] K")
+print(f"  Timing: {WARMUP} warmup + {TIMED_RUNS} timed runs (median)")
 print()
 
 
@@ -238,7 +252,6 @@ def gpu_sync():
 
 def time_func(func, use_gpu=False):
     """Time a function: 1 warmup + N timed, return median in seconds."""
-    # Warmup
     for _ in range(WARMUP):
         func()
         if use_gpu:
@@ -262,12 +275,11 @@ def compare(name, result_a, result_b, label_a, label_b, rtol, atol):
     a = to_numpy(result_a)
     b = to_numpy(result_b)
 
-    # Handle shape mismatches gracefully
     if a.shape != b.shape:
-        print(f"    {label_a} vs {label_b}: SHAPE MISMATCH {a.shape} vs {b.shape} -> FAIL")
+        print(f"    {label_a} vs {label_b}: SHAPE MISMATCH "
+              f"{a.shape} vs {b.shape} -> FAIL")
         return False
 
-    # Mask NaN/Inf for comparison (CAPE can have NaN for no-CAPE points)
     valid = np.isfinite(a) & np.isfinite(b)
     if valid.sum() == 0:
         print(f"    {label_a} vs {label_b}: all NaN/Inf -> SKIP")
@@ -292,7 +304,7 @@ def fmt_time(seconds):
 
 
 # ============================================================================
-# Benchmark functions
+# Benchmark runner
 # ============================================================================
 
 all_pass = True
@@ -301,14 +313,7 @@ saved_results = {}  # {func_name: {backend_label: result_array_or_tuple}}
 
 def compare_cape_tuple(func_name, ref_tuple, other_tuple,
                        ref_label, other_label, rtol, atol):
-    """Compare CAPE/CIN tuple results with special LFC handling.
-
-    Returns True if all sub-results pass.
-    LFC is compared with very lenient tolerance because when no true LFC
-    exists (stable profile, no CAPE), the returned height is implementation-
-    dependent (sentinel/extrapolated).  We only compare LFC at points where
-    both backends found meaningful CAPE (> 10 J/kg).
-    """
+    """Compare CAPE/CIN tuple results with special LFC handling."""
     names = ["CAPE", "CIN", "LCL", "LFC"]
     all_ok = True
     cape_ref = to_numpy(ref_tuple[0])
@@ -325,13 +330,6 @@ def compare_cape_tuple(func_name, ref_tuple, other_tuple,
             continue
 
         if name == "LFC":
-            # LFC is notoriously ill-defined when the parcel is immediately
-            # buoyant (no CIN) or when no true LFC exists.  Different backends
-            # return different sentinel values (0, domain top, NaN).
-            # We only compare LFC at points where:
-            #   - Both backends found meaningful CAPE (> 10 J/kg)
-            #   - Both values are finite
-            #   - Neither value looks like a sentinel (> 20000 m or == 0)
             finite = np.isfinite(r) & np.isfinite(o)
             has_cape = (cape_ref > 10) & (cape_oth > 10)
             not_sentinel = (r > 1) & (o > 1) & (r < 20000) & (o < 20000)
@@ -359,11 +357,7 @@ def compare_cape_tuple(func_name, ref_tuple, other_tuple,
 
 
 def run_benchmark(func_name, backends, rtol, atol, tuple_names=None):
-    """Run a single benchmark across backends.
-
-    backends: dict of {label: (callable, is_gpu)}
-    tuple_names: if set (e.g. for CAPE), use special cape-tuple comparison.
-    """
+    """Run a single benchmark across backends."""
     global all_pass
 
     print(f"\n{'-' * 78}")
@@ -382,8 +376,10 @@ def run_benchmark(func_name, backends, rtol, atol, tuple_names=None):
             print(f"  [{label:15s}]  {fmt_time(t):>12s}")
         except Exception as exc:
             print(f"  [{label:15s}]  ERROR: {exc}")
+            import traceback
+            traceback.print_exc()
 
-    # Correctness comparison: compare all pairs against the first successful backend
+    # Correctness comparison
     if len(results) >= 2:
         print()
         labels = list(results.keys())
@@ -420,7 +416,6 @@ def run_benchmark(func_name, backends, rtol, atol, tuple_names=None):
             ratio = base_t / timings[label] if timings[label] > 0 else float("inf")
             print(f"    Speedup {label} vs {base_label}: {ratio:.1f}x")
 
-    # Save results for comprehensive verification later
     saved_results[func_name] = results
 
 
@@ -443,7 +438,8 @@ run_benchmark("potential_temperature", {
         False,
     ),
     "metrust CPU": (
-        lambda: (mrcalc.set_backend("cpu") or True) and mrcalc.potential_temperature(p_flat, t_flat),
+        lambda: (mrcalc.set_backend("cpu") or True) and
+                mrcalc.potential_temperature(p_flat, t_flat),
         False,
     ),
     "met-cu direct": (
@@ -451,12 +447,12 @@ run_benchmark("potential_temperature", {
         True,
     ),
     "metrust GPU": (
-        lambda: (mrcalc.set_backend("gpu") or True) and mrcalc.potential_temperature(p_flat, t_flat),
+        lambda: (mrcalc.set_backend("gpu") or True) and
+                mrcalc.potential_temperature(p_flat, t_flat),
         True,
     ),
 }, rtol=THERMO_RTOL, atol=THERMO_ATOL)
 
-# Reset backend
 mrcalc.set_backend("cpu")
 
 # ============================================================================
@@ -469,7 +465,8 @@ run_benchmark("equivalent_potential_temperature", {
         False,
     ),
     "metrust CPU": (
-        lambda: (mrcalc.set_backend("cpu") or True) and mrcalc.equivalent_potential_temperature(p_flat, t_flat, td_flat),
+        lambda: (mrcalc.set_backend("cpu") or True) and
+                mrcalc.equivalent_potential_temperature(p_flat, t_flat, td_flat),
         False,
     ),
     "met-cu direct": (
@@ -477,7 +474,8 @@ run_benchmark("equivalent_potential_temperature", {
         True,
     ),
     "metrust GPU": (
-        lambda: (mrcalc.set_backend("gpu") or True) and mrcalc.equivalent_potential_temperature(p_flat, t_flat, td_flat),
+        lambda: (mrcalc.set_backend("gpu") or True) and
+                mrcalc.equivalent_potential_temperature(p_flat, t_flat, td_flat),
         True,
     ),
 }, rtol=THERMO_RTOL, atol=THERMO_ATOL)
@@ -524,6 +522,7 @@ run_benchmark("wind_direction", {
 #    MetPy does NOT have a grid version.
 # ============================================================================
 
+# Use subdomain for CAPE (expensive per-column lifting)
 p3d_Pa = env["pressure_3d_Pa"]
 tc3d = env["temperature_C"]
 qv3d = env["qvapor_kgkg"]
@@ -532,9 +531,6 @@ psfc_Pa = env["psfc_Pa"]
 t2m_K = env["t2m_K"]
 q2_kgkg = env["q2_kgkg"]
 
-# Use a smaller subdomain for CAPE to keep run time reasonable
-# CAPE is O(nz * ncols) with per-column parcel lifting -- expensive
-CAPE_NY, CAPE_NX = 100, 100
 p3d_Pa_sub = np.ascontiguousarray(p3d_Pa[:, :CAPE_NY, :CAPE_NX])
 tc3d_sub = np.ascontiguousarray(tc3d[:, :CAPE_NY, :CAPE_NX])
 qv3d_sub = np.ascontiguousarray(qv3d[:, :CAPE_NY, :CAPE_NX])
@@ -567,32 +563,38 @@ run_benchmark("compute_cape_cin", {
         ),
         True,
     ),
-}, rtol=GRID_RTOL, atol=GRID_ATOL, tuple_names="cape")
+}, rtol=CAPE_RTOL, atol=CAPE_ATOL, tuple_names="cape")
 
 mrcalc.set_backend("cpu")
 
 # ============================================================================
 # 6. compute_srh (3 backends: metrust CPU, met-cu direct, metrust GPU)
+#    Uses same subdomain as CAPE for consistency.
 # ============================================================================
 
 u3d = env["u"]
 v3d = env["v"]
 hagl = env["height_agl"]
 
+# SRH/shear subdomain
+u3d_sub = np.ascontiguousarray(u3d[:, :CAPE_NY, :CAPE_NX])
+v3d_sub = np.ascontiguousarray(v3d[:, :CAPE_NY, :CAPE_NX])
+hagl_sub = np.ascontiguousarray(hagl3d[:, :CAPE_NY, :CAPE_NX])
+
 run_benchmark("compute_srh", {
     "metrust CPU": (
         lambda: (mrcalc.set_backend("cpu") or True) and mrcalc.compute_srh(
-            u3d, v3d, hagl, top_m=1000.0,
+            u3d_sub, v3d_sub, hagl_sub, top_m=1000.0,
         ),
         False,
     ),
     "met-cu direct": (
-        lambda: mcucalc.compute_srh(u3d, v3d, hagl, top_m=1000.0),
+        lambda: mcucalc.compute_srh(u3d_sub, v3d_sub, hagl_sub, top_m=1000.0),
         True,
     ),
     "metrust GPU": (
         lambda: (mrcalc.set_backend("gpu") or True) and mrcalc.compute_srh(
-            u3d, v3d, hagl, top_m=1000.0,
+            u3d_sub, v3d_sub, hagl_sub, top_m=1000.0,
         ),
         True,
     ),
@@ -607,17 +609,19 @@ mrcalc.set_backend("cpu")
 run_benchmark("compute_shear", {
     "metrust CPU": (
         lambda: (mrcalc.set_backend("cpu") or True) and mrcalc.compute_shear(
-            u3d, v3d, hagl, bottom_m=0.0, top_m=6000.0,
+            u3d_sub, v3d_sub, hagl_sub, bottom_m=0.0, top_m=6000.0,
         ),
         False,
     ),
     "met-cu direct": (
-        lambda: mcucalc.compute_shear(u3d, v3d, hagl, bottom_m=0.0, top_m=6000.0),
+        lambda: mcucalc.compute_shear(
+            u3d_sub, v3d_sub, hagl_sub, bottom_m=0.0, top_m=6000.0,
+        ),
         True,
     ),
     "metrust GPU": (
         lambda: (mrcalc.set_backend("gpu") or True) and mrcalc.compute_shear(
-            u3d, v3d, hagl, bottom_m=0.0, top_m=6000.0,
+            u3d_sub, v3d_sub, hagl_sub, bottom_m=0.0, top_m=6000.0,
         ),
         True,
     ),
@@ -627,23 +631,6 @@ mrcalc.set_backend("cpu")
 
 # ============================================================================
 # COMPREHENSIVE DATA CORRECTNESS VERIFICATION
-# ============================================================================
-#
-# This section treats MetPy as ground truth for functions that have MetPy
-# equivalents (potential_temperature, equivalent_potential_temperature,
-# wind_speed, wind_direction).  For grid composites without MetPy equivalents
-# (compute_cape_cin, compute_srh, compute_shear) it uses metrust CPU as the
-# reference and compares met-cu and metrust GPU against it.
-#
-# For every (function, backend) pair it reports:
-#   1. Element-wise statistics (mean diff, max |diff|, RMSE, p99, rel RMSE)
-#   2. NaN / Inf audit
-#   3. Physical plausibility range checks
-#   4. Pearson correlation
-#   5. Spatial error distribution (% of points above relative error thresholds)
-#   6. Edge-case audit (agreement at extremes and zero-shear columns)
-#   7. Text histogram of differences
-#   8. PASS / FAIL verdict with stated tolerance
 # ============================================================================
 
 from scipy import stats as _scipy_stats
@@ -655,27 +642,30 @@ print("#" + " COMPREHENSIVE DATA CORRECTNESS VERIFICATION ".center(76) + "#")
 print("#" * 78)
 
 
-# ---------- Physical plausibility bounds per variable ----------
+# ---------- Physical plausibility bounds (tuned for real HRRR data) ----------
+# Temperature range: ~-80 C (upper levels) to ~+30 C (surface summer)
+# Theta: lowest pressure levels can push theta above 450 K at 50 hPa
+# Theta-e: tropical/low-level moist air can reach 370+, upper levels > 450 rare
 PHYS_BOUNDS = {
-    "potential_temperature":            (250.0, 400.0),   # K
-    "equivalent_potential_temperature":  (250.0, 450.0),   # K
+    "potential_temperature":            (200.0, 600.0),   # K; wide for 50 hPa
+    "equivalent_potential_temperature":  (200.0, 600.0),   # K
     "wind_speed":                        (0.0, 120.0),     # m/s
     "wind_direction":                    (0.0, 360.0),     # degrees
     "CAPE":                              (0.0, 8000.0),    # J/kg
-    "CIN":                               (-500.0, 0.0),    # J/kg (usually <= 0)
-    "LCL":                               (0.0, 8000.0),    # m
+    "CIN":                               (-1000.0, 0.0),   # J/kg
+    "LCL":                               (0.0, 10000.0),   # m
     "LFC":                               (0.0, 25000.0),   # m
-    "compute_srh":                       (-500.0, 1000.0), # m^2/s^2
-    "compute_shear":                     (0.0, 80.0),      # m/s
+    "compute_srh":                       (-600.0, 1200.0), # m^2/s^2
+    "compute_shear":                     (0.0, 100.0),     # m/s
 }
 
-# Tolerances for PASS/FAIL per category
+# Tolerances
 TOLERANCES = {
     "potential_temperature":            {"rtol": 1e-4, "atol": 1e-2},
     "equivalent_potential_temperature":  {"rtol": 1e-4, "atol": 1e-2},
     "wind_speed":                        {"rtol": 1e-4, "atol": 1e-2},
     "wind_direction":                    {"rtol": 1e-4, "atol": 1e-2},
-    "compute_cape_cin":                  {"rtol": 1e-3, "atol": 0.5},
+    "compute_cape_cin":                  {"rtol": CAPE_RTOL, "atol": CAPE_ATOL},
     "compute_srh":                       {"rtol": 1e-3, "atol": 0.5},
     "compute_shear":                     {"rtol": 1e-3, "atol": 0.5},
 }
@@ -714,7 +704,6 @@ def deep_compare_array(ref, other, ref_label, other_label, var_name,
 
     print(f"\n    --- {var_name}: {other_label} vs {ref_label} ---")
 
-    # Shape sanity
     if r.shape != o.shape:
         print(f"      SHAPE MISMATCH: {r.shape} vs {o.shape} -> FAIL")
         return False, {"rmse": float("nan"), "max_diff": float("nan")}
@@ -732,7 +721,6 @@ def deep_compare_array(ref, other, ref_label, other_label, var_name,
     print(f"      Inf count:  {ref_label}={int(inf_r.sum())}  "
           f"{other_label}={int(inf_o.sum())}")
 
-    # Valid mask (finite in both)
     valid = np.isfinite(r) & np.isfinite(o)
     n_valid = int(valid.sum())
     if n_valid == 0:
@@ -771,7 +759,6 @@ def deep_compare_array(ref, other, ref_label, other_label, var_name,
     print(f"      Pearson r      = {pearson_r:.10f}")
 
     # ---- 5. Spatial error distribution ----
-    # Relative error: |diff| / max(|ref|, tiny) to avoid div-by-zero
     denom = np.maximum(np.abs(rv), 1e-12)
     rel_err = abs_diff / denom
     pct_gt_1 = float(np.mean(rel_err > 0.01) * 100)
@@ -780,14 +767,13 @@ def deep_compare_array(ref, other, ref_label, other_label, var_name,
     print(f"      Points >0.1%% rel err = {pct_gt_01:.4f} %")
 
     # ---- 6. Edge-case audit ----
-    # Compare at extremes of the reference field
     if n_valid >= 10:
-        n_edge = max(1, n_valid // 100)  # bottom/top 1%
+        n_edge = max(1, n_valid // 100)
         sorted_idx = np.argsort(rv)
         low_idx = sorted_idx[:n_edge]
         high_idx = sorted_idx[-n_edge:]
-        low_max_diff = float(np.max(np.abs(diff[low_idx]))) if len(low_idx) > 0 else 0.0
-        high_max_diff = float(np.max(np.abs(diff[high_idx]))) if len(high_idx) > 0 else 0.0
+        low_max_diff = float(np.max(np.abs(diff[low_idx])))
+        high_max_diff = float(np.max(np.abs(diff[high_idx])))
         print(f"      Edge: bottom 1%% (n={n_edge}) max|diff|={low_max_diff:.6g}"
               f"  top 1%% max|diff|={high_max_diff:.6g}")
 
@@ -810,8 +796,7 @@ def deep_compare_array(ref, other, ref_label, other_label, var_name,
 
 # ---------- Run verification for each function ----------
 
-# We collect per-(func, backend) summary stats for the final table.
-summary_table = []  # list of (func_name, backend_label, rmse, max_diff, verdict)
+summary_table = []
 
 # ---- Functions with MetPy ground truth ----
 METPY_FUNCS = {
@@ -876,9 +861,7 @@ for func_name, cfg in METPY_FUNCS.items():
 
 
 # ---- Grid composites: CAPE/CIN (tuple), SRH, shear ----
-# For these we use metrust CPU as reference and compare met-cu / metrust GPU.
 
-# --- compute_cape_cin ---
 CAPE_TUPLE_NAMES = ["CAPE", "CIN", "LCL", "LFC"]
 CAPE_PHYS = [
     PHYS_BOUNDS["CAPE"],
@@ -917,7 +900,6 @@ if "compute_cape_cin" in saved_results:
                 r_arr = to_numpy(ref_tuple[i])
                 o_arr = to_numpy(other_tuple[i])
 
-                # For LFC, restrict to non-sentinel CAPE-bearing columns
                 if sub_name == "LFC":
                     finite = np.isfinite(r_arr) & np.isfinite(o_arr)
                     has_cape = (cape_ref > 10) & (cape_oth > 10)
@@ -932,7 +914,6 @@ if "compute_cape_cin" in saved_results:
                             (f"CAPE/LFC", backend, float("nan"),
                              float("nan"), "SKIP"))
                         continue
-                    # Apply mask -- create masked flat arrays
                     r_masked = r_arr[mask]
                     o_masked = o_arr[mask]
                     ok, stats = deep_compare_array(
@@ -940,7 +921,7 @@ if "compute_cape_cin" in saved_results:
                         ref_label, backend,
                         f"CAPE/{sub_name} (n={n_masked} non-sentinel)",
                         plo, phi,
-                        5e-2, 50.0,  # lenient LFC tolerance
+                        5e-2, 50.0,
                     )
                 else:
                     ok, stats = deep_compare_array(
@@ -988,7 +969,6 @@ if "compute_srh" in saved_results:
                  stats["rmse"], stats["max_diff"], verdict))
 
         # Edge-case audit: zero-shear columns
-        # Identify columns where reference SRH is near zero (|SRH| < 1)
         ref_np = to_numpy(ref)
         near_zero = np.abs(ref_np) < 1.0
         n_zero = int(near_zero.sum())

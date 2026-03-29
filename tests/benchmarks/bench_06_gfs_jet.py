@@ -1,19 +1,32 @@
 #!/usr/bin/env python
-"""Benchmark 06: GFS Jet Stream Analysis at 250 hPa
+"""Benchmark 06: GFS Jet Stream Analysis at 250 hPa -- REAL DATA
 
 Scenario
 --------
-Global 0.25-degree GFS grid, Northern Hemisphere slice (361 x 720).
-Synthetic polar jet with 60-80 m/s core, entrance/exit regions.
+Real GFS 0.25-degree global grid (721 x 1440) from GRIB2 file.
+250 hPa level extracted: actual jet stream with cores reaching ~87 m/s.
+
+Data source
+-----------
+  C:\\Users\\drew\\metrust-py\\data\\gfs_0p25.grib2
+  33 isobaric levels, 721 x 1440 per level.
+  Loaded with xarray + cfgrib, filtered for 250 hPa.
+
+  Variables used:
+    u   -- zonal wind component (m/s)
+    v   -- meridional wind component (m/s)
+    t   -- temperature (K in GRIB; converted to C for metrust/met-cu)
+
+  Grid spacing: dx ~ 27800 m, dy ~ 27800 m (constant approximation).
 
 Functions benchmarked
 ---------------------
-  wind_speed        (CPU)        element-wise sqrt(u^2 + v^2)
-  wind_direction    (CPU)        element-wise atan2
-  wind_components   (CPU)        speed/dir -> u, v
-  vorticity         (GPU star)   dv/dx - du/dy on uniform grid
-  divergence        (CPU)        du/dx + dv/dy
-  potential_temp    (GPU star)   theta at 250 hPa
+  wind_speed          (CPU)       element-wise sqrt(u^2 + v^2)
+  wind_direction      (CPU)       element-wise atan2
+  wind_components     (CPU)       speed/dir -> u, v
+  vorticity           (GPU star)  dv/dx - du/dy on uniform grid
+  divergence          (CPU)       du/dx + dv/dy
+  potential_temp      (GPU star)  theta at 250 hPa
 
 Backends: MetPy (Pint), metrust CPU, met-cu direct, metrust GPU.
 
@@ -31,6 +44,7 @@ Usage:
 """
 from __future__ import annotations
 
+import os
 import sys
 import time
 import warnings
@@ -119,85 +133,67 @@ def spd_str(a, b):
 
 
 # ============================================================================
-# Synthetic GFS Jet Stream Data (361 x 720, 0.25-degree)
+# Load REAL GFS 250 hPa data from GRIB2
 # ============================================================================
 
-def make_jet_data():
-    """Create realistic 250 hPa jet stream wind field.
+# Locate the GRIB2 file relative to this script or via absolute path
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_DATA_PATH = os.path.normpath(os.path.join(_SCRIPT_DIR, "..", "..", "data", "gfs_0p25.grib2"))
+if not os.path.exists(_DATA_PATH):
+    # Fallback to absolute path
+    _DATA_PATH = r"C:\Users\drew\metrust-py\data\gfs_0p25.grib2"
 
-    The polar jet sits around 30-50N with a 60-80 m/s core, entrance
-    region on the upstream side, and exit region downstream.  Background
-    westerlies of ~15 m/s fill the rest of the hemisphere.
+
+def load_gfs_250hpa():
+    """Load real GFS 250 hPa data from GRIB2 file.
+
+    Returns dict with u, v (m/s), temp_c (Celsius), temp_k (Kelvin),
+    lat/lon arrays, grid spacings, and metadata.
     """
-    np.random.seed(42)
+    import xarray as xr
 
-    ny, nx = 361, 720          # 0-90N, 0-360E at 0.25-degree
-    lat = np.linspace(0, 90, ny)         # degrees N
-    lon = np.linspace(0, 359.75, nx)     # degrees E
+    print(f"  Loading GFS data from: {_DATA_PATH}")
+    ds = xr.open_dataset(
+        _DATA_PATH,
+        engine="cfgrib",
+        backend_kwargs={
+            "filter_by_keys": {"typeOfLevel": "isobaricInhPa"},
+            "indexpath": "",
+        },
+    )
+
+    # Extract 250 hPa level
+    u_250 = ds["u"].sel(isobaricInhPa=250.0).values.astype(np.float64)
+    v_250 = ds["v"].sel(isobaricInhPa=250.0).values.astype(np.float64)
+    t_250_k = ds["t"].sel(isobaricInhPa=250.0).values.astype(np.float64)
+
+    lat = ds.coords["latitude"].values.astype(np.float64)
+    lon = ds.coords["longitude"].values.astype(np.float64)
+
+    ds.close()
+
+    ny, nx = u_250.shape
     lon2d, lat2d = np.meshgrid(lon, lat)
 
-    # --- Background westerly flow (increases with latitude) ---
-    u_bg = 15.0 * np.sin(np.radians(lat2d))  # 0 at equator, 15 m/s at pole
+    # Temperature: GRIB stores in K, convert to C for metrust/met-cu
+    temp_c = t_250_k - 273.15
 
-    # --- Primary jet core centred at 40N, Gaussian in latitude ---
-    jet_lat0 = 40.0
-    jet_sigma_lat = 5.0
-    lat_envelope = np.exp(-0.5 * ((lat2d - jet_lat0) / jet_sigma_lat) ** 2)
-
-    # Longitudinal modulation: entrance (ramp-up), core, exit (ramp-down)
-    # Core around 180E, entrance 120-180E, exit 180-240E
-    jet_lon0 = 180.0
-    jet_sigma_lon = 40.0
-    lon_envelope = np.exp(-0.5 * ((lon2d - jet_lon0) / jet_sigma_lon) ** 2)
-
-    # Peak speed: 75 m/s, modulated by entrance/exit
-    jet_speed = 75.0 * lat_envelope * lon_envelope
-
-    # Secondary jet streak at 50N, 300E (weaker, ~50 m/s)
-    lat_env2 = np.exp(-0.5 * ((lat2d - 50.0) / 4.0) ** 2)
-    lon_env2 = np.exp(-0.5 * ((lon2d - 300.0) / 30.0) ** 2)
-    jet_speed2 = 50.0 * lat_env2 * lon_env2
-
-    # Combine: jet is purely zonal to first order
-    u = u_bg + jet_speed + jet_speed2
-
-    # Meridional component: ageostrophic cross-jet circulation
-    # Entrance region: poleward on right side  (v > 0 east of jet core)
-    # Exit region: equatorward on right side  (v < 0 west of jet core)
-    dlat = (lat2d - jet_lat0) / jet_sigma_lat
-    dlon = (lon2d - jet_lon0) / jet_sigma_lon
-    v_ageo = -8.0 * dlon * np.exp(-0.5 * (dlat ** 2 + dlon ** 2))
-
-    # Add v from secondary streak
-    dlat2 = (lat2d - 50.0) / 4.0
-    dlon2 = (lon2d - 300.0) / 30.0
-    v_ageo2 = -5.0 * dlon2 * np.exp(-0.5 * (dlat2 ** 2 + dlon2 ** 2))
-
-    v = v_ageo + v_ageo2
-
-    # Small-scale turbulent noise (realistic for model output)
-    u += np.random.normal(0, 0.5, (ny, nx))
-    v += np.random.normal(0, 0.5, (ny, nx))
-
-    u = np.ascontiguousarray(u, dtype=np.float64)
-    v = np.ascontiguousarray(v, dtype=np.float64)
-
-    # --- Temperature field for potential temperature ---
-    # 250 hPa temperature: ~-50C near jet core, warmer equatorward
-    temp_c = -55.0 + 15.0 * np.sin(np.radians(lat2d)) ** 2
-    temp_c += np.random.normal(0, 0.3, (ny, nx))
+    # Ensure contiguous float64 arrays
+    u_250 = np.ascontiguousarray(u_250, dtype=np.float64)
+    v_250 = np.ascontiguousarray(v_250, dtype=np.float64)
     temp_c = np.ascontiguousarray(temp_c, dtype=np.float64)
 
-    # Grid spacings: representative mid-latitude values
-    dx = 20000.0    # ~20 km (0.25 deg at ~45N in x)
-    dy = 27800.0    # ~27.8 km (0.25 deg in y)
+    # Grid spacings: constant approximation for mid-latitudes
+    dx = 27800.0   # ~27.8 km (0.25 deg at ~45N in x)
+    dy = 27800.0   # ~27.8 km (0.25 deg in y)
 
     return dict(
         ny=ny, nx=nx,
         lat=lat, lon=lon,
         lat2d=lat2d, lon2d=lon2d,
-        u=u, v=v,
+        u=u_250, v=v_250,
         temp_c=temp_c,
+        temp_k=t_250_k,
         pressure_hpa=250.0,
         dx=dx, dy=dy,
     )
@@ -218,13 +214,13 @@ def _to_numpy(arr):
 
 # Physical plausibility bounds per quantity
 _PHYS_BOUNDS = {
-    "wind_speed":      (0.0,    100.0),   # m/s -- jet can reach ~90
+    "wind_speed":      (0.0,    120.0),   # m/s -- real jets can reach ~90+
     "wind_direction":  (0.0,    360.0),   # degrees (0 inclusive, 360 exclusive ideally)
-    "wind_components(u)": (-100.0, 100.0),
-    "wind_components(v)": (-100.0, 100.0),
+    "wind_components(u)": (-120.0, 120.0),
+    "wind_components(v)": (-120.0, 120.0),
     "vorticity":       (-1e-3,  1e-3),    # 1/s
-    "divergence":      (-5e-4,  5e-4),    # 1/s
-    "potential_temp":  (280.0,  350.0),   # K
+    "divergence":      (-1e-3,  1e-3),    # 1/s -- real GFS 250 hPa can exceed 5e-4
+    "potential_temp":  (280.0,  450.0),   # K -- 250 hPa theta typically 300-400 K
 }
 
 # Correlation threshold
@@ -402,8 +398,8 @@ def deep_verify(name, ref, test, label, u_arr=None, v_arr=None):
                 jet_diffs = np.abs(ref_np[jet_mask] - test_np[jet_mask])
             jet_max = float(np.max(jet_diffs))
             jet_rmse = float(np.sqrt(np.mean(jet_diffs ** 2)))
-            print(f"      jet core  (top 1%, n={n_jet}): max_abs={jet_max:.6e}, "
-                  f"RMSE={jet_rmse:.6e}")
+            print(f"      jet core  (top 1%, n={n_jet}, wspd>={jet_threshold:.1f} m/s): "
+                  f"max_abs={jet_max:.6e}, RMSE={jet_rmse:.6e}")
 
     # 8b. Wind direction at calm spots (speed < 0.5 m/s)
     if is_direction and u_arr is not None and v_arr is not None:
@@ -422,10 +418,6 @@ def deep_verify(name, ref, test, label, u_arr=None, v_arr=None):
 
     # 8c. Wind direction near 0/360 wraparound
     if is_direction:
-        wrap_mask = ((ref_f > 350) | (ref_f < 10)) & np.isfinite(test_f)
-        # apply to flattened arrays: ref_f and test_f are already finite-masked
-        wrap_ref = ref_f[wrap_mask[:ref_f.size] if wrap_mask.size == ref_f.size else np.zeros(ref_f.size, dtype=bool)]
-        # Re-derive from the full arrays for safety
         near_0_360 = ((ref_np > 350) | (ref_np < 10)) & finite_mask
         n_wrap = int(np.count_nonzero(near_0_360))
         if n_wrap > 0:
@@ -446,8 +438,6 @@ def deep_verify(name, ref, test, label, u_arr=None, v_arr=None):
     print(_diff_histogram_str(abs_diffs))
 
     # ---- Final verdict for this quantity ----
-    # Use tight tolerance: RMSE must be very small relative to the data range
-    # and Pearson r must exceed threshold (already checked above)
     overall = "PASS" if all_ok else "FAIL"
     print(f"      >>> {name} vs {label}: {overall}")
 
@@ -485,20 +475,28 @@ def print_summary_table():
 
 def main():
     print("=" * 100)
-    print("  BENCHMARK 06: GFS Jet Stream Analysis at 250 hPa")
+    print("  BENCHMARK 06: GFS Jet Stream Analysis at 250 hPa -- REAL DATA")
     print(f"  Backends: MetPy | metrust CPU | met-cu direct | metrust GPU")
     print(f"  GPU: {GPU_NAME if HAS_GPU else 'not available'}")
     print("=" * 100)
 
-    d = make_jet_data()
+    d = load_gfs_250hpa()
     ny, nx = d["ny"], d["nx"]
     u, v = d["u"], d["v"]
     temp_c = d["temp_c"]
+    temp_k = d["temp_k"]
     dx, dy = d["dx"], d["dy"]
     pressure_hpa = d["pressure_hpa"]
 
-    print(f"\n  Grid: {ny} x {nx} = {ny * nx:,} points")
-    print(f"  Jet core max wind: {np.max(np.sqrt(u**2 + v**2)):.1f} m/s")
+    wspd_max = np.max(np.sqrt(u**2 + v**2))
+    wspd_min = np.min(np.sqrt(u**2 + v**2))
+
+    print(f"\n  Grid: {ny} x {nx} = {ny * nx:,} points  (REAL GFS 0.25-degree)")
+    print(f"  Jet stream wind range: {wspd_min:.2f} - {wspd_max:.2f} m/s")
+    print(f"  Temperature range: {temp_k.min():.2f} - {temp_k.max():.2f} K "
+          f"({temp_c.min():.2f} - {temp_c.max():.2f} C)")
+    print(f"  u range: {u.min():.2f} to {u.max():.2f} m/s")
+    print(f"  v range: {v.min():.2f} to {v.max():.2f} m/s")
     print(f"  dx = {dx:.0f} m, dy = {dy:.0f} m")
     print(f"  Pressure: {pressure_hpa} hPa")
 
@@ -514,7 +512,7 @@ def main():
     # DEEP VERIFICATION (MetPy = ground truth)
     # ==================================================================
     print("\n" + "=" * 130)
-    print("  DEEP DATA CORRECTNESS VERIFICATION")
+    print("  DEEP DATA CORRECTNESS VERIFICATION  (Real GFS 250 hPa)")
     print("  Ground truth: MetPy (Pint).  Every backend compared element-wise.")
     print("=" * 130)
 
@@ -727,7 +725,7 @@ def main():
     # ==================================================================
     print(f"\n{'=' * 130}")
     print("  (*) = GPU-eligible function")
-    print(f"  Grid: {ny}x{nx} = {ny * nx:,} points  |  250 hPa GFS jet stream scenario")
+    print(f"  Grid: {ny}x{nx} = {ny * nx:,} points  |  250 hPa GFS jet stream -- REAL DATA")
     overall_str = "ALL PASS" if all_pass else "*** SOME FAILURES ***"
     print(f"  Deep verification: {overall_str}")
     n_pass = sum(1 for r in _SUMMARY_ROWS if r[2] == "PASS")

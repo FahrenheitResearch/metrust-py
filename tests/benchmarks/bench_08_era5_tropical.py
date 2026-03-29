@@ -1,14 +1,15 @@
 #!/usr/bin/env python
-"""Benchmark 08: ERA5-like Tropical Cyclone Analysis
+"""Benchmark 08: Real GFS Tropical Analysis (Western Pacific)
 
-Scenario: 0.25 degree grid, 200x200 subdomain centred on a synthetic TC,
-20 vertical levels (1000-50 hPa).  Rankine-vortex wind field, warm-core
-temperature anomaly, high moisture in the eyewall.
+Scenario: Real GFS 0.25-degree data, tropical subdomain (0-30N, 100-150E).
+33 isobaric levels (1000-1 hPa), ~121 x 201 horizontal grid.
+
+Data source: C:\\Users\\drew\\metrust-py\\data\\gfs_0p25.grib2
 
 Functions benchmarked
 ---------------------
-  vorticity                           (GPU)  -- the canonical TC field
-  equivalent_potential_temperature    (GPU)  -- warm-core identification
+  vorticity                           (GPU)
+  equivalent_potential_temperature    (GPU)
   potential_temperature               (GPU)
   compute_pw                          (GPU)  -- 3-D precipitable water
   wind_speed                          (CPU)
@@ -20,12 +21,13 @@ MetPy does NOT have a grid compute_pw -- that row uses 3 backends only.
 Verification : deep correctness audit per function --
   mean diff, max abs diff, RMSE, 99th pct, relative RMSE%, NaN/Inf audit,
   physical plausibility bounds, Pearson r, % points > 1%/0.1% relative error,
-  histogram of diffs, and special TC structural checks.
+  histogram of diffs, and tropical atmosphere structural checks.
 
 Timing       : perf_counter, cupy sync, 1 warmup + 3 timed, median
 """
 from __future__ import annotations
 
+import os
 import sys
 import time
 import warnings
@@ -41,6 +43,7 @@ if sys.platform == "win32":
 # ============================================================================
 # Imports
 # ============================================================================
+import xarray as xr
 import metpy.calc as mpcalc
 from metpy.units import units
 
@@ -64,6 +67,16 @@ try:
     HAS_METCU = True
 except Exception:
     pass
+
+# ============================================================================
+# GFS data path
+# ============================================================================
+DATA_FILE = os.path.join(os.path.dirname(__file__), "..", "..", "data", "gfs_0p25.grib2")
+DATA_FILE = os.path.normpath(DATA_FILE)
+
+# Tropical subdomain: Western Pacific 0-30N, 100-150E
+LAT_SLICE = slice(30, 0)       # GFS lats run 90 to -90
+LON_SLICE = slice(100, 150)
 
 # ============================================================================
 # Timing helpers
@@ -116,108 +129,75 @@ def spd(ref, tgt):
 
 
 # ============================================================================
-# Synthetic tropical cyclone field generator
+# Load real GFS data
 # ============================================================================
-def make_tc_fields():
-    """Build synthetic TC data on a 200x200 x 20-level grid.
+def load_gfs_tropical():
+    """Load GFS isobaric data and extract tropical Western Pacific subdomain.
 
     Returns a dict with all arrays needed by the six benchmarked functions.
     """
-    NX = NY = 200
-    NZ = 20
-    DX = DY = 27800.0  # metres (0.25 deg at tropics)
+    print(f"  Loading GFS data from: {DATA_FILE}")
 
-    # Pressure levels (hPa) -- surface to top
-    p_levels_hPa = np.array([
-        1000, 975, 950, 925, 900, 850, 800, 750, 700, 650,
-        600, 550, 500, 400, 300, 250, 200, 150, 100, 50,
-    ], dtype=np.float64)
-
-    # ------------------------------------------------------------------
-    # Horizontal grid (distance from storm centre)
-    # ------------------------------------------------------------------
-    cx, cy = NX // 2, NY // 2
-    x = (np.arange(NX) - cx) * DX  # metres
-    y = (np.arange(NY) - cy) * DY
-    X, Y = np.meshgrid(x, y, indexing="xy")
-    R = np.sqrt(X**2 + Y**2)        # radius from centre
-    THETA = np.arctan2(Y, X)         # azimuthal angle
-
-    # ------------------------------------------------------------------
-    # Rankine vortex (tangential wind)
-    # ------------------------------------------------------------------
-    Rmax = 50_000.0      # eye radius ~ 50 km
-    Vmax = 50.0           # max wind ~ 50 m/s
-    V_t = np.where(R <= Rmax,
-                   Vmax * R / Rmax,
-                   Vmax * (Rmax / np.maximum(R, 1.0)))
-
-    # Cyclonic (counter-clockwise in NH): tangential -> u,v
-    u_2d = -V_t * np.sin(THETA)
-    v_2d =  V_t * np.cos(THETA)
-
-    # ------------------------------------------------------------------
-    # Vertical decay of vortex wind (strongest at 850 hPa, weakens aloft)
-    # ------------------------------------------------------------------
-    weight_wind = np.exp(-0.5 * ((p_levels_hPa - 850.0) / 300.0)**2)
-    u_3d = u_2d[None, :, :] * weight_wind[:, None, None]
-    v_3d = v_2d[None, :, :] * weight_wind[:, None, None]
-
-    # ------------------------------------------------------------------
-    # Base temperature profile (tropical sounding, Celsius)
-    # ------------------------------------------------------------------
-    T_sfc = 28.0  # SST-ish
-    T_top = -75.0
-    T_base = np.linspace(T_sfc, T_top, NZ)  # 1-D profile
-
-    # Warm-core anomaly: Gaussian in r, peaked at 300 hPa
-    warm_core_r = np.exp(-(R / 100_000.0)**2)
-    warm_core_z = np.exp(-0.5 * ((p_levels_hPa - 300.0) / 150.0)**2)
-    dT_warm = 10.0 * warm_core_z[:, None, None] * warm_core_r[None, :, :]
-    T_3d = T_base[:, None, None] + dT_warm  # (nz, ny, nx)  Celsius
-
-    # ------------------------------------------------------------------
-    # Dewpoint (moisture: high near eyewall, drier in eye and outskirts)
-    # ------------------------------------------------------------------
-    rh_base = np.linspace(0.85, 0.20, NZ)  # tropical RH profile
-    eyewall_mask = np.exp(-((R - Rmax) / 80_000.0)**2)  # enhance near eyewall
-    eye_drying = np.where(R < Rmax * 0.5, 0.6, 1.0)     # drier inside eye
-    rh_3d = np.clip(
-        rh_base[:, None, None] * (1.0 + 0.15 * eyewall_mask[None, :, :]) * eye_drying[None, :, :],
-        0.05, 0.99,
+    ds = xr.open_dataset(
+        DATA_FILE, engine="cfgrib",
+        backend_kwargs={
+            "filter_by_keys": {"typeOfLevel": "isobaricInhPa"},
+            "indexpath": "",
+        },
     )
 
-    # Dewpoint from RH and T (Magnus formula, approximate)
-    a, b = 17.27, 237.3
-    gamma = a * T_3d / (b + T_3d) + np.log(rh_3d)
-    Td_3d = b * gamma / (a - gamma)  # Celsius
+    # Extract tropical subdomain
+    sub = ds.sel(latitude=LAT_SLICE, longitude=LON_SLICE)
 
-    # ------------------------------------------------------------------
-    # Mixing ratio (for compute_pw)
-    # ------------------------------------------------------------------
-    e_s = 6.112 * np.exp(a * T_3d / (b + T_3d))      # sat vp (hPa)
-    e   = rh_3d * e_s                                   # actual vp (hPa)
-    w_3d = 0.622 * e / (p_levels_hPa[:, None, None] - e)  # mixing ratio kg/kg
+    p_levels_hPa = sub.isobaricInhPa.values.astype(np.float64)
+    NZ = len(p_levels_hPa)
+    lats = sub.latitude.values
+    lons = sub.longitude.values
+    NY = len(lats)
+    NX = len(lons)
 
-    # ------------------------------------------------------------------
-    # Pressure 3-D (Pa) for compute_pw
-    # ------------------------------------------------------------------
+    # Grid spacing (metres) -- 0.25 deg at ~15N
+    DX = 0.25 * 111_320.0 * np.cos(np.radians(15.0))  # ~26.9 km
+    DY = 0.25 * 110_540.0                              # ~27.6 km
+
+    # 3-D fields: (nz, ny, nx), float64
+    T_K = sub["t"].values.astype(np.float64)        # temperature in K
+    q   = sub["q"].values.astype(np.float64)        # specific humidity kg/kg
+    u   = sub["u"].values.astype(np.float64)        # u-wind m/s
+    v   = sub["v"].values.astype(np.float64)        # v-wind m/s
+
+    # Derived fields
+    T_C = T_K - 273.15                              # Celsius for metrust/met-cu
+
+    # Mixing ratio from specific humidity: w = q / (1 - q)
+    w_3d = q / (1.0 - q)
+
+    # Dewpoint from specific humidity and pressure
+    # e = q * p / (0.622 + q * 0.378)
     p3_Pa = np.broadcast_to(
         p_levels_hPa[:, None, None] * 100.0, (NZ, NY, NX)
-    ).copy()
+    ).copy().astype(np.float64)
+
+    e = q * p3_Pa / (0.622 + q * 0.378)   # vapour pressure (Pa)
+    e_hPa = e / 100.0
+    # Clamp e_hPa > 0 to avoid log domain errors
+    e_hPa = np.clip(e_hPa, 1e-6, None)
+    # Magnus formula: Td (Celsius)
+    Td_C = 243.04 * np.log(e_hPa / 6.1078) / (17.27 - np.log(e_hPa / 6.1078))
+
+    ds.close()
 
     return dict(
         NX=NX, NY=NY, NZ=NZ, DX=DX, DY=DY,
-        cx=cx, cy=cy,
-        Rmax=Rmax,
-        R=R,
+        lats=lats, lons=lons,
         p_levels_hPa=p_levels_hPa,
-        u_2d=u_2d, v_2d=v_2d,
-        u_3d=u_3d, v_3d=v_3d,
-        T_3d=T_3d,        # Celsius (nz, ny, nx)
-        Td_3d=Td_3d,      # Celsius (nz, ny, nx)
-        w_3d=w_3d,         # mixing ratio kg/kg (nz, ny, nx)
-        p3_Pa=p3_Pa,       # Pa (nz, ny, nx)
+        u_3d=u, v_3d=v,          # (nz, ny, nx) m/s
+        T_K=T_K,                  # (nz, ny, nx) Kelvin
+        T_C=T_C,                  # (nz, ny, nx) Celsius
+        Td_C=Td_C,               # (nz, ny, nx) Celsius
+        q=q,                      # (nz, ny, nx) specific humidity
+        w_3d=w_3d,                # (nz, ny, nx) mixing ratio kg/kg
+        p3_Pa=p3_Pa,              # (nz, ny, nx) pressure Pa
     )
 
 
@@ -289,8 +269,8 @@ class DeepVerifier:
     """Accumulates per-function verification results across all backends."""
 
     def __init__(self):
-        self.reports = []  # list of dicts, one per (function, pair) comparison
-        self.tc_checks = []  # list of dicts for TC-specific structural checks
+        self.reports = []
+        self.trop_checks = []
         self.all_pass = True
 
     # ------------------------------------------------------------------
@@ -385,7 +365,7 @@ class DeepVerifier:
 
         # --- Physical plausibility ---
         if phys_lo is not None or phys_hi is not None:
-            test_full = np.asarray(test, dtype=np.float64)  # already raveled
+            test_full = np.asarray(test, dtype=np.float64)
             oob = np.zeros(test_full.size, dtype=bool)
             if phys_lo is not None:
                 oob |= test_full < phys_lo
@@ -397,6 +377,7 @@ class DeepVerifier:
             report["phys_hi"] = phys_hi
             report["phys_oob"] = n_oob
             report["phys_oob_pct"] = n_oob / max(n_valid, 1) * 100.0
+
             if n_oob > 0:
                 report["fail_reasons"].append(
                     f"Phys bounds [{phys_lo}, {phys_hi}] {phys_label}: "
@@ -421,215 +402,165 @@ class DeepVerifier:
         return report["pass"]
 
     # ------------------------------------------------------------------
-    # TC-specific structural checks
+    # Tropical atmosphere structural checks
     # ------------------------------------------------------------------
-    def tc_vorticity_check(self, vort_2d, cx, cy, Rmax, DX):
-        """Verify vorticity max is near storm center and has correct sign."""
-        v = np.asarray(vort_2d, dtype=np.float64)
-        check = {"name": "TC vorticity structure", "pass": True, "notes": []}
-
-        # Max vorticity location
-        max_idx = np.unravel_index(np.argmax(v), v.shape)
-        max_val = float(v[max_idx])
-        dist_from_center_km = np.sqrt(
-            (max_idx[1] - cx)**2 + (max_idx[0] - cy)**2) * DX / 1000.0
-
-        check["vort_max"] = max_val
-        check["vort_max_ij"] = max_idx
-        check["vort_max_dist_km"] = dist_from_center_km
-        check["notes"].append(
-            f"Vort max = {max_val:.6e} at ({max_idx[0]},{max_idx[1]}), "
-            f"{dist_from_center_km:.1f} km from center")
-
-        # Should be near center (within ~2 * Rmax)
-        if dist_from_center_km > 2.0 * Rmax / 1000.0:
-            check["pass"] = False
-            check["notes"].append(
-                f"FAIL: vort max {dist_from_center_km:.1f} km from center, "
-                f"expected within {2.0 * Rmax / 1000.0:.0f} km")
-
-        # Physical bounds: vorticity should be within +/-5e-3 /s near TC
-        if abs(max_val) > 5e-3:
-            check["pass"] = False
-            check["notes"].append(
-                f"FAIL: vort max {max_val:.4e} exceeds 5e-3 /s")
-
-        # Positive vorticity at center for NH cyclone
-        center_vort = float(v[cy, cx])
-        check["vort_center"] = center_vort
-        if center_vort <= 0:
-            check["pass"] = False
-            check["notes"].append(
-                f"FAIL: center vort = {center_vort:.4e}, expected > 0 for NH cyclone")
-        else:
-            check["notes"].append(
-                f"Center vort = {center_vort:.6e} (positive, NH cyclone: OK)")
-
-        self.tc_checks.append(check)
-        self.all_pass = self.all_pass and check["pass"]
-        return check["pass"]
-
-    def tc_wind_speed_check(self, ws_2d, u_2d, v_2d, cx, cy, Rmax, DX):
-        """Verify cyclonic pattern: min at center, max near Rmax."""
-        ws = np.asarray(ws_2d, dtype=np.float64)
-        check = {"name": "TC wind speed structure", "pass": True, "notes": []}
-
-        # Center should be calm (eye)
-        center_ws = float(ws[cy, cx])
-        check["ws_center"] = center_ws
-        if center_ws > 5.0:
-            check["pass"] = False
-            check["notes"].append(
-                f"FAIL: eye wind speed = {center_ws:.2f} m/s, expected < 5 m/s")
-        else:
-            check["notes"].append(f"Eye wind speed = {center_ws:.2f} m/s (calm: OK)")
-
-        # Max should be near Rmax
-        max_idx = np.unravel_index(np.argmax(ws), ws.shape)
-        max_val = float(ws[max_idx])
-        dist_km = np.sqrt(
-            (max_idx[1] - cx)**2 + (max_idx[0] - cy)**2) * DX / 1000.0
-        rmax_km = Rmax / 1000.0
-
-        check["ws_max"] = max_val
-        check["ws_max_dist_km"] = dist_km
-        check["notes"].append(
-            f"WS max = {max_val:.2f} m/s at {dist_km:.1f} km "
-            f"(Rmax = {rmax_km:.0f} km)")
-
-        if abs(dist_km - rmax_km) > rmax_km * 1.0:
-            check["pass"] = False
-            check["notes"].append(
-                f"FAIL: WS max at {dist_km:.1f} km, expected near {rmax_km:.0f} km")
-
-        # Physical: wind speed 0-60 m/s
-        if max_val > 60.0 or float(np.min(ws)) < 0.0:
-            check["pass"] = False
-            check["notes"].append(
-                f"FAIL: WS range [{np.min(ws):.2f}, {max_val:.2f}] outside [0, 60]")
-
-        # Cyclonic check: verify tangential component is counter-clockwise (NH)
-        # Sample points east of center at Rmax: v should be positive (northward)
-        j_east = int(round(cx + Rmax / DX))
-        if 0 <= j_east < ws.shape[1]:
-            v_east = float(v_2d[cy, j_east])
-            check["v_east_of_center"] = v_east
-            if v_east > 0:
-                check["notes"].append(
-                    f"East-of-center v = {v_east:.2f} m/s (northward, CCW: OK)")
-            else:
-                check["pass"] = False
-                check["notes"].append(
-                    f"FAIL: East-of-center v = {v_east:.2f} m/s, expected > 0 (CCW)")
-
-        self.tc_checks.append(check)
-        self.all_pass = self.all_pass and check["pass"]
-        return check["pass"]
-
-    def tc_theta_e_check(self, ept_2d, cx, cy, Rmax, DX):
-        """Verify theta-e is highest in eyewall, reasonable tropical range."""
+    def trop_theta_e_check(self, ept_2d, label="MetPy"):
+        """Verify theta-e is in realistic tropical range at 850 hPa."""
         e = np.asarray(ept_2d, dtype=np.float64)
-        check = {"name": "TC theta-e structure", "pass": True, "notes": []}
+        check = {"name": f"Tropical theta-e structure ({label})", "pass": True, "notes": []}
 
-        # Build radial distance array
-        ny, nx = e.shape
-        y_idx, x_idx = np.mgrid[0:ny, 0:nx]
-        r_grid = np.sqrt((x_idx - cx)**2 + (y_idx - cy)**2) * DX
-
-        # Eyewall ring: Rmax +/- 50% Rmax
-        eyewall = (r_grid >= 0.5 * Rmax) & (r_grid <= 1.5 * Rmax)
-        outer = r_grid > 3.0 * Rmax
-        eye = r_grid < 0.3 * Rmax
-
-        ept_eyewall_mean = float(np.mean(e[eyewall])) if np.any(eyewall) else float("nan")
-        ept_outer_mean = float(np.mean(e[outer])) if np.any(outer) else float("nan")
-        ept_eye_mean = float(np.mean(e[eye])) if np.any(eye) else float("nan")
-
-        check["ept_eyewall_mean"] = ept_eyewall_mean
-        check["ept_outer_mean"] = ept_outer_mean
-        check["ept_eye_mean"] = ept_eye_mean
+        ept_mean = float(np.nanmean(e))
+        ept_min = float(np.nanmin(e))
+        ept_max = float(np.nanmax(e))
+        check["ept_mean"] = ept_mean
+        check["ept_range"] = (ept_min, ept_max)
         check["notes"].append(
-            f"Theta-e: eyewall={ept_eyewall_mean:.1f} K, "
-            f"outer={ept_outer_mean:.1f} K, eye={ept_eye_mean:.1f} K")
+            f"Theta-e 850 hPa: mean={ept_mean:.1f} K, "
+            f"range=[{ept_min:.1f}, {ept_max:.1f}] K")
 
-        # Eyewall should be warmest (highest theta-e)
-        if np.isfinite(ept_eyewall_mean) and np.isfinite(ept_outer_mean):
-            if ept_eyewall_mean <= ept_outer_mean:
-                check["pass"] = False
-                check["notes"].append(
-                    f"FAIL: eyewall theta-e ({ept_eyewall_mean:.1f}) "
-                    f"<= outer ({ept_outer_mean:.1f})")
-            else:
-                check["notes"].append(
-                    f"Eyewall > outer by {ept_eyewall_mean - ept_outer_mean:.1f} K: OK")
+        # Tropical 850 hPa theta-e should be 320-380 K
+        if ept_mean < 310 or ept_mean > 390:
+            check["pass"] = False
+            check["notes"].append(
+                f"FAIL: mean theta-e {ept_mean:.1f} K outside tropical range [310, 390]")
+        else:
+            check["notes"].append(
+                f"Mean theta-e {ept_mean:.1f} K in tropical range [310, 390]: OK")
 
-        # Physical range: theta-e must be positive and reasonable
-        # Note: this synthetic sounding has a cold 850 hPa level (~1 C base)
-        # so eyewall theta-e is ~293-298 K, not real-world tropical ~340-365 K.
-        # We check a broad sanity band and rely on structural checks above.
-        if np.isfinite(ept_eyewall_mean):
-            if ept_eyewall_mean < 200 or ept_eyewall_mean > 450:
-                check["pass"] = False
-                check["notes"].append(
-                    f"FAIL: eyewall theta-e {ept_eyewall_mean:.1f} K "
-                    f"outside sanity range [200, 450]")
-            else:
-                check["notes"].append(
-                    f"Eyewall theta-e {ept_eyewall_mean:.1f} K in [200, 450]: OK")
+        # Should have high values (>340 K) somewhere in the domain
+        pct_warm = float(np.count_nonzero(e > 340) / e.size * 100)
+        check["pct_gt_340K"] = pct_warm
+        check["notes"].append(f"{pct_warm:.1f}% of points have theta-e > 340 K")
 
-        self.tc_checks.append(check)
+        self.trop_checks.append(check)
         self.all_pass = self.all_pass and check["pass"]
         return check["pass"]
 
-    def tc_pw_check(self, pw_2d, cx, cy, Rmax, DX):
-        """Verify PW is in tropical range and enhanced near eyewall."""
+    def trop_pw_check(self, pw_2d, label="metrust"):
+        """Verify PW is in realistic tropical range."""
         pw = np.asarray(pw_2d, dtype=np.float64)
-        check = {"name": "TC precipitable water structure", "pass": True, "notes": []}
+        check = {"name": f"Tropical PW structure ({label})", "pass": True, "notes": []}
 
-        ny, nx = pw.shape
-        y_idx, x_idx = np.mgrid[0:ny, 0:nx]
-        r_grid = np.sqrt((x_idx - cx)**2 + (y_idx - cy)**2) * DX
-
-        eyewall = (r_grid >= 0.5 * Rmax) & (r_grid <= 1.5 * Rmax)
-        outer = r_grid > 3.0 * Rmax
-
-        pw_max = float(np.max(pw))
-        pw_min = float(np.min(pw[np.isfinite(pw)]))
-        pw_eyewall = float(np.mean(pw[eyewall])) if np.any(eyewall) else float("nan")
-        pw_outer = float(np.mean(pw[outer])) if np.any(outer) else float("nan")
-
+        pw_mean = float(np.nanmean(pw))
+        pw_min = float(np.nanmin(pw))
+        pw_max = float(np.nanmax(pw))
+        check["pw_mean"] = pw_mean
         check["pw_range"] = (pw_min, pw_max)
-        check["pw_eyewall_mean"] = pw_eyewall
-        check["pw_outer_mean"] = pw_outer
         check["notes"].append(
-            f"PW range: [{pw_min:.1f}, {pw_max:.1f}] mm")
-        check["notes"].append(
-            f"PW: eyewall={pw_eyewall:.1f} mm, outer={pw_outer:.1f} mm")
+            f"PW: mean={pw_mean:.1f} mm, range=[{pw_min:.1f}, {pw_max:.1f}] mm")
 
-        # Physical sanity: PW must be non-negative, < 100 mm
-        # Note: this synthetic sounding yields ~12-21 mm (limited vertical
-        # extent & cold mid-levels), not real-world tropical 40-70 mm.
-        if pw_min < 0.0:
-            check["pass"] = False
-            check["notes"].append(f"FAIL: PW min {pw_min:.1f} mm is negative")
-        if pw_max > 100.0:
+        # Tropical PW should be 20-80 mm typically
+        if pw_mean < 10 or pw_mean > 90:
             check["pass"] = False
             check["notes"].append(
-                f"FAIL: PW max {pw_max:.1f} mm exceeds 100 mm sanity cap")
-        if pw_min >= 0.0 and pw_max <= 100.0:
-            check["notes"].append(f"PW range [{pw_min:.1f}, {pw_max:.1f}] mm: OK")
+                f"FAIL: mean PW {pw_mean:.1f} mm outside tropical range [10, 90]")
+        else:
+            check["notes"].append(
+                f"Mean PW {pw_mean:.1f} mm in tropical range [10, 90]: OK")
 
-        # Eyewall should have higher PW than outer
-        if np.isfinite(pw_eyewall) and np.isfinite(pw_outer):
-            if pw_eyewall > pw_outer:
-                check["notes"].append(
-                    f"PW eyewall > outer by {pw_eyewall - pw_outer:.1f} mm: OK")
-            else:
-                check["notes"].append(
-                    f"PW eyewall ({pw_eyewall:.1f}) <= outer ({pw_outer:.1f}): "
-                    f"unexpected but not fatal for synthetic data")
+        # Must be non-negative
+        if pw_min < -0.1:
+            check["pass"] = False
+            check["notes"].append(f"FAIL: PW min {pw_min:.2f} mm is negative")
 
-        self.tc_checks.append(check)
+        # Sanity cap
+        if pw_max > 120:
+            check["pass"] = False
+            check["notes"].append(
+                f"FAIL: PW max {pw_max:.1f} mm exceeds 120 mm sanity cap")
+
+        self.trop_checks.append(check)
+        self.all_pass = self.all_pass and check["pass"]
+        return check["pass"]
+
+    def trop_vorticity_check(self, vort_2d, label="MetPy"):
+        """Verify vorticity is in reasonable range for tropical low-level flow."""
+        v = np.asarray(vort_2d, dtype=np.float64)
+        check = {"name": f"Tropical vorticity structure ({label})", "pass": True, "notes": []}
+
+        vort_mean = float(np.nanmean(v))
+        vort_min = float(np.nanmin(v))
+        vort_max = float(np.nanmax(v))
+        vort_absmax = max(abs(vort_min), abs(vort_max))
+        check["vort_range"] = (vort_min, vort_max)
+        check["notes"].append(
+            f"Vorticity: mean={vort_mean:.4e}, range=[{vort_min:.4e}, {vort_max:.4e}] /s")
+
+        # Typical tropical 850 hPa vorticity: +/- 1e-4 to 1e-3 /s
+        if vort_absmax > 5e-3:
+            check["pass"] = False
+            check["notes"].append(
+                f"FAIL: max |vorticity| {vort_absmax:.4e} exceeds 5e-3 /s")
+        else:
+            check["notes"].append(
+                f"Max |vorticity| {vort_absmax:.4e} within reasonable bounds: OK")
+
+        # Should have both positive and negative values in the tropics
+        has_pos = bool(np.any(v > 0))
+        has_neg = bool(np.any(v < 0))
+        if has_pos and has_neg:
+            check["notes"].append("Both positive and negative vorticity present: OK")
+        else:
+            check["notes"].append("WARNING: vorticity is all one sign")
+
+        self.trop_checks.append(check)
+        self.all_pass = self.all_pass and check["pass"]
+        return check["pass"]
+
+    def trop_wind_speed_check(self, ws_2d, label="MetPy"):
+        """Verify wind speed is in realistic tropical range at 850 hPa."""
+        ws = np.asarray(ws_2d, dtype=np.float64)
+        check = {"name": f"Tropical wind speed structure ({label})", "pass": True, "notes": []}
+
+        ws_mean = float(np.nanmean(ws))
+        ws_min = float(np.nanmin(ws))
+        ws_max = float(np.nanmax(ws))
+        check["ws_range"] = (ws_min, ws_max)
+        check["notes"].append(
+            f"Wind speed 850 hPa: mean={ws_mean:.1f}, "
+            f"range=[{ws_min:.1f}, {ws_max:.1f}] m/s")
+
+        # Tropical 850 hPa winds: typically 0-30 m/s, can reach 40 in TCs
+        if ws_max > 50.0:
+            check["pass"] = False
+            check["notes"].append(
+                f"FAIL: max wind speed {ws_max:.1f} m/s exceeds 50 m/s")
+        if ws_min < 0.0:
+            check["pass"] = False
+            check["notes"].append(
+                f"FAIL: min wind speed {ws_min:.2f} m/s is negative")
+
+        if ws_min >= 0.0 and ws_max <= 50.0:
+            check["notes"].append(
+                f"Wind speed range [{ws_min:.1f}, {ws_max:.1f}] m/s: OK")
+
+        self.trop_checks.append(check)
+        self.all_pass = self.all_pass and check["pass"]
+        return check["pass"]
+
+    def trop_potential_temp_check(self, pt_2d, label="MetPy"):
+        """Verify potential temperature is in realistic range at 850 hPa."""
+        pt = np.asarray(pt_2d, dtype=np.float64)
+        check = {"name": f"Tropical potential temp ({label})", "pass": True, "notes": []}
+
+        pt_mean = float(np.nanmean(pt))
+        pt_min = float(np.nanmin(pt))
+        pt_max = float(np.nanmax(pt))
+        check["pt_range"] = (pt_min, pt_max)
+        check["notes"].append(
+            f"Theta 850 hPa: mean={pt_mean:.1f} K, "
+            f"range=[{pt_min:.1f}, {pt_max:.1f}] K")
+
+        # Tropical 850 hPa theta: ~295-315 K
+        if pt_mean < 285 or pt_mean > 325:
+            check["pass"] = False
+            check["notes"].append(
+                f"FAIL: mean theta {pt_mean:.1f} K outside range [285, 325]")
+        else:
+            check["notes"].append(
+                f"Mean theta {pt_mean:.1f} K in expected range [285, 325]: OK")
+
+        self.trop_checks.append(check)
         self.all_pass = self.all_pass and check["pass"]
         return check["pass"]
 
@@ -698,11 +629,11 @@ class DeepVerifier:
                 for reason in r["fail_reasons"]:
                     print(f"           ** {reason}")
 
-        # TC structural checks
-        if self.tc_checks:
+        # Tropical structural checks
+        if self.trop_checks:
             print()
-            print(f"  --- TC structural checks ---")
-            for c in self.tc_checks:
+            print(f"  --- Tropical atmosphere structural checks ---")
+            for c in self.trop_checks:
                 status = "PASS" if c["pass"] else "FAIL"
                 print(f"    [{status}] {c['name']}")
                 for note in c["notes"]:
@@ -726,16 +657,16 @@ class DeepVerifier:
 
         n_pass = sum(1 for r in self.reports if r["pass"])
         n_fail = sum(1 for r in self.reports if not r["pass"])
-        tc_pass = sum(1 for c in self.tc_checks if c["pass"])
-        tc_fail = sum(1 for c in self.tc_checks if not c["pass"])
+        tc_pass = sum(1 for c in self.trop_checks if c["pass"])
+        tc_fail = sum(1 for c in self.trop_checks if not c["pass"])
 
         print()
-        print(f"  Statistical comparisons: {n_pass} PASS, {n_fail} FAIL "
+        print(f"  Statistical comparisons:     {n_pass} PASS, {n_fail} FAIL "
               f"(of {n_pass + n_fail})")
-        print(f"  TC structural checks:    {tc_pass} PASS, {tc_fail} FAIL "
+        print(f"  Tropical structural checks:  {tc_pass} PASS, {tc_fail} FAIL "
               f"(of {tc_pass + tc_fail})")
         overall = "ALL PASS" if self.all_pass else "SOME FAILURES"
-        print(f"  Overall verification:    {overall}")
+        print(f"  Overall verification:        {overall}")
         print("=" * W)
 
 
@@ -744,39 +675,55 @@ class DeepVerifier:
 # ============================================================================
 def main():
     print("=" * 110)
-    print("  BENCHMARK 08 : ERA5-like Tropical Cyclone Analysis")
-    print(f"  Grid: 200x200 x 20 levels  |  dx=dy=27.8 km (0.25 deg at tropics)")
+    print("  BENCHMARK 08 : Real GFS Tropical Analysis (Western Pacific 0-30N, 100-150E)")
+    print(f"  Data: GFS 0.25 deg, 33 levels, tropical subdomain ~121 x 201")
     print(f"  GPU : {GPU_NAME if HAS_GPU else 'not available'}  |  met-cu: {'yes' if HAS_METCU else 'no'}")
     print("=" * 110)
 
-    # -- build fields --
-    print("  Generating synthetic tropical cyclone fields ... ", end="", flush=True)
+    # -- load data --
+    print()
     t0 = time.perf_counter()
-    d = make_tc_fields()
-    print(f"{(time.perf_counter() - t0) * 1000:.0f} ms")
+    d = load_gfs_tropical()
+    load_ms = (time.perf_counter() - t0) * 1000.0
+    print(f"  Loaded in {load_ms:.0f} ms  |  "
+          f"shape: {d['NZ']} levels x {d['NY']} lat x {d['NX']} lon")
+    print(f"  Pressure levels: {d['p_levels_hPa'][0]:.0f} - {d['p_levels_hPa'][-1]:.0f} hPa "
+          f"({d['NZ']} levels)")
+    print(f"  dx={d['DX']:.0f} m  dy={d['DY']:.0f} m")
+    print()
 
     NX, NY, NZ = d["NX"], d["NY"], d["NZ"]
     DX, DY = d["DX"], d["DY"]
-    cx, cy = d["cx"], d["cy"]
-    Rmax = d["Rmax"]
 
     verifier = DeepVerifier()
 
-    # -- MetPy Pint wrappers (not timed) --
-    u2_q   = d["u_2d"] * units("m/s")
-    v2_q   = d["v_2d"] * units("m/s")
-    dx_q   = DX * units.m
-    dy_q   = DY * units.m
+    # -- 850 hPa slice for 2-D tests --
+    # Find 850 hPa index
+    i850 = int(np.argmin(np.abs(d["p_levels_hPa"] - 850.0)))
+    p850_hPa = d["p_levels_hPa"][i850]
+    print(f"  Using level index {i850} = {p850_hPa:.0f} hPa for 2-D tests")
 
-    # Use 850 hPa slice (index 5) for 2-D thermo tests
-    i850 = 5  # p_levels_hPa[5] = 850
-    T850   = d["T_3d"][i850]
-    Td850  = d["Td_3d"][i850]
-    T850_q = T850 * units.degC
-    Td850_q = Td850 * units.degC
-    p850_q = 850.0 * units.hPa
-    # met-cu needs pressure broadcast to match array shape
-    p850_arr = np.full_like(T850, 850.0)
+    u850 = d["u_3d"][i850].copy()       # (ny, nx)
+    v850 = d["v_3d"][i850].copy()
+    T850_C = d["T_C"][i850].copy()      # Celsius
+    Td850_C = d["Td_C"][i850].copy()    # Celsius
+
+    print(f"  T850: {T850_C.min():.1f} to {T850_C.max():.1f} C")
+    print(f"  Td850: {Td850_C.min():.1f} to {Td850_C.max():.1f} C")
+    print(f"  U850: {u850.min():.1f} to {u850.max():.1f} m/s")
+    print(f"  V850: {v850.min():.1f} to {v850.max():.1f} m/s")
+
+    # MetPy Pint wrappers
+    u850_q = u850 * units("m/s")
+    v850_q = v850 * units("m/s")
+    dx_q = DX * units.m
+    dy_q = DY * units.m
+    T850_q = T850_C * units.degC
+    Td850_q = Td850_C * units.degC
+    p850_q = p850_hPa * units.hPa
+
+    # met-cu needs pressure broadcast to array shape
+    p850_arr = np.full_like(T850_C, p850_hPa)
 
     # ================================================================
     print()
@@ -787,31 +734,27 @@ def main():
     # ----------------------------------------------------------------
     # 1. VORTICITY (GPU)
     # ----------------------------------------------------------------
-    # MetPy
-    t_mp = _time_func(lambda: mpcalc.vorticity(u2_q, v2_q, dx=dx_q, dy=dy_q))
-    ref_vort = _strip(mpcalc.vorticity(u2_q, v2_q, dx=dx_q, dy=dy_q))
+    t_mp = _time_func(lambda: mpcalc.vorticity(u850_q, v850_q, dx=dx_q, dy=dy_q))
+    ref_vort = _strip(mpcalc.vorticity(u850_q, v850_q, dx=dx_q, dy=dy_q))
 
-    # metrust CPU
     mrcalc.set_backend("cpu")
-    t_cpu = _time_func(lambda: mrcalc.vorticity(d["u_2d"], d["v_2d"], dx=DX, dy=DY))
-    mr_vort = _strip(mrcalc.vorticity(d["u_2d"], d["v_2d"], dx=DX, dy=DY))
+    t_cpu = _time_func(lambda: mrcalc.vorticity(u850, v850, dx=DX, dy=DY))
+    mr_vort = _strip(mrcalc.vorticity(u850, v850, dx=DX, dy=DY))
 
-    # met-cu
     t_mcu = None
     if HAS_METCU:
         t_mcu = _time_func(
-            lambda: mcucalc.vorticity(d["u_2d"], d["v_2d"], dx=DX, dy=DY),
+            lambda: mcucalc.vorticity(u850, v850, dx=DX, dy=DY),
             gpu=True)
-        mcu_vort = _asnp(mcucalc.vorticity(d["u_2d"], d["v_2d"], dx=DX, dy=DY))
+        mcu_vort = _asnp(mcucalc.vorticity(u850, v850, dx=DX, dy=DY))
 
-    # metrust GPU
     t_gpu = None
     if HAS_GPU:
         mrcalc.set_backend("gpu")
         t_gpu = _time_func(
-            lambda: mrcalc.vorticity(d["u_2d"], d["v_2d"], dx=DX, dy=DY),
+            lambda: mrcalc.vorticity(u850, v850, dx=DX, dy=DY),
             gpu=True)
-        mr_gpu_vort = _strip(mrcalc.vorticity(d["u_2d"], d["v_2d"], dx=DX, dy=DY))
+        mr_gpu_vort = _strip(mrcalc.vorticity(u850, v850, dx=DX, dy=DY))
         mrcalc.set_backend("cpu")
 
     vd = {"MP-CPU": _check(ref_vort, mr_vort)}
@@ -822,7 +765,6 @@ def main():
     all_pass = all_pass and all(vd.values())
     record("vorticity", t_mp, t_cpu, t_mcu, t_gpu, vd)
 
-    # Deep verification: vorticity
     verifier.compare("vorticity", "MP-CPU", ref_vort, mr_vort,
                      phys_lo=-5e-3, phys_hi=5e-3, phys_label="/s")
     if HAS_GPU:
@@ -831,9 +773,7 @@ def main():
     if HAS_METCU:
         verifier.compare("vorticity", "MP-MCU", ref_vort, mcu_vort,
                          phys_lo=-5e-3, phys_hi=5e-3, phys_label="/s")
-    # TC structural: vorticity max near center
-    verifier.tc_vorticity_check(ref_vort, cx, cy, Rmax, DX)
-    verifier.tc_vorticity_check(mr_vort, cx, cy, Rmax, DX)
+    verifier.trop_vorticity_check(ref_vort, label="MetPy")
 
     # ----------------------------------------------------------------
     # 2. EQUIVALENT POTENTIAL TEMPERATURE (GPU)
@@ -845,23 +785,25 @@ def main():
 
     mrcalc.set_backend("cpu")
     t_cpu = _time_func(lambda: mrcalc.equivalent_potential_temperature(
-        850.0, T850, Td850))
-    mr_ept = _strip(mrcalc.equivalent_potential_temperature(850.0, T850, Td850))
+        p850_hPa, T850_C, Td850_C))
+    mr_ept = _strip(mrcalc.equivalent_potential_temperature(
+        p850_hPa, T850_C, Td850_C))
 
     t_mcu = None
     if HAS_METCU:
         t_mcu = _time_func(
-            lambda: mcucalc.equivalent_potential_temperature(p850_arr, T850, Td850),
+            lambda: mcucalc.equivalent_potential_temperature(p850_arr, T850_C, Td850_C),
             gpu=True)
-        mcu_ept = _asnp(mcucalc.equivalent_potential_temperature(p850_arr, T850, Td850))
+        mcu_ept = _asnp(mcucalc.equivalent_potential_temperature(p850_arr, T850_C, Td850_C))
 
     t_gpu = None
     if HAS_GPU:
         mrcalc.set_backend("gpu")
         t_gpu = _time_func(
-            lambda: mrcalc.equivalent_potential_temperature(850.0, T850, Td850),
+            lambda: mrcalc.equivalent_potential_temperature(p850_hPa, T850_C, Td850_C),
             gpu=True)
-        mr_gpu_ept = _strip(mrcalc.equivalent_potential_temperature(850.0, T850, Td850))
+        mr_gpu_ept = _strip(mrcalc.equivalent_potential_temperature(
+            p850_hPa, T850_C, Td850_C))
         mrcalc.set_backend("cpu")
 
     vd = {"MP-CPU": _check(ref_ept, mr_ept)}
@@ -872,18 +814,15 @@ def main():
     all_pass = all_pass and all(vd.values())
     record("equiv_potential_temp", t_mp, t_cpu, t_mcu, t_gpu, vd)
 
-    # Deep verification: equiv_potential_temperature
-    # Synthetic sounding theta-e at 850 hPa is ~293-298 K (cold level)
     verifier.compare("equiv_potential_temp", "MP-CPU", ref_ept, mr_ept,
-                     phys_lo=200, phys_hi=450, phys_label="K")
+                     phys_lo=280, phys_hi=400, phys_label="K")
     if HAS_GPU:
         verifier.compare("equiv_potential_temp", "MP-GPU", ref_ept, mr_gpu_ept,
-                         phys_lo=200, phys_hi=450, phys_label="K")
+                         phys_lo=280, phys_hi=400, phys_label="K")
     if HAS_METCU:
         verifier.compare("equiv_potential_temp", "MP-MCU", ref_ept, mcu_ept,
-                         phys_lo=200, phys_hi=450, phys_label="K")
-    # TC structural: theta-e highest in eyewall
-    verifier.tc_theta_e_check(ref_ept, cx, cy, Rmax, DX)
+                         phys_lo=280, phys_hi=400, phys_label="K")
+    verifier.trop_theta_e_check(ref_ept, label="MetPy")
 
     # ----------------------------------------------------------------
     # 3. POTENTIAL TEMPERATURE (GPU)
@@ -892,23 +831,23 @@ def main():
     ref_pt = _strip(mpcalc.potential_temperature(p850_q, T850_q))
 
     mrcalc.set_backend("cpu")
-    t_cpu = _time_func(lambda: mrcalc.potential_temperature(850.0, T850))
-    mr_pt = _strip(mrcalc.potential_temperature(850.0, T850))
+    t_cpu = _time_func(lambda: mrcalc.potential_temperature(p850_hPa, T850_C))
+    mr_pt = _strip(mrcalc.potential_temperature(p850_hPa, T850_C))
 
     t_mcu = None
     if HAS_METCU:
         t_mcu = _time_func(
-            lambda: mcucalc.potential_temperature(p850_arr, T850),
+            lambda: mcucalc.potential_temperature(p850_arr, T850_C),
             gpu=True)
-        mcu_pt = _asnp(mcucalc.potential_temperature(p850_arr, T850))
+        mcu_pt = _asnp(mcucalc.potential_temperature(p850_arr, T850_C))
 
     t_gpu = None
     if HAS_GPU:
         mrcalc.set_backend("gpu")
         t_gpu = _time_func(
-            lambda: mrcalc.potential_temperature(850.0, T850),
+            lambda: mrcalc.potential_temperature(p850_hPa, T850_C),
             gpu=True)
-        mr_gpu_pt = _strip(mrcalc.potential_temperature(850.0, T850))
+        mr_gpu_pt = _strip(mrcalc.potential_temperature(p850_hPa, T850_C))
         mrcalc.set_backend("cpu")
 
     vd = {"MP-CPU": _check(ref_pt, mr_pt)}
@@ -919,15 +858,15 @@ def main():
     all_pass = all_pass and all(vd.values())
     record("potential_temperature", t_mp, t_cpu, t_mcu, t_gpu, vd)
 
-    # Deep verification: potential_temperature
     verifier.compare("potential_temperature", "MP-CPU", ref_pt, mr_pt,
-                     phys_lo=250, phys_hi=400, phys_label="K")
+                     phys_lo=280, phys_hi=330, phys_label="K")
     if HAS_GPU:
         verifier.compare("potential_temperature", "MP-GPU", ref_pt, mr_gpu_pt,
-                         phys_lo=250, phys_hi=400, phys_label="K")
+                         phys_lo=280, phys_hi=330, phys_label="K")
     if HAS_METCU:
         verifier.compare("potential_temperature", "MP-MCU", ref_pt, mcu_pt,
-                         phys_lo=250, phys_hi=400, phys_label="K")
+                         phys_lo=280, phys_hi=330, phys_label="K")
+    verifier.trop_potential_temp_check(ref_pt, label="MetPy")
 
     # ----------------------------------------------------------------
     # 4. COMPUTE_PW (GPU) -- no MetPy grid equivalent
@@ -960,32 +899,30 @@ def main():
     all_pass = all_pass and all(vd.values())
     record("compute_pw (3D)", None, t_cpu, t_mcu, t_gpu, vd)
 
-    # Deep verification: compute_pw (cross-compare, no MetPy reference)
     if HAS_METCU:
         verifier.compare("compute_pw", "CPU-MCU", mr_pw, mcu_pw,
-                         phys_lo=0, phys_hi=100, phys_label="mm")
+                         phys_lo=0, phys_hi=120, phys_label="mm")
     if HAS_GPU:
         verifier.compare("compute_pw", "CPU-GPU", mr_pw, mr_gpu_pw,
-                         phys_lo=0, phys_hi=100, phys_label="mm")
-    # TC structural: PW in tropical range
-    verifier.tc_pw_check(mr_pw, cx, cy, Rmax, DX)
+                         phys_lo=0, phys_hi=120, phys_label="mm")
+    verifier.trop_pw_check(mr_pw, label="metrust CPU")
 
     # ----------------------------------------------------------------
     # 5. WIND SPEED (CPU only -- no GPU kernel)
     # ----------------------------------------------------------------
-    t_mp = _time_func(lambda: mpcalc.wind_speed(u2_q, v2_q))
-    ref_ws = _strip(mpcalc.wind_speed(u2_q, v2_q))
+    t_mp = _time_func(lambda: mpcalc.wind_speed(u850_q, v850_q))
+    ref_ws = _strip(mpcalc.wind_speed(u850_q, v850_q))
 
     mrcalc.set_backend("cpu")
-    t_cpu = _time_func(lambda: mrcalc.wind_speed(d["u_2d"], d["v_2d"]))
-    mr_ws = _strip(mrcalc.wind_speed(d["u_2d"], d["v_2d"]))
+    t_cpu = _time_func(lambda: mrcalc.wind_speed(u850, v850))
+    mr_ws = _strip(mrcalc.wind_speed(u850, v850))
 
     t_mcu = None
     if HAS_METCU:
         t_mcu = _time_func(
-            lambda: mcucalc.wind_speed(d["u_2d"], d["v_2d"]),
+            lambda: mcucalc.wind_speed(u850, v850),
             gpu=True)
-        mcu_ws = _asnp(mcucalc.wind_speed(d["u_2d"], d["v_2d"]))
+        mcu_ws = _asnp(mcucalc.wind_speed(u850, v850))
 
     vd = {"MP-CPU": _check(ref_ws, mr_ws)}
     if HAS_METCU:
@@ -993,31 +930,29 @@ def main():
     all_pass = all_pass and all(vd.values())
     record("wind_speed", t_mp, t_cpu, t_mcu, None, vd)
 
-    # Deep verification: wind_speed
     verifier.compare("wind_speed", "MP-CPU", ref_ws, mr_ws,
-                     phys_lo=0.0, phys_hi=60.0, phys_label="m/s")
+                     phys_lo=0.0, phys_hi=50.0, phys_label="m/s")
     if HAS_METCU:
         verifier.compare("wind_speed", "MP-MCU", ref_ws, mcu_ws,
-                         phys_lo=0.0, phys_hi=60.0, phys_label="m/s")
-    # TC structural: cyclonic pattern
-    verifier.tc_wind_speed_check(ref_ws, d["u_2d"], d["v_2d"], cx, cy, Rmax, DX)
+                         phys_lo=0.0, phys_hi=50.0, phys_label="m/s")
+    verifier.trop_wind_speed_check(ref_ws, label="MetPy")
 
     # ----------------------------------------------------------------
     # 6. DIVERGENCE (CPU only -- no GPU kernel)
     # ----------------------------------------------------------------
-    t_mp = _time_func(lambda: mpcalc.divergence(u2_q, v2_q, dx=dx_q, dy=dy_q))
-    ref_div = _strip(mpcalc.divergence(u2_q, v2_q, dx=dx_q, dy=dy_q))
+    t_mp = _time_func(lambda: mpcalc.divergence(u850_q, v850_q, dx=dx_q, dy=dy_q))
+    ref_div = _strip(mpcalc.divergence(u850_q, v850_q, dx=dx_q, dy=dy_q))
 
     mrcalc.set_backend("cpu")
-    t_cpu = _time_func(lambda: mrcalc.divergence(d["u_2d"], d["v_2d"], dx=DX, dy=DY))
-    mr_div = _strip(mrcalc.divergence(d["u_2d"], d["v_2d"], dx=DX, dy=DY))
+    t_cpu = _time_func(lambda: mrcalc.divergence(u850, v850, dx=DX, dy=DY))
+    mr_div = _strip(mrcalc.divergence(u850, v850, dx=DX, dy=DY))
 
     t_mcu = None
     if HAS_METCU:
         t_mcu = _time_func(
-            lambda: mcucalc.divergence(d["u_2d"], d["v_2d"], dx=DX, dy=DY),
+            lambda: mcucalc.divergence(u850, v850, dx=DX, dy=DY),
             gpu=True)
-        mcu_div = _asnp(mcucalc.divergence(d["u_2d"], d["v_2d"], dx=DX, dy=DY))
+        mcu_div = _asnp(mcucalc.divergence(u850, v850, dx=DX, dy=DY))
 
     vd = {"MP-CPU": _check(ref_div, mr_div)}
     if HAS_METCU:
@@ -1025,7 +960,6 @@ def main():
     all_pass = all_pass and all(vd.values())
     record("divergence", t_mp, t_cpu, t_mcu, None, vd)
 
-    # Deep verification: divergence
     verifier.compare("divergence", "MP-CPU", ref_div, mr_div,
                      phys_lo=-5e-3, phys_hi=5e-3, phys_label="/s")
     if HAS_METCU:
