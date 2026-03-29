@@ -258,6 +258,26 @@ def _raw_array_ndim(data):
     return np.asarray(data).ndim
 
 
+def _broadcast_for_gpu(*args):
+    """Broadcast scalar args to match the largest array shape for GPU kernels.
+
+    met-cu CUDA kernels ``.ravel()`` every argument and index by thread-id,
+    so all inputs must have the same number of elements.  This helper expands
+    any 0-d (scalar) argument to a full array matching the largest shape.
+    """
+    shapes = [np.shape(a) for a in args]
+    ref = max(shapes, key=lambda s: len(s) if s else 0)
+    if not ref:
+        return args
+    out = []
+    for a, s in zip(args, shapes):
+        if not s and ref:
+            out.append(np.broadcast_to(float(a), ref).copy())
+        else:
+            out.append(a)
+    return tuple(out)
+
+
 def _gpu_uniform_grid_supported(*arrays, dx=None, dy=None, parallel_scale=None,
                                 meridional_scale=None, latitude=None,
                                 longitude=None, crs=None):
@@ -370,12 +390,13 @@ def equivalent_potential_temperature(pressure, temperature, dewpoint):
     Quantity (K)
     """
     if _BACKEND == "gpu":
+        p, t, td = _broadcast_for_gpu(
+            _strip(pressure, "hPa"),
+            _strip(temperature, "degC"),
+            _strip(dewpoint, "degC"),
+        )
         result = _gpu_to_numpy(
-            _load_gpu_calc().equivalent_potential_temperature(
-                _strip(pressure, "hPa"),
-                _strip(temperature, "degC"),
-                _strip(dewpoint, "degC"),
-            )
+            _load_gpu_calc().equivalent_potential_temperature(p, t, td)
         )
         return result * units.K
     vals, shape, is_arr = _prep(_strip(pressure, "hPa"), _strip(temperature, "degC"), _strip(dewpoint, "degC"))
