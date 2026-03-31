@@ -17,7 +17,7 @@ metrust started with SHARPpy-heritage algorithms — Wobus polynomial approximat
 
 Over a series of systematic replacements, metrust moved to MetPy-exact algorithms:
 
-- **Moist lapse rate** replaced with a fourth-order Runge-Kutta (RK4) integration of the full moist-adiabatic ODE, matching MetPy's `moist_lapse` to machine precision.
+- **Moist lapse rate** replaced with a fourth-order Runge-Kutta (RK4) integration of the full moist-adiabatic ODE, matching MetPy closely on the supported reference-pressure paths.
 - **CAPE integration** switched from a simplified buoyancy sum to MetPy's exact formulation: `g * dTv / Tv * dz`, integrated over each layer.
 - **Bunkers storm motion** moved to a pressure-weighted mean wind, matching the Bunkers et al. (2000) method that MetPy implements.
 - **Isentropic interpolation** adopted a Newton solver on the exact theta equation rather than a lookup-table approach.

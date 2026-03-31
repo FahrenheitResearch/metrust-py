@@ -7,8 +7,12 @@ in Rust versus what it delegates to MetPy.
 
 ## 1. Compatibility Model
 
-metrust is a drop-in replacement for `metpy.calc` backed by a compiled Rust
+metrust is a MetPy-compatible calculation layer for `metpy.calc`, backed by a compiled Rust
 engine (`_metrust`).  The compatibility model has three tiers:
+
+Function coverage in the tables below is a functionality matrix, not a guarantee of byte-for-byte
+signature parity with every historical MetPy calling convention. The compatibility tests cover the
+most common wrapper forms and explicit regression cases.
 
 | Tier | Description |
 |------|-------------|

@@ -107,7 +107,14 @@ def _rh_to_percent(relative_humidity):
     if val.ndim == 0:
         v = float(val)
         return v * 100.0 if abs(v) <= 1.5 else v
+    finite = val[np.isfinite(val)]
+    if finite.size and np.nanmax(np.abs(finite)) <= 1.5:
+        return val * 100.0
     return val
+
+
+def _rh_to_fraction(relative_humidity):
+    return np.asarray(_rh_to_percent(relative_humidity), dtype=np.float64) / 100.0
 
 
 def _as_2d(data, unit=None):
@@ -334,15 +341,26 @@ def _svp_ice_pa(t_k):
     return _SAT_P0 * (_T0 / t_k) ** pw * np.exp(ex)
 
 
+def _normalize_phase(phase):
+    phase = str(phase).strip().lower()
+    if phase == "solid":
+        return "ice"
+    return phase
+
+
 def _svp_with_phase(t_c, phase):
     """SVP in hPa with explicit phase selection."""
-    t_k = t_c + _ZEROCNK
+    phase = _normalize_phase(phase)
+    t_k = np.asarray(t_c, dtype=np.float64) + _ZEROCNK
     if phase == "ice":
         return _svp_ice_pa(t_k) / 100.0
     # auto: ice below T0
-    if t_k > _T0:
-        return _calc.saturation_vapor_pressure(t_c)  # liquid, already hPa
-    return _svp_ice_pa(t_k) / 100.0
+    liquid = np.asarray(_calc.saturation_vapor_pressure_array(np.asarray(t_c, dtype=np.float64).ravel()), dtype=np.float64).reshape(t_k.shape)
+    ice = _svp_ice_pa(t_k) / 100.0
+    if phase == "auto":
+        result = np.where(t_k > _T0, liquid, ice)
+        return float(result) if np.ndim(result) == 0 else result
+    return float(ice) if np.ndim(ice) == 0 else ice
 
 # ============================================================================
 # Thermo
@@ -423,6 +441,7 @@ def saturation_vapor_pressure(temperature, phase="liquid"):
     -------
     Quantity (hPa)
     """
+    phase = _normalize_phase(phase)
     t_raw = _strip(temperature, "degC")
     if phase == "liquid":
         vals, shape, is_arr = _prep(t_raw)
@@ -450,6 +469,7 @@ def saturation_mixing_ratio(pressure, temperature, phase="liquid"):
     -------
     Quantity (dimensionless, kg/kg)
     """
+    phase = _normalize_phase(phase)
     p_raw = _strip(pressure, "hPa")
     t_raw = _strip(temperature, "degC")
     if phase == "liquid":
@@ -460,11 +480,12 @@ def saturation_mixing_ratio(pressure, temperature, phase="liquid"):
             result = _calc.saturation_mixing_ratio(vals[0], vals[1]) / 1000.0
         return _attach(result, "kg/kg")
     # ice / auto
-    p = _as_float(p_raw)
-    t = _as_float(t_raw)
+    p = np.asarray(p_raw, dtype=np.float64)
+    t = np.asarray(t_raw, dtype=np.float64)
     _EPS = 0.6219569100577033
     es = _svp_with_phase(t, phase)
-    return _attach(max((_EPS * es / (p - es)), 0.0) / 1000.0, "kg/kg")
+    result = np.maximum(_EPS * es / (p - es), 0.0)
+    return _attach(float(result) if np.ndim(result) == 0 else result, "kg/kg")
 
 
 def wet_bulb_temperature(pressure, temperature, dewpoint):
@@ -592,6 +613,7 @@ def relative_humidity_from_dewpoint(temperature, dewpoint, phase="liquid"):
     -------
     Quantity (dimensionless, 0-1)
     """
+    phase = _normalize_phase(phase)
     t_raw = _strip(temperature, "degC")
     td_raw = _strip(dewpoint, "degC")
     if phase == "liquid":
@@ -1113,13 +1135,17 @@ def brunt_vaisala_frequency_squared(height, potential_temp):
     return result * units("1/s**2")
 
 
-def precipitable_water(pressure, dewpoint):
+def precipitable_water(pressure, dewpoint, *, bottom=None, top=None):
     """Precipitable water from pressure and dewpoint profiles.
 
     Parameters
     ----------
     pressure : array Quantity (pressure)
     dewpoint : array Quantity (temperature)
+    bottom: Quantity (pressure), optional
+        Bottom of the layer. Defaults to the highest pressure in the profile.
+    top: Quantity (pressure), optional
+        Top of the layer. Defaults to the lowest pressure in the profile.
 
     Returns
     -------
@@ -1127,7 +1153,53 @@ def precipitable_water(pressure, dewpoint):
     """
     p = _as_1d(_strip(pressure, "hPa"))
     td = _as_1d(_strip(dewpoint, "degC"))
-    return _calc.precipitable_water(p, td) * units.mm
+    mask = ~(np.isnan(p) | np.isnan(td))
+    p = p[mask]
+    td = td[mask]
+    if p.size == 0:
+        raise ValueError("precipitable_water requires at least one finite pressure/dewpoint pair")
+
+    sort_inds = np.argsort(p)[::-1]
+    p = p[sort_inds]
+    td = td[sort_inds]
+
+    min_pressure = float(np.nanmin(p))
+    max_pressure = float(np.nanmax(p))
+
+    if top is None:
+        top_hpa = min_pressure
+    else:
+        top_hpa = _as_float(_strip(top, "hPa"))
+        if not min_pressure <= top_hpa <= max_pressure:
+            raise ValueError(
+                f"The pressure and dewpoint profile ranges from {max_pressure} to "
+                f"{min_pressure} hPa after removing missing values. {top_hpa} hPa is "
+                "outside this range."
+            )
+
+    if bottom is None:
+        bottom_hpa = max_pressure
+    else:
+        bottom_hpa = _as_float(_strip(bottom, "hPa"))
+        if not min_pressure <= bottom_hpa <= max_pressure:
+            raise ValueError(
+                f"The pressure and dewpoint profile ranges from {max_pressure} to "
+                f"{min_pressure} hPa after removing missing values. {bottom_hpa} hPa is "
+                "outside this range."
+            )
+
+    pres_layer, dewpoint_layer = get_layer(
+        p * units.hPa,
+        td * units.degC,
+        bottom=bottom_hpa * units.hPa,
+        depth=(bottom_hpa - top_hpa) * units.hPa,
+        interpolate=True,
+    )
+    w = mixing_ratio(saturation_vapor_pressure(dewpoint_layer), pres_layer.to("Pa"))
+    # Pressure decreases with height, so the integral is negated to yield positive PW.
+    trapz = getattr(np, "trapezoid", None) or np.trapz
+    pw = -trapz(w.to("kg/kg").magnitude, pres_layer.to("Pa").magnitude) / (9.80665 * 1000.0)
+    return (pw * units.m).to("mm")
 
 
 def parcel_profile_with_lcl(pressure, t_surface, td_surface):
@@ -1440,21 +1512,7 @@ def thickness_hydrostatic_from_relative_humidity(pressure, temperature,
     """
     p = _as_1d(_strip(pressure, "hPa"))
     t = _as_1d(_strip(temperature, "degC"))
-    # Handle RH: Rust expects percent (0-100).
-    # If pint Quantity, try converting to percent first.
-    if hasattr(relative_humidity, "magnitude"):
-        try:
-            rh = _as_1d(relative_humidity.to("percent").magnitude)
-        except Exception:
-            # dimensionless ratio 0-1 -> convert to percent
-            rh = _as_1d(relative_humidity.magnitude) * 100.0
-    else:
-        rh_arr = np.asarray(relative_humidity, dtype=np.float64)
-        # Heuristic: if max <= 1.0, treat as ratio
-        if rh_arr.max() <= 1.0:
-            rh = _as_1d(rh_arr * 100.0)
-        else:
-            rh = _as_1d(rh_arr)
+    rh = _as_1d(_rh_to_percent(relative_humidity))
     return _calc.thickness_hydrostatic_from_relative_humidity(p, t, rh) * units.m
 
 
@@ -1856,7 +1914,7 @@ def mixed_layer_cape_cin(pressure, temperature, dewpoint, depth=100.0):
     return cape_val * units("J/kg"), cin_val * units("J/kg")
 
 
-def mixing_ratio_from_relative_humidity(pressure, temperature, relative_humidity):
+def mixing_ratio_from_relative_humidity(pressure, temperature, relative_humidity, *, phase="liquid"):
     """Mixing ratio from pressure, temperature, and relative humidity.
 
     Parameters
@@ -1864,11 +1922,20 @@ def mixing_ratio_from_relative_humidity(pressure, temperature, relative_humidity
     pressure : Quantity (pressure)
     temperature : Quantity (temperature)
     relative_humidity : Quantity (percent or dimensionless)
+    phase : str, optional
+        ``"liquid"`` (default), ``"ice"``, or ``"auto"``.
 
     Returns
     -------
     Quantity (dimensionless, kg/kg)
     """
+    phase = _normalize_phase(phase)
+    if phase != "liquid":
+        rh = _rh_to_fraction(relative_humidity)
+        return _attach(
+            rh * saturation_mixing_ratio(pressure, temperature, phase=phase).to("kg/kg").magnitude,
+            "kg/kg",
+        )
     rh = _rh_to_percent(relative_humidity)
     vals, shape, is_arr = _prep(_strip(pressure, "hPa"), _strip(temperature, "degC"), rh)
     if is_arr:
@@ -1897,38 +1964,50 @@ def mixing_ratio_from_specific_humidity(specific_humidity):
     return _attach(result, "kg/kg")
 
 
-def moist_lapse(pressure, t_start, reference_pressure=None):
+def moist_lapse(pressure, temperature, reference_pressure=None):
     """Moist adiabatic lapse rate temperature profile.
 
     Parameters
     ----------
     pressure : array Quantity (pressure)
-    t_start : Quantity (temperature)
+    temperature : Quantity (temperature)
 
     Returns
     -------
     array Quantity (degC)
     """
     p = _as_1d(_strip(pressure, "hPa"))
-    t = _as_float(_strip(t_start, "degC"))
+    t = _as_float(_strip(temperature, "degC"))
     if reference_pressure is None:
         result = np.asarray(_calc.moist_lapse(p, t))
     else:
         ref_p = _as_float(_strip(reference_pressure, "hPa"))
-        if np.isclose(ref_p, p[0]):
-            p_run = np.ascontiguousarray(p)
-            reverse = False
-        elif np.isclose(ref_p, p[-1]):
-            p_run = np.ascontiguousarray(p[::-1])
-            reverse = True
-        else:
-            raise NotImplementedError(
-                "moist_lapse currently supports reference_pressure only when it matches "
-                "the first or last pressure level"
-            )
-        result = np.asarray(_calc.moist_lapse(p_run, t))
-        if reverse:
-            result = result[::-1]
+        result = np.empty_like(p, dtype=np.float64)
+        equal_mask = np.isclose(p, ref_p)
+        lower_mask = p < ref_p
+        higher_mask = p > ref_p
+
+        if np.any(lower_mask):
+            lower_levels = np.sort(p[lower_mask])[::-1]
+            up_path = np.ascontiguousarray(np.concatenate(([ref_p], lower_levels)))
+            up_result = np.asarray(_calc.moist_lapse(up_path, t))
+            for level, value in zip(up_path[1:], up_result[1:]):
+                result[np.isclose(p, level)] = value
+
+        if np.any(higher_mask):
+            higher_levels = np.sort(p[higher_mask])
+            down_path = np.ascontiguousarray(np.concatenate(([ref_p], higher_levels)))
+            down_result = np.asarray(_calc.moist_lapse(down_path, t))
+            for level, value in zip(down_path[1:], down_result[1:]):
+                result[np.isclose(p, level)] = value
+
+        result[equal_mask] = t
+
+        if not np.any(equal_mask):
+            sort_idx = np.argsort(p)
+            p_sorted = p[sort_idx]
+            result_sorted = result[sort_idx]
+            result = np.interp(p, p_sorted, result_sorted)
     return result * units.degC
 
 
@@ -2072,7 +2151,7 @@ def reduce_point_density(lats, lons, radius):
     return _calc.reduce_point_density(lat_arr, lon_arr, r)
 
 
-def relative_humidity_from_mixing_ratio(pressure, temperature, mixing_ratio_val):
+def relative_humidity_from_mixing_ratio(pressure, temperature, mixing_ratio_val, *, phase="liquid"):
     """Relative humidity from mixing ratio.
 
     Parameters
@@ -2085,6 +2164,11 @@ def relative_humidity_from_mixing_ratio(pressure, temperature, mixing_ratio_val)
     -------
     Quantity (dimensionless, 0-1)
     """
+    phase = _normalize_phase(phase)
+    if phase != "liquid":
+        w_kgkg = _strip(mixing_ratio_val, "kg/kg") if _can_convert(mixing_ratio_val, "kg/kg") else mixing_ratio_val
+        ws_kgkg = saturation_mixing_ratio(pressure, temperature, phase=phase).to("kg/kg").magnitude
+        return _attach(np.asarray(w_kgkg, dtype=np.float64) / ws_kgkg, "")
     p_raw = _strip(pressure, "hPa")
     t_raw = _strip(temperature, "degC")
     w_raw = _strip(mixing_ratio_val, "g/kg") if _can_convert(mixing_ratio_val, "g/kg") else np.asarray(_strip(mixing_ratio_val, "kg/kg"), dtype=np.float64) * 1000.0
@@ -2096,7 +2180,7 @@ def relative_humidity_from_mixing_ratio(pressure, temperature, mixing_ratio_val)
     return _attach(result, "")
 
 
-def relative_humidity_from_specific_humidity(pressure, temperature, specific_humidity):
+def relative_humidity_from_specific_humidity(pressure, temperature, specific_humidity, *, phase="liquid"):
     """Relative humidity from specific humidity.
 
     Parameters
@@ -2109,6 +2193,19 @@ def relative_humidity_from_specific_humidity(pressure, temperature, specific_hum
     -------
     Quantity (dimensionless, 0-1)
     """
+    phase = _normalize_phase(phase)
+    if phase != "liquid":
+        q = np.asarray(
+            _strip(specific_humidity, "kg/kg") if hasattr(specific_humidity, "magnitude") else specific_humidity,
+            dtype=np.float64,
+        )
+        mixing_ratio_val = q / np.clip(1.0 - q, 1e-12, None)
+        return relative_humidity_from_mixing_ratio(
+            pressure,
+            temperature,
+            mixing_ratio_val * units("kg/kg"),
+            phase=phase,
+        )
     vals, shape, is_arr = _prep(
         _strip(pressure, "hPa"),
         _strip(temperature, "degC"),
@@ -2466,7 +2563,7 @@ def wind_speed(u, v):
     return result.reshape(orig_shape) * units("m/s")
 
 
-def wind_direction(u, v):
+def wind_direction(u, v, convention="from"):
     """Meteorological wind direction from (u, v).
 
     Parameters
@@ -2477,10 +2574,16 @@ def wind_direction(u, v):
     -------
     array Quantity (degree)
     """
+    if convention not in {"from", "to"}:
+        raise ValueError('Invalid kwarg for "convention". Valid options are "from" or "to".')
     orig_shape = np.asarray(_strip(u, "m/s")).shape
     u_arr = _as_1d(_strip(u, "m/s"))
     v_arr = _as_1d(_strip(v, "m/s"))
     result = np.asarray(_calc.wind_direction(u_arr, v_arr))
+    if convention == "to":
+        result = np.where(result <= 180.0, result + 180.0, result - 180.0)
+        calm_mask = (u_arr == 0.0) & (v_arr == 0.0)
+        result = np.where(calm_mask, 0.0, result)
     return result.reshape(orig_shape) * units.degree
 
 
@@ -2868,73 +2971,71 @@ def _first_derivative_variable(field, delta, axis):
     (one fewer element than field along *axis*).
     """
     arr = np.asarray(field, dtype=np.float64)
+    axis = axis % arr.ndim
     d = np.asarray(delta, dtype=np.float64).copy()
     # Replace near-zero spacings with NaN to avoid division by zero (e.g., at poles)
     d[np.abs(d) < 1.0] = np.nan
     n = arr.shape[axis]
+    if n < 3:
+        return np.gradient(arr, axis=axis)
 
-    # Expand delta to match field dimensions if needed
-    if d.ndim == 1 and d.size == n - 1:
-        # Standard case: spacing between adjacent levels
-        pass
-    elif d.ndim == 2 and d.shape[axis] == n - 1:
-        pass
-    elif d.ndim == 2 and d.shape[axis] == n:
-        # Average adjacent to get n-1 spacings
-        d = (np.take(d, range(d.shape[axis] - 1), axis=axis)
-             + np.take(d, range(1, d.shape[axis]), axis=axis)) / 2.0
-    elif d.size == 1:
+    if d.size == 1:
         return np.gradient(arr, float(d.ravel()[0]), axis=axis)
+
+    target_shape = list(arr.shape)
+    target_shape[axis] = n - 1
+    if d.ndim == 1:
+        if d.size == n:
+            d = np.diff(d)
+        elif d.size != n - 1:
+            return np.gradient(arr, float(np.mean(d)), axis=axis)
+        reshape = [1] * arr.ndim
+        reshape[axis] = d.shape[0]
+        d = d.reshape(reshape)
     else:
-        return np.gradient(arr, float(np.mean(d)), axis=axis)
+        if d.shape[axis] == n:
+            d = np.diff(d, axis=axis)
+        elif d.shape[axis] != n - 1:
+            return np.gradient(arr, float(np.mean(d)), axis=axis)
+        try:
+            d = np.broadcast_to(d, tuple(target_shape)).copy()
+        except ValueError:
+            return np.gradient(arr, float(np.mean(d)), axis=axis)
 
-    result = np.empty_like(arr)
-    # Interior: centered differences
-    slc_c = [slice(None)] * arr.ndim
-    slc_p = [slice(None)] * arr.ndim
-    slc_m = [slice(None)] * arr.ndim
-    slc_c[axis] = slice(1, -1)
-    slc_p[axis] = slice(2, None)
-    slc_m[axis] = slice(None, -2)
+    def _axis_slice(spec):
+        slices = [slice(None)] * arr.ndim
+        slices[axis] = spec
+        return tuple(slices)
 
-    # d_fwd[i] = spacing from i to i+1, d_bwd[i] = spacing from i-1 to i
-    slc_df = [slice(None)] * d.ndim
-    slc_db = [slice(None)] * d.ndim
-    slc_df[axis] = slice(1, None)    # d[1:]
-    slc_db[axis] = slice(None, -1)   # d[:-1]
+    delta_slice0 = _axis_slice(slice(None, -1))
+    delta_slice1 = _axis_slice(slice(1, None))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        combined_delta = d[delta_slice0] + d[delta_slice1]
+        delta_diff = d[delta_slice1] - d[delta_slice0]
 
-    d_fwd = d[tuple(slc_df)]
-    d_bwd = d[tuple(slc_db)]
+        center = (
+            -d[delta_slice1] / (combined_delta * d[delta_slice0]) * arr[_axis_slice(slice(None, -2))]
+            + delta_diff / (d[delta_slice0] * d[delta_slice1]) * arr[_axis_slice(slice(1, -1))]
+            + d[delta_slice0] / (combined_delta * d[delta_slice1]) * arr[_axis_slice(slice(2, None))]
+        )
 
-    # Broadcast delta to match field shape
-    if d_fwd.ndim < arr.ndim:
-        shape = [1] * arr.ndim
-        shape[axis] = d_fwd.shape[0] if d_fwd.ndim > 0 else 1
-        d_fwd = d_fwd.reshape(shape)
-        d_bwd = d_bwd.reshape(shape)
+        combined_delta = d[_axis_slice(slice(None, 1))] + d[_axis_slice(slice(1, 2))]
+        big_delta = combined_delta + d[_axis_slice(slice(None, 1))]
+        left = (
+            -big_delta / (combined_delta * d[_axis_slice(slice(None, 1))]) * arr[_axis_slice(slice(None, 1))]
+            + combined_delta / (d[_axis_slice(slice(None, 1))] * d[_axis_slice(slice(1, 2))]) * arr[_axis_slice(slice(1, 2))]
+            - d[_axis_slice(slice(None, 1))] / (combined_delta * d[_axis_slice(slice(1, 2))]) * arr[_axis_slice(slice(2, 3))]
+        )
 
-    result[tuple(slc_c)] = (arr[tuple(slc_p)] - arr[tuple(slc_m)]) / (d_fwd + d_bwd)
+        combined_delta = d[_axis_slice(slice(-2, -1))] + d[_axis_slice(slice(-1, None))]
+        big_delta = combined_delta + d[_axis_slice(slice(-1, None))]
+        right = (
+            d[_axis_slice(slice(-1, None))] / (combined_delta * d[_axis_slice(slice(-2, -1))]) * arr[_axis_slice(slice(-3, -2))]
+            - combined_delta / (d[_axis_slice(slice(-2, -1))] * d[_axis_slice(slice(-1, None))]) * arr[_axis_slice(slice(-2, -1))]
+            + big_delta / (combined_delta * d[_axis_slice(slice(-1, None))]) * arr[_axis_slice(slice(-1, None))]
+        )
 
-    # Boundaries: forward/backward differences
-    slc_0 = [slice(None)] * arr.ndim
-    slc_1 = [slice(None)] * arr.ndim
-    slc_0[axis] = 0
-    slc_1[axis] = 1
-    d0 = np.take(d, 0, axis=axis)
-    if d0.ndim < arr[tuple(slc_0)].ndim:
-        d0 = np.expand_dims(d0, axis=axis) if d0.ndim > 0 else d0
-    result[tuple(slc_0)] = (arr[tuple(slc_1)] - arr[tuple(slc_0)]) / d0
-
-    slc_n1 = [slice(None)] * arr.ndim
-    slc_n2 = [slice(None)] * arr.ndim
-    slc_n1[axis] = -1
-    slc_n2[axis] = -2
-    dn = np.take(d, -1, axis=axis)
-    if dn.ndim < arr[tuple(slc_n1)].ndim:
-        dn = np.expand_dims(dn, axis=axis) if dn.ndim > 0 else dn
-    result[tuple(slc_n1)] = (arr[tuple(slc_n1)] - arr[tuple(slc_n2)]) / dn
-
-    return result
+    return np.concatenate((left, center, right), axis=axis)
 
 
 def _get_scale_factors(data):
@@ -3242,14 +3343,14 @@ def advection(scalar, *args, dx=None, dy=None, dz=None, x_dim=-1, y_dim=-2,
     return _wrap_result_like(scalar, result, out_unit)
 
 
-def frontogenesis(theta, u, v, dx=None, dy=None, x_dim=-1, y_dim=-2,
-                  parallel_scale=None, meridional_scale=None,
+def frontogenesis(potential_temperature, u, v, dx=None, dy=None, x_dim=-1, y_dim=-2,
+                  *, parallel_scale=None, meridional_scale=None,
                   latitude=None, longitude=None, crs=None):
     """2-D Petterssen frontogenesis function.
 
     Parameters
     ----------
-    theta : 2-D array Quantity (K)
+    potential_temperature : 2-D array Quantity (K)
     u, v : 2-D array Quantity (m/s)
     dx, dy : Quantity (m)
 
@@ -3257,6 +3358,7 @@ def frontogenesis(theta, u, v, dx=None, dy=None, x_dim=-1, y_dim=-2,
     -------
     2-D array Quantity (K/m/s)
     """
+    theta = potential_temperature
     dx, dy = _resolve_dx_dy(theta, dx=dx, dy=dy, latitude=latitude, longitude=longitude)
     if (dx is None or dy is None) and u is not None:
         dx, dy = _resolve_dx_dy(u, dx=dx, dy=dy, latitude=latitude, longitude=longitude)
@@ -3286,7 +3388,6 @@ def frontogenesis(theta, u, v, dx=None, dy=None, x_dim=-1, y_dim=-2,
     dy_m = np.asarray(dy.to("m").magnitude if hasattr(dy, "to") else dy, dtype=np.float64)
 
     if _is_variable_spacing(dx) or _is_variable_spacing(dy) or dx_m.ndim >= 2:
-        # Variable-spacing: compute frontogenesis with full 2D dx/dy
         dtdx = _first_derivative_variable(t_arr, dx_m, axis=-1)
         dtdy = _first_derivative_variable(t_arr, dy_m, axis=-2)
         dudx = _first_derivative_variable(u_arr, dx_m, axis=-1)
@@ -3294,10 +3395,18 @@ def frontogenesis(theta, u, v, dx=None, dy=None, x_dim=-1, y_dim=-2,
         dudy = _first_derivative_variable(u_arr, dy_m, axis=-2)
         dvdx = _first_derivative_variable(v_arr, dx_m, axis=-1)
         mag_t = np.sqrt(dtdx**2 + dtdy**2)
-        mag_t = np.where(mag_t < 1e-30, np.nan, mag_t)
-        result = -0.5 * mag_t * (
-            (dtdx**2 * dudx + dtdy**2 * dvdy + (dtdx * dtdy) * (dvdx + dudy)) / (mag_t**2)
+        shrd = dvdx + dudy
+        strd = dudx - dvdy
+        tdef = np.sqrt(strd**2 + shrd**2)
+        div = dudx + dvdy
+        psi = 0.5 * np.arctan2(shrd, strd)
+        sin_beta = np.divide(
+            dtdx * np.cos(psi) + dtdy * np.sin(psi),
+            mag_t,
+            out=np.zeros_like(mag_t),
+            where=mag_t != 0,
         )
+        result = 0.5 * mag_t * (tdef * (1.0 - 2.0 * sin_beta**2) - div)
         return _wrap_result_like(theta, result, "K/m/s")
 
     dx_val = float(dx_m.mean()) if dx_m.ndim > 0 else float(dx_m)
@@ -3771,7 +3880,9 @@ def shear_vorticity(u, v, dx, dy):
     return result * units("1/s")
 
 
-def shearing_deformation(u, v, dx, dy):
+def shearing_deformation(u, v, dx=None, dy=None, x_dim=-1, y_dim=-2,
+                         parallel_scale=None, meridional_scale=None,
+                         latitude=None, longitude=None, crs=None):
     """Shearing deformation on a 2-D grid.
 
     Parameters
@@ -3783,15 +3894,36 @@ def shearing_deformation(u, v, dx, dy):
     -------
     2-D array Quantity (1/s)
     """
-    u_2d = _as_2d(u, "m/s")
-    v_2d = _as_2d(v, "m/s")
+    dx, dy = _resolve_dx_dy(u, dx=dx, dy=dy, latitude=latitude, longitude=longitude)
+    if dx is None or dy is None:
+        raise TypeError("shearing_deformation requires dx/dy or inferable latitude/longitude coordinates")
+    u_arr = np.asarray(_strip(u, "m/s"), dtype=np.float64)
+    v_arr = np.asarray(_strip(v, "m/s"), dtype=np.float64)
+    if parallel_scale is None and meridional_scale is None:
+        ps, ms = _get_scale_factors(u)
+    else:
+        ps = np.asarray(parallel_scale, dtype=np.float64) if parallel_scale is not None else None
+        ms = np.asarray(meridional_scale, dtype=np.float64) if meridional_scale is not None else None
+
+    dx_m = np.asarray(dx.to("m").magnitude if hasattr(dx, "to") else dx, dtype=np.float64)
+    dy_m = np.asarray(dy.to("m").magnitude if hasattr(dy, "to") else dy, dtype=np.float64)
+
+    if ps is not None and ms is not None:
+        _, du_dy_corr, dv_dx_corr, _ = _vector_derivative_corrected(u_arr, v_arr, dx, dy, ps, ms)
+        return _wrap_result_like(u, dv_dx_corr + du_dy_corr, "1/s")
+    if _is_variable_spacing(dx) or _is_variable_spacing(dy) or dx_m.ndim >= 2:
+        result = _first_derivative_variable(v_arr, dx_m, axis=-1) + _first_derivative_variable(u_arr, dy_m, axis=-2)
+        return _wrap_result_like(u, result, "1/s")
+
     dx_val = _mean_spacing(dx, "m")
     dy_val = _mean_spacing(dy, "m")
-    result = np.asarray(_calc.shearing_deformation(u_2d, v_2d, dx_val, dy_val))
-    return result * units("1/s")
+    result = np.asarray(_calc.shearing_deformation(_as_2d(u, "m/s"), _as_2d(v, "m/s"), dx_val, dy_val))
+    return _wrap_result_like(u, result, "1/s")
 
 
-def stretching_deformation(u, v, dx, dy):
+def stretching_deformation(u, v, dx=None, dy=None, x_dim=-1, y_dim=-2,
+                           parallel_scale=None, meridional_scale=None,
+                           latitude=None, longitude=None, crs=None):
     """Stretching deformation on a 2-D grid.
 
     Parameters
@@ -3803,15 +3935,36 @@ def stretching_deformation(u, v, dx, dy):
     -------
     2-D array Quantity (1/s)
     """
-    u_2d = _as_2d(u, "m/s")
-    v_2d = _as_2d(v, "m/s")
+    dx, dy = _resolve_dx_dy(u, dx=dx, dy=dy, latitude=latitude, longitude=longitude)
+    if dx is None or dy is None:
+        raise TypeError("stretching_deformation requires dx/dy or inferable latitude/longitude coordinates")
+    u_arr = np.asarray(_strip(u, "m/s"), dtype=np.float64)
+    v_arr = np.asarray(_strip(v, "m/s"), dtype=np.float64)
+    if parallel_scale is None and meridional_scale is None:
+        ps, ms = _get_scale_factors(u)
+    else:
+        ps = np.asarray(parallel_scale, dtype=np.float64) if parallel_scale is not None else None
+        ms = np.asarray(meridional_scale, dtype=np.float64) if meridional_scale is not None else None
+
+    dx_m = np.asarray(dx.to("m").magnitude if hasattr(dx, "to") else dx, dtype=np.float64)
+    dy_m = np.asarray(dy.to("m").magnitude if hasattr(dy, "to") else dy, dtype=np.float64)
+
+    if ps is not None and ms is not None:
+        du_dx_corr, _, _, dv_dy_corr = _vector_derivative_corrected(u_arr, v_arr, dx, dy, ps, ms)
+        return _wrap_result_like(u, du_dx_corr - dv_dy_corr, "1/s")
+    if _is_variable_spacing(dx) or _is_variable_spacing(dy) or dx_m.ndim >= 2:
+        result = _first_derivative_variable(u_arr, dx_m, axis=-1) - _first_derivative_variable(v_arr, dy_m, axis=-2)
+        return _wrap_result_like(u, result, "1/s")
+
     dx_val = _mean_spacing(dx, "m")
     dy_val = _mean_spacing(dy, "m")
-    result = np.asarray(_calc.stretching_deformation(u_2d, v_2d, dx_val, dy_val))
-    return result * units("1/s")
+    result = np.asarray(_calc.stretching_deformation(_as_2d(u, "m/s"), _as_2d(v, "m/s"), dx_val, dy_val))
+    return _wrap_result_like(u, result, "1/s")
 
 
-def total_deformation(u, v, dx, dy):
+def total_deformation(u, v, dx=None, dy=None, x_dim=-1, y_dim=-2,
+                      parallel_scale=None, meridional_scale=None,
+                      latitude=None, longitude=None, crs=None):
     """Total deformation on a 2-D grid.
 
     Parameters
@@ -3823,12 +3976,39 @@ def total_deformation(u, v, dx, dy):
     -------
     2-D array Quantity (1/s)
     """
-    u_2d = _as_2d(u, "m/s")
-    v_2d = _as_2d(v, "m/s")
+    dx, dy = _resolve_dx_dy(u, dx=dx, dy=dy, latitude=latitude, longitude=longitude)
+    if dx is None or dy is None:
+        raise TypeError("total_deformation requires dx/dy or inferable latitude/longitude coordinates")
+    u_arr = np.asarray(_strip(u, "m/s"), dtype=np.float64)
+    v_arr = np.asarray(_strip(v, "m/s"), dtype=np.float64)
+    if parallel_scale is None and meridional_scale is None:
+        ps, ms = _get_scale_factors(u)
+    else:
+        ps = np.asarray(parallel_scale, dtype=np.float64) if parallel_scale is not None else None
+        ms = np.asarray(meridional_scale, dtype=np.float64) if meridional_scale is not None else None
+
+    dx_m = np.asarray(dx.to("m").magnitude if hasattr(dx, "to") else dx, dtype=np.float64)
+    dy_m = np.asarray(dy.to("m").magnitude if hasattr(dy, "to") else dy, dtype=np.float64)
+
+    if ps is not None and ms is not None:
+        du_dx_corr, du_dy_corr, dv_dx_corr, dv_dy_corr = _vector_derivative_corrected(
+            u_arr, v_arr, dx, dy, ps, ms)
+        strd = du_dx_corr - dv_dy_corr
+        shrd = dv_dx_corr + du_dy_corr
+        return _wrap_result_like(u, np.sqrt(strd**2 + shrd**2), "1/s")
+    if _is_variable_spacing(dx) or _is_variable_spacing(dy) or dx_m.ndim >= 2:
+        dudx = _first_derivative_variable(u_arr, dx_m, axis=-1)
+        dvdy = _first_derivative_variable(v_arr, dy_m, axis=-2)
+        dudy = _first_derivative_variable(u_arr, dy_m, axis=-2)
+        dvdx = _first_derivative_variable(v_arr, dx_m, axis=-1)
+        strd = dudx - dvdy
+        shrd = dvdx + dudy
+        return _wrap_result_like(u, np.sqrt(strd**2 + shrd**2), "1/s")
+
     dx_val = _mean_spacing(dx, "m")
     dy_val = _mean_spacing(dy, "m")
-    result = np.asarray(_calc.total_deformation(u_2d, v_2d, dx_val, dy_val))
-    return result * units("1/s")
+    result = np.asarray(_calc.total_deformation(_as_2d(u, "m/s"), _as_2d(v, "m/s"), dx_val, dy_val))
+    return _wrap_result_like(u, result, "1/s")
 
 
 def geospatial_gradient(data, lats, lons):
@@ -4085,7 +4265,7 @@ def fosberg_fire_weather_index(temperature, relative_humidity, wind_speed_val):
     Quantity (dimensionless)
     """
     t = _as_float(_strip(temperature, "degF"))
-    rh = _as_float(_strip(relative_humidity, "percent")) if hasattr(relative_humidity, "magnitude") else float(relative_humidity)
+    rh = _as_float(_rh_to_percent(relative_humidity))
     ws = _as_float(_strip(wind_speed_val, "mph"))
     return _calc.fosberg_fire_weather_index(t, rh, ws) * units.dimensionless
 
@@ -4145,7 +4325,7 @@ def hot_dry_windy(temperature, relative_humidity, wind_speed_val, vpd=0.0):
     Quantity (dimensionless)
     """
     t = _as_float(_strip(temperature, "degC"))
-    rh = _as_float(_strip(relative_humidity, "percent")) if hasattr(relative_humidity, "magnitude") else float(relative_humidity)
+    rh = _as_float(_rh_to_percent(relative_humidity))
     ws = _as_float(_strip(wind_speed_val, "m/s"))
     return _calc.hot_dry_windy(t, rh, ws, float(vpd)) * units.dimensionless
 
@@ -4309,7 +4489,7 @@ def heat_index(temperature, relative_humidity):
     -------
     Quantity (degC)
     """
-    result = _vec_call(_calc.heat_index, _strip(temperature, "degC"), _strip(relative_humidity, "percent") if hasattr(relative_humidity, "magnitude") else relative_humidity)
+    result = _vec_call(_calc.heat_index, _strip(temperature, "degC"), _rh_to_percent(relative_humidity))
     return result * units.degC
 
 
@@ -4342,7 +4522,12 @@ def apparent_temperature(temperature, relative_humidity, wind_speed_val):
     -------
     Quantity (degC)
     """
-    result = _vec_call(_calc.apparent_temperature, _strip(temperature, "degC"), _strip(relative_humidity, "percent") if hasattr(relative_humidity, "magnitude") else relative_humidity, _strip(wind_speed_val, "m/s"))
+    result = _vec_call(
+        _calc.apparent_temperature,
+        _strip(temperature, "degC"),
+        _rh_to_percent(relative_humidity),
+        _strip(wind_speed_val, "m/s"),
+    )
     return result * units.degC
 
 
@@ -4595,11 +4780,24 @@ def first_derivative(data, axis_spacing=None, axis=0, x=None, delta=None):
     if delta is not None:
         axis_spacing = delta
     elif x is not None and axis_spacing is None:
-        axis_spacing = x
+        x_arr = x.to("m").magnitude if hasattr(x, "to") else x
+        x_arr = np.asarray(x_arr, dtype=np.float64)
+        ax = axis % d_arr.ndim
+        if x_arr.ndim > 0 and x_arr.shape[ax if x_arr.ndim > ax else 0] == d_arr.shape[ax]:
+            axis_spacing = np.diff(x_arr, axis=ax if x_arr.ndim > ax else 0)
+        else:
+            axis_spacing = x
     if axis_spacing is None:
         raise TypeError("first_derivative requires axis spacing via axis_spacing, x, or delta")
-    ds = _mean_spacing(axis_spacing, "m")
-    result = np.asarray(_calc.first_derivative(d_arr, ds, int(axis)))
+    spacing_arr = np.asarray(
+        axis_spacing.to("m").magnitude if hasattr(axis_spacing, "to") else axis_spacing,
+        dtype=np.float64,
+    )
+    if spacing_arr.size > 1:
+        result = _first_derivative_variable(d_arr, spacing_arr, int(axis))
+    else:
+        ds = float(spacing_arr.ravel()[0])
+        result = np.asarray(_calc.first_derivative(d_arr, ds, int(axis)))
     if has_units:
         return result * (data.units / units.m)
     if hasattr(axis_spacing, "magnitude"):

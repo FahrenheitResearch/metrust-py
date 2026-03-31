@@ -4,8 +4,8 @@ build-backend = "maturin"
 
 [project]
 name = "metrust"
-version = "0.4.0"
-description = "Rust-powered drop-in replacement for MetPy -- 150/150 calc functions plus 36 extras, 10-93000x faster"
+version = "0.4.1"
+description = "Rust-powered MetPy-compatible calculation layer with optional GPU acceleration"
 requires-python = ">=3.9"
 license = {text = "MIT"}
 authors = [{name = "Fahrenheit Research"}]

@@ -2,8 +2,8 @@
 
 ## Meteorological Computation at the Speed of Rust
 
-**metrust** is a Rust-powered, drop-in replacement for [MetPy](https://unidata.github.io/MetPy/)'s calculation layer.
-Change one import line. Keep your existing code. Get 10--90x faster results.
+**metrust** is a Rust-powered, MetPy-compatible calculation layer for [MetPy](https://unidata.github.io/MetPy/)'s calculation workflows.
+For many `metpy.calc` workflows, changing one import line is enough. Many thermo and grid workloads run substantially faster.
 
 ---
 

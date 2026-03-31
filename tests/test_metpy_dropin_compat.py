@@ -259,3 +259,166 @@ def test_advection_handles_compound_scalar_units():
 
     assert adv.shape == (3, 4)
     assert adv.units == 1 / (mp_units.s ** 2)
+
+
+def test_common_keyword_forms_match_metpy():
+    u = np.array([1.0, 0.0]) * mp_units("m/s")
+    v = np.array([0.0, -10.0]) * mp_units("m/s")
+
+    mr_wdir = mcalc.wind_direction(u, v, convention="to")
+    mp_wdir = mpcalc.wind_direction(u, v, convention="to")
+    np.testing.assert_allclose(mr_wdir.to("degree").m, mp_wdir.to("degree").m, atol=1e-12)
+
+    pressure = np.array([1000.0, 950.0, 900.0, 850.0, 800.0]) * mp_units.hPa
+    dewpoint = np.array([20.0, 16.0, 12.0, 7.0, 2.0]) * mp_units.degC
+    mr_pw = mcalc.precipitable_water(
+        pressure,
+        dewpoint,
+        bottom=950 * mp_units.hPa,
+        top=800 * mp_units.hPa,
+    )
+    mp_pw = mpcalc.precipitable_water(
+        pressure,
+        dewpoint,
+        bottom=950 * mp_units.hPa,
+        top=800 * mp_units.hPa,
+    )
+    np.testing.assert_allclose(mr_pw.to("mm").m, mp_pw.to("mm").m, atol=1e-3)
+
+    theta = np.array(
+        [
+            [300.0, 301.0, 302.0],
+            [300.5, 301.5, 302.5],
+            [301.0, 302.0, 303.0],
+        ]
+    ) * mp_units.K
+    u_grid = np.array(
+        [
+            [0.0, 1.0, 2.0],
+            [0.0, 1.0, 2.0],
+            [0.0, 1.0, 2.0],
+        ]
+    ) * mp_units("m/s")
+    v_grid = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [-0.5, -0.5, -0.5],
+            [-1.0, -1.0, -1.0],
+        ]
+    ) * mp_units("m/s")
+    mr_fg = mcalc.frontogenesis(
+        potential_temperature=theta,
+        u=u_grid,
+        v=v_grid,
+        dx=1000 * mp_units.m,
+        dy=1000 * mp_units.m,
+    )
+    mp_fg = mpcalc.frontogenesis(
+        theta,
+        u_grid,
+        v_grid,
+        dx=1000 * mp_units.m,
+        dy=1000 * mp_units.m,
+    )
+    np.testing.assert_allclose(mr_fg.to("K/m/s").m, mp_fg.to("K/m/s").m, atol=1e-12)
+
+
+def test_plain_relative_humidity_arrays_match_metpy():
+    temperature = np.array([20.0, 20.0]) * mp_units.degC
+    pressure = np.array([1000.0, 1000.0]) * mp_units.hPa
+    rh_plain = np.array([0.75, 0.80])
+
+    mr_td = mcalc.dewpoint_from_relative_humidity(temperature, rh_plain)
+    mp_td = mpcalc.dewpoint_from_relative_humidity(temperature, rh_plain)
+    np.testing.assert_allclose(mr_td.to("degC").m, mp_td.to("degC").m, atol=1e-10)
+
+    mr_w = mcalc.mixing_ratio_from_relative_humidity(
+        pressure,
+        temperature,
+        rh_plain,
+        phase="liquid",
+    )
+    mp_w = mpcalc.mixing_ratio_from_relative_humidity(
+        pressure,
+        temperature,
+        rh_plain,
+        phase="liquid",
+    )
+    np.testing.assert_allclose(mr_w.to("kg/kg").m, mp_w.to("kg/kg").m, rtol=1e-2)
+
+    cold_pressure = np.array([800.0, 700.0]) * mp_units.hPa
+    cold_temperature = np.array([-10.0, -20.0]) * mp_units.degC
+    cold_rh = np.array([0.75, 0.80])
+    mr_w_solid = mcalc.mixing_ratio_from_relative_humidity(
+        cold_pressure,
+        cold_temperature,
+        cold_rh,
+        phase="solid",
+    )
+    mp_w_solid = mpcalc.mixing_ratio_from_relative_humidity(
+        cold_pressure,
+        cold_temperature,
+        cold_rh,
+        phase="solid",
+    )
+    np.testing.assert_allclose(mr_w_solid.to("kg/kg").m, mp_w_solid.to("kg/kg").m, rtol=1e-2)
+
+    rh_roundtrip = mcalc.relative_humidity_from_mixing_ratio(
+        cold_pressure,
+        cold_temperature,
+        mr_w_solid,
+        phase="solid",
+    )
+    np.testing.assert_allclose(rh_roundtrip.m, cold_rh, atol=1e-10)
+
+
+def test_moist_lapse_internal_reference_pressure_matches_metpy():
+    pressure = np.array([1000.0, 925.0, 850.0, 700.0, 500.0]) * mp_units.hPa
+    reference_pressure = 875 * mp_units.hPa
+
+    mr_trace = mcalc.moist_lapse(
+        pressure,
+        10 * mp_units.degC,
+        reference_pressure=reference_pressure,
+    )
+    mp_trace = mpcalc.moist_lapse(
+        pressure,
+        10 * mp_units.degC,
+        reference_pressure=reference_pressure,
+    )
+
+    np.testing.assert_allclose(mr_trace.to("degC").m, mp_trace.to("degC").m, atol=2e-5)
+
+
+def test_variable_spacing_derivatives_match_metpy():
+    x = np.array([0.0, 1000.0, 3000.0, 6000.0])
+    y = np.array([0.0, 500.0, 2000.0])
+    xx, yy = np.meshgrid(x, y)
+    dx = np.tile(np.diff(x), (len(y), 1)) * mp_units.m
+    dy = np.tile(np.diff(y)[:, None], (1, len(x))) * mp_units.m
+
+    field = ((xx / 1000.0) ** 2) * mp_units.K
+    mr_fd = mcalc.first_derivative(field, axis=1, delta=dx)
+    mp_fd = mpcalc.first_derivative(field, axis=1, delta=dx)
+    np.testing.assert_allclose(mr_fd.to("K/m").m, mp_fd.to("K/m").m, atol=1e-12)
+
+    u = ((yy / 1000.0) ** 2) * mp_units("m/s")
+    v = ((xx / 1000.0) ** 2) * mp_units("m/s")
+    mr_div = mcalc.divergence(u, v, dx=dx, dy=dy)
+    mp_div = mpcalc.divergence(u, v, dx=dx, dy=dy)
+    np.testing.assert_allclose(mr_div.to("1/s").m, mp_div.to("1/s").m, atol=1e-12)
+
+    mr_vort = mcalc.vorticity(u, v, dx=dx, dy=dy)
+    mp_vort = mpcalc.vorticity(u, v, dx=dx, dy=dy)
+    np.testing.assert_allclose(mr_vort.to("1/s").m, mp_vort.to("1/s").m, atol=1e-12)
+
+    theta = (300.0 + xx / 1000.0) * mp_units.K
+    u_front = (xx / 1000.0) * mp_units("m/s")
+    v_front = (-yy / 1000.0) * mp_units("m/s")
+    mr_fg = mcalc.frontogenesis(theta, u_front, v_front, dx=dx, dy=dy)
+    mp_fg = mpcalc.frontogenesis(theta, u_front, v_front, dx=dx, dy=dy)
+    np.testing.assert_allclose(mr_fg.to("K/m/s").m, mp_fg.to("K/m/s").m, atol=1e-12)
+
+    mr_tdef = mcalc.total_deformation(u_front, v_front, dx=dx, dy=dy)
+    mp_tdef = mpcalc.total_deformation(u_front, v_front, dx=dx, dy=dy)
+    np.testing.assert_allclose(mr_tdef.to("1/s").m, mp_tdef.to("1/s").m, atol=1e-12)

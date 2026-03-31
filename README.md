@@ -1,8 +1,8 @@
 # metrust
 
-**Drop-in replacement for MetPy's calculation layer, powered by Rust.**
+**MetPy-compatible calculation layer, powered by Rust.**
 
-150/150 `metpy.calc` functions implemented natively, plus 36 extras. 6-30x faster on real-world workflows. Verified against MetPy on SounderPy, MetPy Cookbook examples, and synthetic global grids.
+150/150 `metpy.calc` functions implemented natively, plus 36 extras. Often faster on real-world workflows. Verified against MetPy on SounderPy, MetPy Cookbook examples, and synthetic global grids.
 
 ```python
 # The only change: swap the import
@@ -30,7 +30,7 @@ pip install metrust metpy
 
 ## What It Does
 
-metrust implements every function in `metpy.calc` with a Rust backend compiled via PyO3. The Python API matches MetPy's signatures, units, and return types:
+metrust implements every function in `metpy.calc` with a Rust backend compiled via PyO3. The Python API is designed for MetPy-compatible units, return types, and common calling conventions, without claiming byte-for-byte parity with every historical MetPy wrapper signature:
 
 ```python
 import numpy as np
@@ -83,6 +83,8 @@ The GPU backend currently targets the overlap where `met-cu` is already strong a
 - `compute_shear`
 - `compute_pw`
 - `composite_reflectivity_from_hydrometeors`
+
+Eligible dispatch currently focuses on scalar thermo plus uniform 2-D Cartesian grid workloads. Latitude/longitude-derived spacing, map-scale corrections, and other projection-aware cases fall back to the Rust CPU backend.
 
 `metrust` still returns the same Pint/NumPy-facing API surface. Unsupported cases automatically stay on the Rust CPU path.
 
@@ -219,7 +221,7 @@ See `examples/` for complete drop-in demos:
 
 ```bash
 cargo test --workspace          # 1,186 Rust tests
-python -m pytest tests/ -q      # 20 Python tests (including MetPy drop-in regression)
+python -m pytest tests/ -q      # 30 Python tests (including MetPy compatibility regression)
 ```
 
 ## Documentation

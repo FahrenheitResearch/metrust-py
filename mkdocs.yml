@@ -1,5 +1,5 @@
 site_name: metrust
-site_description: Rust-powered meteorology toolkit — drop-in replacement for MetPy
+site_description: Rust-powered meteorology toolkit with a MetPy-compatible calculation layer
 site_url: https://fahrenheitresearch.github.io/metrust-py/
 repo_url: https://github.com/FahrenheitResearch/metrust-py
 repo_name: FahrenheitResearch/metrust-py
