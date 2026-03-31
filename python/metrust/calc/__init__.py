@@ -1,7 +1,7 @@
-"""metrust.calc -- Drop-in replacement for metpy.calc
+"""metrust.calc -- MetPy-compatible calculation layer
 
-Every public function accepts and returns Pint Quantity objects, matching
-the MetPy API exactly.  Internally, units are stripped to the convention
+Every public function accepts and returns Pint Quantity objects with a
+MetPy-compatible API surface. Internally, units are stripped to the convention
 expected by the Rust engine (hPa for pressure, Celsius for temperature,
 m/s for wind, m for height, etc.), the Rust function is called, and
 appropriate units are attached to the result.
@@ -23,6 +23,8 @@ Rust-native conventions
 """
 
 import importlib
+import inspect
+import sys
 from contextlib import contextmanager
 import numpy as np
 try:
@@ -6261,3 +6263,89 @@ def __getattr__(name):
 
 def __dir__():
     return sorted(set(globals()).union(__all__))
+
+
+_METPY_SIGNATURE_HOOK = None
+
+
+def _apply_metpy_signatures():
+    """Mirror MetPy signatures for shared public wrappers when MetPy is available."""
+    _metpy_calc = sys.modules.get("metpy.calc")
+    if _metpy_calc is None:
+        return
+
+    for name in __all__:
+        metpy_obj = getattr(_metpy_calc, name, None)
+        if metpy_obj is None or not callable(metpy_obj):
+            continue
+
+        target_name = _COMPAT_ALIASES.get(name, name)
+        wrapper = globals().get(target_name)
+        if wrapper is None or not callable(wrapper):
+            continue
+
+        try:
+            wrapper.__signature__ = inspect.signature(metpy_obj)
+        except (TypeError, ValueError):
+            continue
+
+
+class _MetPyCalcSignatureHook(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+    """Apply MetPy signature mirroring when metpy.calc imports after metrust.calc."""
+
+    def __init__(self):
+        self._wrapped_loader = None
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname != "metpy.calc":
+            return None
+
+        for finder in sys.meta_path:
+            if finder is self:
+                continue
+            find_spec = getattr(finder, "find_spec", None)
+            if find_spec is None:
+                continue
+            spec = find_spec(fullname, path, target)
+            if spec is None:
+                continue
+            self._wrapped_loader = spec.loader
+            spec.loader = self
+            return spec
+        return None
+
+    def create_module(self, spec):
+        if self._wrapped_loader is not None and hasattr(self._wrapped_loader, "create_module"):
+            return self._wrapped_loader.create_module(spec)
+        return None
+
+    def exec_module(self, module):
+        if self._wrapped_loader is None:
+            raise ImportError("metpy.calc signature hook missing wrapped loader")
+        self._wrapped_loader.exec_module(module)
+        _apply_metpy_signatures()
+        _remove_metpy_signature_hook()
+
+
+def _install_metpy_signature_hook():
+    global _METPY_SIGNATURE_HOOK
+    if _METPY_SIGNATURE_HOOK is not None or "metpy.calc" in sys.modules:
+        return
+    _METPY_SIGNATURE_HOOK = _MetPyCalcSignatureHook()
+    sys.meta_path.insert(0, _METPY_SIGNATURE_HOOK)
+
+
+def _remove_metpy_signature_hook():
+    global _METPY_SIGNATURE_HOOK
+    hook = _METPY_SIGNATURE_HOOK
+    if hook is None:
+        return
+    try:
+        sys.meta_path.remove(hook)
+    except ValueError:
+        pass
+    _METPY_SIGNATURE_HOOK = None
+
+
+_apply_metpy_signatures()
+_install_metpy_signature_hook()
