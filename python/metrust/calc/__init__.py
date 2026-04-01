@@ -43,6 +43,49 @@ class InvalidSoundingError(Exception):
 _BACKEND = "cpu"
 _GPU_CALC = None
 
+METPY_COMPATIBILITY_TARGET = {
+    "metpy": "1.7.1",
+    "python": ("3.10", "3.11", "3.12", "3.13"),
+}
+
+METPY_OPTIONAL_CALC_DELEGATIONS = (
+    {
+        "function": "lfc",
+        "trigger": "Quantity profile inputs, with MetPy-preferred handling for complex which selections.",
+        "fallback": "Native profile intersection solver in metrust.",
+    },
+    {
+        "function": "el",
+        "trigger": "Quantity profile inputs, with MetPy-preferred handling for complex which selections.",
+        "fallback": "Native profile intersection solver in metrust.",
+    },
+    {
+        "function": "cape_cin",
+        "trigger": "MetPy parcel-profile form where the 4th positional argument is temperature-like.",
+        "fallback": "Native CAPE/CIN integration path in metrust.",
+    },
+    {
+        "function": "downdraft_cape",
+        "trigger": "Quantity profile inputs when MetPy is available.",
+        "fallback": "Native metrust DCAPE layer-selection and integration path.",
+    },
+    {
+        "function": "parcel_profile_with_lcl",
+        "trigger": "Quantity profile inputs in the profile-returning MetPy form.",
+        "fallback": "Native metrust profile interpolation and parcel trace path.",
+    },
+    {
+        "function": "potential_vorticity_baroclinic",
+        "trigger": "Quantity/DataArray inputs in the MetPy-style baroclinic PV calling form.",
+        "fallback": "Native metrust PV computation with local dx/dy and latitude handling.",
+    },
+    {
+        "function": "geospatial_laplacian",
+        "trigger": "Quantity/DataArray geospatial laplacian inputs when MetPy is available.",
+        "fallback": "Native metrust geospatial gradient and derivative path.",
+    },
+)
+
 
 def _normalize_backend_name(backend):
     name = str(backend).strip().lower()
@@ -5386,6 +5429,12 @@ def geospatial_laplacian(f, *args, dx=None, dy=None, x_dim=-1, y_dim=-2,
         dx, dy = _resolve_dx_dy(f, dx=dx, dy=dy, latitude=latitude, longitude=longitude)
     if dx is None or dy is None:
         raise TypeError("geospatial_laplacian requires dx/dy or inferable latitude/longitude coordinates")
+    if hasattr(f, "magnitude"):
+        f_arr = np.asarray(f.magnitude, dtype=np.float64)
+    elif _is_dataarray_like(f):
+        f_arr = np.asarray(f.values, dtype=np.float64)
+    else:
+        f_arr = np.asarray(f, dtype=np.float64)
     if parallel_scale is None and meridional_scale is None:
         ps, ms = _get_scale_factors(f)
         parallel_scale = ps if ps is not None else parallel_scale
@@ -5403,13 +5452,13 @@ def geospatial_laplacian(f, *args, dx=None, dy=None, x_dim=-1, y_dim=-2,
             longitude=longitude,
             crs=crs,
         )
-        x_axis = x_dim % np.ndim(np.asarray(_strip(f) if hasattr(f, "to") else f))
-        y_axis = y_dim % np.ndim(np.asarray(_strip(f) if hasattr(f, "to") else f))
+        x_axis = x_dim % f_arr.ndim
+        y_axis = y_dim % f_arr.ndim
         term_x = first_derivative(grad_u, delta=dx, axis=x_axis)
         term_y = first_derivative(grad_v, delta=dy, axis=y_axis)
         return term_x + term_y
-    x_axis = x_dim % np.ndim(np.asarray(_strip(f) if hasattr(f, "to") else f))
-    y_axis = y_dim % np.ndim(np.asarray(_strip(f) if hasattr(f, "to") else f))
+    x_axis = x_dim % f_arr.ndim
+    y_axis = y_dim % f_arr.ndim
     return second_derivative(f, delta=dx, axis=x_axis) + second_derivative(f, delta=dy, axis=y_axis)
 
 
@@ -6164,12 +6213,15 @@ def smooth_window(scalar_grid, window, passes=1, normalize_weights=True):
         )
 
     data_units = getattr(scalar_grid, "units", None)
+    unit_str = str(data_units) if data_units is not None else None
+    if unit_str is None:
+        unit_str = getattr(getattr(scalar_grid, "attrs", None), "get", lambda *_: None)("units")
     data = np.array(getattr(scalar_grid, "magnitude", scalar_grid))
     for _ in range(int(passes)):
         data[inner_full_index] = sum(
             weights[index] * data[offset_full_index(index)] for index in weight_indexes
         )
-    return data * data_units if data_units is not None else data
+    return _wrap_result_like(scalar_grid, data, unit_str=unit_str)
 
 
 def _gradient_axes_and_positions(f, axes, coordinates, deltas):
@@ -8222,19 +8274,12 @@ class _MetPyCalcSignatureHook(importlib.abc.MetaPathFinder, importlib.abc.Loader
         if fullname != "metpy.calc":
             return None
 
-        for finder in sys.meta_path:
-            if finder is self:
-                continue
-            find_spec = getattr(finder, "find_spec", None)
-            if find_spec is None:
-                continue
-            spec = find_spec(fullname, path, target)
-            if spec is None:
-                continue
-            self._wrapped_loader = spec.loader
-            spec.loader = self
-            return spec
-        return None
+        spec = importlib.machinery.PathFinder.find_spec(fullname, path)
+        if spec is None:
+            return None
+        self._wrapped_loader = spec.loader
+        spec.loader = self
+        return spec
 
     def create_module(self, spec):
         if self._wrapped_loader is not None and hasattr(self._wrapped_loader, "create_module"):

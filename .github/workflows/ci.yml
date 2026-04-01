@@ -5,22 +5,30 @@ on:
     branches: [master, main]
   pull_request:
 
+env:
+  METPY_VERSION: "1.7.1"
+
 jobs:
-  test:
+  smoke:
+    name: Smoke (${{ matrix.os }}, py${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        python-version: ["3.10", "3.12"]
+        os: [ubuntu-latest, windows-latest, macos-14]
+        python-version: ["3.12"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
 
       - name: Install package and test deps
         run: |
@@ -33,11 +41,47 @@ jobs:
       - name: Run Python compatibility tests
         run: python -m pytest tests/test_python_compat.py -q
 
+  differential:
+    name: Differential (${{ matrix.mode }}, py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        mode: ["metrust-only", "metpy", "metpy-xarray"]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install test dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e "." pytest numpy pint pandas
+          if [[ "${{ matrix.mode }}" != "metrust-only" ]]; then
+            python -m pip install "MetPy==${METPY_VERSION}"
+          fi
+          if [[ "${{ matrix.mode }}" == "metpy-xarray" ]]; then
+            python -m pip install xarray
+          fi
+
+      - name: Run differential test mode
+        run: python tests/run_ci_mode.py ${{ matrix.mode }}
+
   bench-rust:
     name: Rust Benchmarks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -49,7 +93,7 @@ jobs:
         run: cargo bench --package metrust --bench calc_bench
 
       - name: Upload criterion artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: always()
         with:
           name: criterion-report
@@ -60,9 +104,9 @@ jobs:
     name: Python Benchmarks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -75,13 +119,13 @@ jobs:
       - name: Install metrust and MetPy
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e "." numpy pint metpy
+          python -m pip install -e "." numpy pint "MetPy==${METPY_VERSION}"
 
       - name: Run three-tier benchmark
         run: python benches/bench_python.py --json
 
       - name: Upload benchmark results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: always()
         with:
           name: python-bench-results
