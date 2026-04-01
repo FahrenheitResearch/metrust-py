@@ -286,7 +286,9 @@ def _resolve_dx_dy(data, dx=None, dy=None, latitude=None, longitude=None):
 
 def _wrap_result_like(template, values, unit_str=None):
     arr = np.asarray(values, dtype=np.float64)
-    template_shape = np.asarray(template).shape
+    template_shape = getattr(template, "shape", None)
+    if template_shape is None:
+        template_shape = np.asarray(template).shape
     if arr.shape != template_shape:
         arr = arr.reshape(template_shape)
     if hasattr(template, "coords") and hasattr(template, "dims"):
@@ -298,6 +300,8 @@ def _wrap_result_like(template, values, unit_str=None):
 
 
 def _raw_array_ndim(data):
+    if hasattr(data, "ndim"):
+        return data.ndim
     if hasattr(data, "values"):
         data = data.values
     elif hasattr(data, "magnitude"):
