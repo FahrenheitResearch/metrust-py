@@ -53,7 +53,7 @@ The surface is identical. Under the hood, every calculation runs through compile
 
 ### 150/150 MetPy Calc Functions (Plus 36 Extras)
 
-Every function in `metpy.calc` has a metrust equivalent -- 100% API coverage. Plus 36 additional functions MetPy doesn't have (grid composites, fire weather indices, and more). The entire `metrust.calc` module is backed by Rust -- no MetPy dependency, no Python fallback.
+Every function in `metpy.calc` has a metrust equivalent -- 100% API coverage. Plus 36 additional functions MetPy doesn't have (grid composites, fire weather indices, and more). The calculation layer is Rust-backed by default, with a small parity-sensitive subset optionally delegating to MetPy when it is installed.
 Coverage spans the core of operational meteorology:
 
 - **Thermodynamics** -- potential temperature, equivalent potential temperature, virtual temperature, wet-bulb temperature, LCL, LFC, EL, CAPE/CIN, parcel profiles, precipitable water, thickness hydrostatic, stability indices
@@ -149,8 +149,8 @@ All `metrust.calc` functions compile to native machine code through the Rust too
 
 ### No MetPy Dependency for Calculations
 
-`pip install metrust` pulls in **only** NumPy and Pint. The entire calculation layer is self-contained.
-MetPy is never imported, loaded, or called for any `metrust.calc` function.
+`pip install metrust` pulls in **only** NumPy and Pint. The calculation layer stays self-contained by default.
+A small parity-sensitive subset of `metrust.calc` can delegate to MetPy when MetPy is installed, but the default path remains the Rust backend.
 
 ### Optional MetPy for Plots, xarray, and Level 2
 
@@ -158,7 +158,7 @@ A handful of surfaces intentionally delegate to MetPy when it is installed:
 
 | Surface | Behavior |
 |---|---|
-| `metrust.calc` | 100% native Rust. No MetPy fallback. |
+| `metrust.calc` | Native Rust by default, with limited optional MetPy delegation on a few parity-sensitive paths. |
 | `metrust.io.Level2File` | Forwards to MetPy's Level 2 reader when available. |
 | `metrust.plots` | Forwards to `metpy.plots`. |
 | `metrust.xarray` | Forwards to `metpy.xarray`. |

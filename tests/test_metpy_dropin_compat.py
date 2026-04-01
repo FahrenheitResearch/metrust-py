@@ -60,9 +60,9 @@ def test_sounding_index_forms(sounding_profile):
     assert cape.units == mp_units("J/kg")
     assert cin.units == mp_units("J/kg")
     assert lfc_p.units == mp_units.hPa
-    assert lfc_t.units == mp_units.degC
+    assert lfc_t.units == mp_units.kelvin
     assert el_p.units == mp_units.hPa
-    assert el_t.units == mp_units.degC
+    assert el_t.units == mp_units.kelvin
 
     assert mcalc.cross_totals(pres, temp, dewpoint).units == mp_units.delta_degC
     assert mcalc.vertical_totals(pres, temp).units == mp_units.delta_degC

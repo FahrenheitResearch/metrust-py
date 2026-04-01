@@ -30,7 +30,7 @@ pip install metrust metpy
 
 ## What It Does
 
-metrust implements every function in `metpy.calc` with a Rust backend compiled via PyO3. The Python API is designed for MetPy-compatible units, return types, and common calling conventions, without claiming byte-for-byte parity with every historical MetPy wrapper signature:
+metrust implements every function in `metpy.calc` with a Rust backend compiled via PyO3. The Python API now matches MetPy's public `metpy.calc` signatures and is designed for MetPy-compatible units, return types, and runtime behavior on the shared calculation surface:
 
 ```python
 import numpy as np
@@ -207,7 +207,7 @@ These forward to MetPy when installed:
 - `metrust.xarray` (xarray accessor)
 - `metrust.io.Level2File` (NEXRAD Level II)
 
-Core `metrust.calc` is native Rust by default with no MetPy dependency. The optional `met-cu` backend is an explicit accelerator, not a requirement.
+Core `metrust.calc` stays native Rust by default with no required MetPy dependency. A small parity-sensitive subset may delegate to MetPy when it is installed; otherwise those paths still fall back to local metrust implementations. The optional `met-cu` backend is an explicit accelerator, not a requirement.
 
 ## Examples
 

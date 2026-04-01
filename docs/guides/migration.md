@@ -19,7 +19,7 @@ from metrust.units import units
 
 That is the entire change for most code. Every function in `metrust.calc`
 accepts the same Pint Quantity inputs and returns Pint Quantity outputs, using
-the same function names and the same positional/keyword signatures as MetPy.
+the same function names and the same public positional/keyword signatures as MetPy.
 
 A project-wide find-and-replace from `metpy.` to `metrust.` is usually
 sufficient. The table below shows the namespace mapping:

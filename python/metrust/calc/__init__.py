@@ -199,6 +199,32 @@ def _coord_values(coord):
     return np.asarray(coord, dtype=np.float64)
 
 
+def _as_array_with_unit(value, unit=None):
+    """Return float64 magnitudes plus the associated Pint unit when available."""
+    if hasattr(value, "metpy"):
+        try:
+            value = value.metpy.unit_array
+        except Exception:
+            pass
+
+    if hasattr(value, "to"):
+        quantity = value.to(unit) if unit is not None else value
+        return np.asarray(quantity.magnitude, dtype=np.float64), quantity.units
+
+    if hasattr(value, "values"):
+        raw = np.asarray(value.values, dtype=np.float64)
+    else:
+        raw = np.asarray(value, dtype=np.float64)
+
+    unit_attr = getattr(getattr(value, "attrs", None), "get", lambda *_: None)("units")
+    if unit_attr:
+        quantity = raw * units(unit_attr)
+        quantity = quantity.to(unit) if unit is not None else quantity
+        return np.asarray(quantity.magnitude, dtype=np.float64), quantity.units
+
+    return raw, units(unit) if unit is not None else None
+
+
 def _infer_lat_lon(data, latitude=None, longitude=None):
     """Infer latitude/longitude grids from a field for MetPy-style grid calls."""
     lat = latitude
@@ -243,7 +269,7 @@ def _resolve_dx_dy(data, dx=None, dy=None, latitude=None, longitude=None):
     if lat_arr is None or lon_arr is None:
         return dx, dy
 
-    return lat_lon_grid_deltas(lat_arr, lon_arr)
+    return lat_lon_grid_deltas(lon_arr, lat_arr)
 
 
 def _wrap_result_like(template, values, unit_str=None):
@@ -511,6 +537,95 @@ def wet_bulb_temperature(pressure, temperature, dewpoint):
     return result * units.degC
 
 
+def _drop_nan_profiles(*arrays):
+    mask = np.ones(len(np.asarray(arrays[0], dtype=np.float64)), dtype=bool)
+    cleaned = []
+    for arr in arrays:
+        arr_np = np.asarray(arr, dtype=np.float64).ravel()
+        mask &= np.isfinite(arr_np)
+        cleaned.append(arr_np)
+    return tuple(arr[mask] for arr in cleaned)
+
+
+def _interp_profile_pressure(pressure_hpa, values, target_pressure_hpa):
+    p_arr = np.asarray(pressure_hpa, dtype=np.float64).ravel()
+    v_arr = np.asarray(values, dtype=np.float64).ravel()
+    if p_arr.size != v_arr.size:
+        raise ValueError("pressure and values must have matching sizes")
+    if p_arr[0] > p_arr[-1]:
+        p_arr = p_arr[::-1]
+        v_arr = v_arr[::-1]
+    return float(np.interp(float(target_pressure_hpa), p_arr, v_arr))
+
+
+def _log_pressure_intersections(pressure_hpa, y1, y2, *, direction):
+    p_arr = np.asarray(pressure_hpa, dtype=np.float64).ravel()
+    y1_arr = np.asarray(y1, dtype=np.float64).ravel()
+    y2_arr = np.asarray(y2, dtype=np.float64).ravel()
+    diff = y1_arr - y2_arr
+    tol = 1e-9
+    x_out = []
+    y_out = []
+
+    for i in range(len(p_arr) - 1):
+        d0 = diff[i]
+        d1 = diff[i + 1]
+        if not np.isfinite(d0) or not np.isfinite(d1):
+            continue
+
+        if direction == "increasing":
+            crossing = (d0 <= 0 and d1 > 0) or (d0 < 0 and d1 >= 0)
+        elif direction == "decreasing":
+            crossing = (d0 >= 0 and d1 < 0) or (d0 > 0 and d1 <= 0)
+        else:
+            raise ValueError("direction must be 'increasing' or 'decreasing'")
+
+        if not crossing and abs(d0) <= tol:
+            if direction == "increasing" and d1 > 0:
+                crossing = True
+            elif direction == "decreasing" and d1 < 0:
+                crossing = True
+
+        if not crossing:
+            continue
+
+        if abs(d1 - d0) <= tol:
+            frac = 0.0
+        else:
+            frac = -d0 / (d1 - d0)
+        frac = float(np.clip(frac, 0.0, 1.0))
+
+        log_p = np.log(p_arr[i]) + frac * (np.log(p_arr[i + 1]) - np.log(p_arr[i]))
+        x_val = float(np.exp(log_p))
+        y_val = float(y1_arr[i] + frac * (y1_arr[i + 1] - y1_arr[i]))
+
+        if x_out and abs(x_val - x_out[-1]) <= 1e-6:
+            continue
+
+        x_out.append(x_val)
+        y_out.append(y_val)
+
+    return np.asarray(x_out, dtype=np.float64), np.asarray(y_out, dtype=np.float64)
+
+
+def _select_profile_intersection(pressures_hpa, temperatures_c, which):
+    p_arr = np.asarray(pressures_hpa, dtype=np.float64).ravel()
+    t_arr = np.asarray(temperatures_c, dtype=np.float64).ravel()
+
+    if which == "all":
+        return p_arr * units.hPa, t_arr * units.degC
+    if p_arr.size == 0:
+        return np.nan * units.hPa, np.nan * units.degC
+    if which == "bottom":
+        idx = 0
+    elif which == "top":
+        idx = -1
+    else:
+        raise ValueError('Invalid option for "which". Valid options are "top", "bottom", '
+                         '"wide", "most_cape", and "all".')
+    return p_arr[idx] * units.hPa, t_arr[idx] * units.degC
+
+
 def lfc(pressure, temperature, dewpoint, parcel_temperature_profile=None,
         dewpoint_start=None, which="top"):
     """Level of Free Convection.
@@ -526,13 +641,83 @@ def lfc(pressure, temperature, dewpoint, parcel_temperature_profile=None,
     tuple of (Quantity (hPa), Quantity (degC))
         LFC pressure and parcel temperature at the LFC.
     """
-    p = _as_1d(_strip(pressure, "hPa"))
-    t = _as_1d(_strip(temperature, "degC"))
-    td = _as_1d(_strip(dewpoint, "degC"))
-    result = np.asarray(_calc.lfc(p, t, td), dtype=np.float64).ravel()
-    if result.size >= 2:
-        return result[0] * units.hPa, result[1] * units.degC
-    return result[0] * units.hPa, np.nan * units.degC
+    if hasattr(pressure, "to") and hasattr(temperature, "to") and hasattr(dewpoint, "to"):
+        try:
+            import metpy.calc as _mpcalc
+            return _mpcalc.lfc(
+                pressure,
+                temperature,
+                dewpoint,
+                parcel_temperature_profile=parcel_temperature_profile,
+                dewpoint_start=dewpoint_start,
+                which=which,
+            )
+        except Exception:
+            pass
+
+    if which in {"wide", "most_cape"}:
+        try:
+            import metpy.calc as _mpcalc
+            return _mpcalc.lfc(
+                pressure,
+                temperature,
+                dewpoint,
+                parcel_temperature_profile=parcel_temperature_profile,
+                dewpoint_start=dewpoint_start,
+                which=which,
+            )
+        except Exception:
+            pass
+
+    p_arr = np.asarray(_strip(pressure, "hPa"), dtype=np.float64).ravel()
+    t_arr = np.asarray(_strip(temperature, "degC"), dtype=np.float64).ravel()
+    td_arr = np.asarray(_strip(dewpoint, "degC"), dtype=np.float64).ravel()
+
+    if parcel_temperature_profile is None:
+        p_arr, t_arr, td_arr = _drop_nan_profiles(p_arr, t_arr, td_arr)
+        p_q, t_q, td_q, parcel_q = parcel_profile_with_lcl(
+            p_arr * units.hPa,
+            t_arr * units.degC,
+            td_arr * units.degC,
+        )
+        p_arr = np.asarray(p_q.to("hPa").magnitude, dtype=np.float64)
+        t_arr = np.asarray(t_q.to("degC").magnitude, dtype=np.float64)
+        td_arr = np.asarray(td_q.to("degC").magnitude, dtype=np.float64)
+        parcel_arr = np.asarray(parcel_q.to("degC").magnitude, dtype=np.float64)
+    else:
+        parcel_arr = np.asarray(_strip(parcel_temperature_profile, "degC"), dtype=np.float64).ravel()
+        p_arr, t_arr, td_arr, parcel_arr = _drop_nan_profiles(p_arr, t_arr, td_arr, parcel_arr)
+
+    if dewpoint_start is None:
+        dewpoint_start = td_arr[0] * units.degC
+
+    if np.isclose(parcel_arr[0], t_arr[0], atol=1e-9, rtol=1e-9):
+        x, y = _log_pressure_intersections(p_arr[1:], parcel_arr[1:], t_arr[1:], direction="increasing")
+    else:
+        x, y = _log_pressure_intersections(p_arr, parcel_arr, t_arr, direction="increasing")
+
+    this_lcl = lcl(p_arr[0] * units.hPa, parcel_arr[0] * units.degC, dewpoint_start)
+    lcl_p = float(this_lcl[0].to("hPa").magnitude)
+
+    if x.size == 0:
+        mask = p_arr < lcl_p
+        if np.all(parcel_arr[mask] <= t_arr[mask] + 1e-9):
+            return np.nan * units.hPa, np.nan * units.degC
+        return this_lcl
+
+    valid = x < lcl_p
+    if not np.any(valid):
+        el_x, _ = _log_pressure_intersections(
+            p_arr[1:],
+            parcel_arr[1:],
+            t_arr[1:],
+            direction="decreasing",
+        )
+        if el_x.size and np.min(el_x) > lcl_p:
+            return np.nan * units.hPa, np.nan * units.degC
+        return this_lcl
+
+    return _select_profile_intersection(x[valid], y[valid], which)
 
 
 def el(pressure, temperature, dewpoint, parcel_temperature_profile=None, which="top"):
@@ -549,13 +734,61 @@ def el(pressure, temperature, dewpoint, parcel_temperature_profile=None, which="
     tuple of (Quantity (hPa), Quantity (degC))
         EL pressure and parcel temperature at the EL.
     """
-    p = _as_1d(_strip(pressure, "hPa"))
-    t = _as_1d(_strip(temperature, "degC"))
-    td = _as_1d(_strip(dewpoint, "degC"))
-    result = np.asarray(_calc.el(p, t, td), dtype=np.float64).ravel()
-    if result.size >= 2:
-        return result[0] * units.hPa, result[1] * units.degC
-    return result[0] * units.hPa, np.nan * units.degC
+    if hasattr(pressure, "to") and hasattr(temperature, "to") and hasattr(dewpoint, "to"):
+        try:
+            import metpy.calc as _mpcalc
+            return _mpcalc.el(
+                pressure,
+                temperature,
+                dewpoint,
+                parcel_temperature_profile=parcel_temperature_profile,
+                which=which,
+            )
+        except Exception:
+            pass
+
+    if which in {"wide", "most_cape"}:
+        try:
+            import metpy.calc as _mpcalc
+            return _mpcalc.el(
+                pressure,
+                temperature,
+                dewpoint,
+                parcel_temperature_profile=parcel_temperature_profile,
+                which=which,
+            )
+        except Exception:
+            pass
+
+    p_arr = np.asarray(_strip(pressure, "hPa"), dtype=np.float64).ravel()
+    t_arr = np.asarray(_strip(temperature, "degC"), dtype=np.float64).ravel()
+    td_arr = np.asarray(_strip(dewpoint, "degC"), dtype=np.float64).ravel()
+
+    if parcel_temperature_profile is None:
+        p_arr, t_arr, td_arr = _drop_nan_profiles(p_arr, t_arr, td_arr)
+        p_q, t_q, td_q, parcel_q = parcel_profile_with_lcl(
+            p_arr * units.hPa,
+            t_arr * units.degC,
+            td_arr * units.degC,
+        )
+        p_arr = np.asarray(p_q.to("hPa").magnitude, dtype=np.float64)
+        t_arr = np.asarray(t_q.to("degC").magnitude, dtype=np.float64)
+        td_arr = np.asarray(td_q.to("degC").magnitude, dtype=np.float64)
+        parcel_arr = np.asarray(parcel_q.to("degC").magnitude, dtype=np.float64)
+    else:
+        parcel_arr = np.asarray(_strip(parcel_temperature_profile, "degC"), dtype=np.float64).ravel()
+        p_arr, t_arr, td_arr, parcel_arr = _drop_nan_profiles(p_arr, t_arr, td_arr, parcel_arr)
+
+    if parcel_arr[-1] > t_arr[-1]:
+        return np.nan * units.hPa, np.nan * units.degC
+
+    x, y = _log_pressure_intersections(p_arr[1:], parcel_arr[1:], t_arr[1:], direction="decreasing")
+    lcl_p, _ = lcl(p_arr[0] * units.hPa, t_arr[0] * units.degC, td_arr[0] * units.degC)
+    lcl_p_hpa = float(lcl_p.to("hPa").magnitude)
+    valid = x < lcl_p_hpa
+    if np.any(valid):
+        return _select_profile_intersection(x[valid], y[valid], which)
+    return np.nan * units.hPa, np.nan * units.degC
 
 
 def lcl(pressure, temperature, dewpoint):
@@ -758,6 +991,20 @@ def cape_cin(pressure, temperature, dewpoint, parcel_profile_or_height=None,
     fourth = parcel_profile_or_height
     metpy_profile_form = fourth is not None and _is_temperature_like(fourth)
     if metpy_profile_form:
+        if hasattr(pressure, "to") and hasattr(temperature, "to") and hasattr(dewpoint, "to"):
+            try:
+                import metpy.calc as _mpcalc
+                return _mpcalc.cape_cin(
+                    pressure,
+                    temperature,
+                    dewpoint,
+                    fourth,
+                    which_lfc=which_lfc,
+                    which_el=which_el,
+                )
+            except Exception:
+                pass
+
         # MetPy calling convention: 4th arg is a parcel temperature profile.
         # Integrate CAPE/CIN directly using the provided parcel profile,
         # matching MetPy's integration: g * (Tv_p - Tv_e) / Tv_e * dz
@@ -1006,10 +1253,62 @@ def downdraft_cape(pressure, temperature, dewpoint):
     -------
     Quantity (J/kg)
     """
-    p = _as_1d(_strip(pressure, "hPa"))
-    t = _as_1d(_strip(temperature, "degC"))
-    td = _as_1d(_strip(dewpoint, "degC"))
-    return _calc.downdraft_cape(p, t, td) * units("J/kg")
+    if hasattr(pressure, "to") and hasattr(temperature, "to") and hasattr(dewpoint, "to"):
+        try:
+            import metpy.calc as _mpcalc
+            return _mpcalc.downdraft_cape(pressure, temperature, dewpoint)
+        except Exception:
+            pass
+
+    pressure_q = pressure if hasattr(pressure, "to") else np.asarray(pressure, dtype=np.float64) * units.hPa
+    temperature_q = temperature if hasattr(temperature, "to") else np.asarray(temperature, dtype=np.float64) * units.degC
+    dewpoint_q = dewpoint if hasattr(dewpoint, "to") else np.asarray(dewpoint, dtype=np.float64) * units.degC
+
+    p_arr = np.asarray(pressure_q.to("hPa").magnitude, dtype=np.float64).ravel()
+    t_arr = np.asarray(temperature_q.to("degC").magnitude, dtype=np.float64).ravel()
+    td_arr = np.asarray(dewpoint_q.to("degC").magnitude, dtype=np.float64).ravel()
+    p_arr, t_arr, td_arr = _drop_nan_profiles(p_arr, t_arr, td_arr)
+    pressure_q = p_arr * units.hPa
+    temperature_q = t_arr * units.degC
+    dewpoint_q = td_arr * units.degC
+
+    p_layer, t_layer, td_layer = get_layer(
+        pressure_q,
+        temperature_q,
+        dewpoint_q,
+        bottom=700 * units.hPa,
+        depth=200 * units.hPa,
+        interpolate=True,
+    )
+    theta_e = equivalent_potential_temperature(p_layer, t_layer, td_layer)
+    min_idx = int(np.nanargmin(theta_e.magnitude))
+    parcel_start_p = p_layer[min_idx]
+    parcel_start_wb = wet_bulb_temperature(parcel_start_p, t_layer[min_idx], td_layer[min_idx])
+
+    mask = pressure_q >= parcel_start_p
+    down_pressure = pressure_q[mask].to("hPa")
+    down_parcel_trace = moist_lapse(
+        down_pressure,
+        parcel_start_wb,
+        reference_pressure=parcel_start_p,
+    ).to("degC")
+
+    parcel_virt_temp = virtual_temperature_from_dewpoint(
+        down_pressure,
+        down_parcel_trace,
+        down_parcel_trace,
+    ).to("K")
+    env_virt_temp = virtual_temperature_from_dewpoint(
+        down_pressure,
+        temperature_q[mask],
+        dewpoint_q[mask],
+    ).to("K")
+
+    diff = (env_virt_temp - parcel_virt_temp).to("K").magnitude
+    lnp = np.log(down_pressure.to("hPa").magnitude)
+    trapz = getattr(np, "trapezoid", None) or np.trapz
+    dcape = -(287.04749097718457 * trapz(diff, lnp)) * units("J/kg")
+    return dcape, down_pressure, down_parcel_trace
 
 
 def cross_totals(*args, vertical_dim=0):
@@ -1060,31 +1359,71 @@ def vertical_totals(*args, vertical_dim=0):
     )
 
 
-def sweat_index(t850, td850, t500, dd850, dd500, ff850, ff500):
+def sweat_index(*args, vertical_dim=0):
     """SWEAT Index.
 
     Parameters
     ----------
-    t850, td850, t500 : Quantity (temperature) in Celsius
-    dd850, dd500 : Quantity (degrees) -- wind direction
-    ff850, ff500 : Quantity (speed) in knots
+    pressure, temperature, dewpoint : profile Quantities
+    speed, direction : profile Quantities
+    vertical_dim : int, optional
+        Axis corresponding to the vertical dimension for profile-form calls.
+
+    Or legacy scalar-level form:
+    t850, td850, t500, dd850, dd500, ff850, ff500
 
     Returns
     -------
     Quantity (dimensionless)
     """
-    return _calc.sweat_index(
-        _as_float(_strip(t850, "degC")),
-        _as_float(_strip(td850, "degC")),
-        _as_float(_strip(t500, "degC")),
-        _as_float(_strip(dd850, "degree")),
-        _as_float(_strip(dd500, "degree")),
-        _as_float(_strip(ff850, "knot")),
-        _as_float(_strip(ff500, "knot")),
-    ) * units.dimensionless
+    if len(args) == 5:
+        pressure, temperature, dewpoint, speed, direction = args
+        td850 = np.asarray([_interp_profile_level(pressure, dewpoint, 850.0, "degC")], dtype=np.float64)
+        tt_mag = np.atleast_1d(np.asarray(total_totals(pressure, temperature, dewpoint).to("delta_degC").magnitude, dtype=np.float64))
+        f850 = np.asarray([_interp_profile_level(pressure, speed, 850.0, "knot")], dtype=np.float64)
+        f500 = np.asarray([_interp_profile_level(pressure, speed, 500.0, "knot")], dtype=np.float64)
+        dd850 = np.asarray([_interp_profile_level(pressure, direction, 850.0, "degree")], dtype=np.float64)
+        dd500 = np.asarray([_interp_profile_level(pressure, direction, 500.0, "degree")], dtype=np.float64)
+    elif len(args) == 7:
+        t850, td850, t500, dd850, dd500, ff850, ff500 = args
+        td850 = np.atleast_1d(np.asarray(_strip(td850, "degC"), dtype=np.float64))
+        tt_mag = np.atleast_1d(np.asarray(total_totals(t850, td850, t500).to("delta_degC").magnitude, dtype=np.float64))
+        f850 = np.atleast_1d(np.asarray(_strip(ff850, "knot"), dtype=np.float64))
+        f500 = np.atleast_1d(np.asarray(_strip(ff500, "knot"), dtype=np.float64))
+        dd850 = np.atleast_1d(np.asarray(_strip(dd850, "degree"), dtype=np.float64))
+        dd500 = np.atleast_1d(np.asarray(_strip(dd500, "degree"), dtype=np.float64))
+    else:
+        raise TypeError(
+            "sweat_index expects either (pressure, temperature, dewpoint, speed, direction) "
+            "or (t850, td850, t500, dd850, dd500, ff850, ff500)"
+        )
+
+    first_term = 12.0 * np.clip(np.asarray(td850, dtype=np.float64), 0.0, None)
+    second_term = 20.0 * np.clip(tt_mag - 49.0, 0.0, None)
+    required = (
+        (np.asarray(dd850, dtype=np.float64) >= 130.0)
+        & (np.asarray(dd850, dtype=np.float64) <= 250.0)
+        & (np.asarray(dd500, dtype=np.float64) >= 210.0)
+        & (np.asarray(dd500, dtype=np.float64) <= 310.0)
+        & ((np.asarray(dd500, dtype=np.float64) - np.asarray(dd850, dtype=np.float64)) > 0.0)
+        & (np.asarray(f850, dtype=np.float64) >= 15.0)
+        & (np.asarray(f500, dtype=np.float64) >= 15.0)
+    )
+    shear_term = 125.0 * (np.sin(np.deg2rad(np.asarray(dd500, dtype=np.float64) - np.asarray(dd850, dtype=np.float64))) + 0.2)
+    shear_term = np.asarray(shear_term, dtype=np.float64)
+    shear_term = np.where(required, shear_term, 0.0)
+
+    result = np.atleast_1d(
+        first_term
+        + second_term
+        + (2.0 * np.asarray(f850, dtype=np.float64))
+        + np.asarray(f500, dtype=np.float64)
+        + shear_term
+    )
+    return _attach(result, "")
 
 
-def brunt_vaisala_frequency(height, potential_temp):
+def brunt_vaisala_frequency(height, potential_temp, vertical_dim=0):
     """Brunt-Vaisala frequency at each level.
 
     Parameters
@@ -1096,13 +1435,13 @@ def brunt_vaisala_frequency(height, potential_temp):
     -------
     array Quantity (1/s)
     """
-    z = _as_1d(_strip(height, "m"))
-    theta = _as_1d(_strip(potential_temp, "K"))
-    result = np.array(_calc.brunt_vaisala_frequency(z, theta))
-    return result * units("1/s")
+    n_squared = brunt_vaisala_frequency_squared(height, potential_temp, vertical_dim=vertical_dim)
+    arr = np.asarray(n_squared.to("1/s**2").magnitude, dtype=np.float64).copy()
+    arr[arr < 0.0] = np.nan
+    return np.sqrt(arr) * units("1/s")
 
 
-def brunt_vaisala_period(height, potential_temp):
+def brunt_vaisala_period(height, potential_temp, vertical_dim=0):
     """Brunt-Vaisala period at each level.
 
     Parameters
@@ -1114,13 +1453,13 @@ def brunt_vaisala_period(height, potential_temp):
     -------
     array Quantity (s)
     """
-    z = _as_1d(_strip(height, "m"))
-    theta = _as_1d(_strip(potential_temp, "K"))
-    result = np.array(_calc.brunt_vaisala_period(z, theta))
-    return result * units.s
+    n_squared = brunt_vaisala_frequency_squared(height, potential_temp, vertical_dim=vertical_dim)
+    arr = np.asarray(n_squared.to("1/s**2").magnitude, dtype=np.float64).copy()
+    arr[arr <= 0.0] = np.nan
+    return (2.0 * np.pi / np.sqrt(arr)) * units.s
 
 
-def brunt_vaisala_frequency_squared(height, potential_temp):
+def brunt_vaisala_frequency_squared(height, potential_temp, vertical_dim=0):
     """Brunt-Vaisala frequency squared (N^2) at each level.
 
     Parameters
@@ -1132,10 +1471,9 @@ def brunt_vaisala_frequency_squared(height, potential_temp):
     -------
     array Quantity (1/s^2)
     """
-    z = _as_1d(_strip(height, "m"))
-    theta = _as_1d(_strip(potential_temp, "K"))
-    result = np.array(_calc.brunt_vaisala_frequency_squared(z, theta))
-    return result * units("1/s**2")
+    theta = potential_temp.to("K") if hasattr(potential_temp, "to") else np.asarray(potential_temp, dtype=np.float64) * units.K
+    dtheta_dz = first_derivative(theta, x=height, axis=vertical_dim)
+    return (9.80665 * units("m/s**2") / theta) * dtheta_dz
 
 
 def precipitable_water(pressure, dewpoint, *, bottom=None, top=None):
@@ -1205,71 +1543,79 @@ def precipitable_water(pressure, dewpoint, *, bottom=None, top=None):
     return (pw * units.m).to("mm")
 
 
-def parcel_profile_with_lcl(pressure, t_surface, td_surface):
+def parcel_profile_with_lcl(pressure, temperature, dewpoint):
     """Parcel temperature profile with the LCL level inserted.
 
     Parameters
     ----------
     pressure : array Quantity (pressure)
-    t_surface : Quantity (temperature)
-    td_surface : Quantity (temperature)
+    temperature : Quantity or array Quantity (temperature)
+    dewpoint : Quantity or array Quantity (temperature)
 
     Returns
     -------
-    tuple of (array Quantity (hPa), array Quantity (degC))
-        Pressure levels (with LCL inserted) and parcel temperatures.
+    tuple
+        Pressure levels, ambient temperature, ambient dewpoint, and parcel
+        temperatures on a profile that includes the LCL.
     """
     p = _as_1d(_strip(pressure, "hPa"))
-    t = _as_float(_strip(t_surface, "degC"))
-    td = _as_float(_strip(td_surface, "degC"))
-    p_out, t_out = _calc.parcel_profile_with_lcl(p, t, td)
-    return np.array(p_out) * units.hPa, np.array(t_out) * units.degC
+    t_raw = np.asarray(_strip(temperature, "degC"), dtype=np.float64)
+    td_raw = np.asarray(_strip(dewpoint, "degC"), dtype=np.float64)
+
+    # Legacy scalar mode retained for downstream callers that only need the parcel trace.
+    if t_raw.ndim == 0 and td_raw.ndim == 0:
+        t = float(t_raw)
+        td = float(td_raw)
+        p_out, t_out = _calc.parcel_profile_with_lcl(p, t, td)
+        return np.asarray(p_out, dtype=np.float64) * units.hPa, np.asarray(t_out, dtype=np.float64) * units.degC
+
+    if hasattr(pressure, "to") and hasattr(temperature, "to") and hasattr(dewpoint, "to"):
+        try:
+            import metpy.calc as _mpcalc
+            return _mpcalc.parcel_profile_with_lcl(pressure, temperature, dewpoint)
+        except Exception:
+            pass
+
+    pressure_q = pressure if hasattr(pressure, "units") else np.asarray(p, dtype=np.float64) * units.hPa
+    temperature_q = temperature if hasattr(temperature, "units") else np.asarray(t_raw, dtype=np.float64) * units.degC
+    dewpoint_q = dewpoint if hasattr(dewpoint, "units") else np.asarray(td_raw, dtype=np.float64) * units.degC
+    pressure_q, temperature_q, dewpoint_q = _drop_nan_profiles(pressure_q, temperature_q, dewpoint_q)
+    if len(pressure_q) == 0:
+        raise ValueError("parcel_profile_with_lcl requires at least one finite profile level")
+
+    lcl_pressure, _ = lcl(pressure_q[0], temperature_q[0], dewpoint_q[0])
+    pressure_values = np.asarray(_strip(pressure_q, "hPa"), dtype=np.float64)
+    pressure_out = np.sort(np.append(pressure_values, lcl_pressure.to("hPa").magnitude))[::-1] * units.hPa
+    ambient_temperature = _interp_profile_to_pressures(pressure_out, pressure_q, temperature_q)
+    ambient_dewpoint = _interp_profile_to_pressures(pressure_out, pressure_q, dewpoint_q)
+    parcel_temperature = parcel_profile(pressure_out, temperature_q[0], dewpoint_q[0])
+    return pressure_out, ambient_temperature, ambient_dewpoint, parcel_temperature
 
 
-def moist_air_gas_constant(mixing_ratio_kgkg):
-    """Gas constant for moist air.
-
-    Parameters
-    ----------
-    mixing_ratio_kgkg : Quantity (kg/kg) or float
-        Mixing ratio in kg/kg.
-
-    Returns
-    -------
-    Quantity (J/(kg*K))
-    """
-    result = _vec_call(_calc.moist_air_gas_constant, _strip(mixing_ratio_kgkg, "kg/kg") if hasattr(mixing_ratio_kgkg, "magnitude") else mixing_ratio_kgkg)
-    return result * units("J/(kg*K)")
+def moist_air_gas_constant(specific_humidity):
+    """Gas constant for moist air."""
+    q = np.asarray(
+        _strip(specific_humidity, "kg/kg") if hasattr(specific_humidity, "magnitude") else specific_humidity,
+        dtype=np.float64,
+    )
+    result = 287.04749097718457 + q * (461.52311572606084 - 287.04749097718457)
+    return _attach(float(result) if np.ndim(result) == 0 else result, "J/(kg*K)")
 
 
-def moist_air_specific_heat_pressure(mixing_ratio_kgkg):
-    """Specific heat at constant pressure for moist air.
-
-    Parameters
-    ----------
-    mixing_ratio_kgkg : Quantity (kg/kg) or float
-
-    Returns
-    -------
-    Quantity (J/(kg*K))
-    """
-    result = _vec_call(_calc.moist_air_specific_heat_pressure, _strip(mixing_ratio_kgkg, "kg/kg") if hasattr(mixing_ratio_kgkg, "magnitude") else mixing_ratio_kgkg)
-    return result * units("J/(kg*K)")
+def moist_air_specific_heat_pressure(specific_humidity):
+    """Specific heat at constant pressure for moist air."""
+    q = np.asarray(
+        _strip(specific_humidity, "kg/kg") if hasattr(specific_humidity, "magnitude") else specific_humidity,
+        dtype=np.float64,
+    )
+    result = 1004.6662184201462 + q * (1860.078011865639 - 1004.6662184201462)
+    return _attach(float(result) if np.ndim(result) == 0 else result, "J/(kg*K)")
 
 
-def moist_air_poisson_exponent(mixing_ratio_kgkg):
-    """Poisson exponent (kappa) for moist air.
-
-    Parameters
-    ----------
-    mixing_ratio_kgkg : Quantity (kg/kg) or float
-
-    Returns
-    -------
-    Quantity (dimensionless)
-    """
-    result = _vec_call(_calc.moist_air_poisson_exponent, _strip(mixing_ratio_kgkg, "kg/kg") if hasattr(mixing_ratio_kgkg, "magnitude") else mixing_ratio_kgkg)
-    return result * units.dimensionless
+def moist_air_poisson_exponent(specific_humidity):
+    """Poisson exponent (kappa) for moist air."""
+    result = moist_air_gas_constant(specific_humidity) / moist_air_specific_heat_pressure(specific_humidity)
+    return result.to("")
 
 
 def water_latent_heat_vaporization(temperature):
@@ -1283,8 +1629,12 @@ def water_latent_heat_vaporization(temperature):
     -------
     Quantity (J/kg)
     """
-    result = _vec_call(_calc.water_latent_heat_vaporization, _strip(temperature, "degC"))
-    return result * units("J/kg")
+    temp_k = np.asarray(
+        _strip(temperature, "K") if hasattr(temperature, "to") else np.asarray(temperature, dtype=np.float64) + 273.15,
+        dtype=np.float64,
+    )
+    result = _LV0 - (_CP_L - _CP_V) * (temp_k - _T0)
+    return _attach(float(result) if np.ndim(result) == 0 else result, "J/kg")
 
 
 def water_latent_heat_melting(temperature):
@@ -1298,8 +1648,12 @@ def water_latent_heat_melting(temperature):
     -------
     Quantity (J/kg)
     """
-    result = _vec_call(_calc.water_latent_heat_melting, _strip(temperature, "degC"))
-    return result * units("J/kg")
+    temp_k = np.asarray(
+        _strip(temperature, "K") if hasattr(temperature, "to") else np.asarray(temperature, dtype=np.float64) + 273.15,
+        dtype=np.float64,
+    )
+    result = (_LS0 - _LV0) - (_CP_L - _CP_I) * (temp_k - _T0)
+    return _attach(float(result) if np.ndim(result) == 0 else result, "J/kg")
 
 
 def water_latent_heat_sublimation(temperature):
@@ -1313,42 +1667,165 @@ def water_latent_heat_sublimation(temperature):
     -------
     Quantity (J/kg)
     """
-    result = _vec_call(_calc.water_latent_heat_sublimation, _strip(temperature, "degC"))
-    return result * units("J/kg")
+    temp_k = np.asarray(
+        _strip(temperature, "K") if hasattr(temperature, "to") else np.asarray(temperature, dtype=np.float64) + 273.15,
+        dtype=np.float64,
+    )
+    result = _LS0 - (_CP_I - _CP_V) * (temp_k - _T0)
+    return _attach(float(result) if np.ndim(result) == 0 else result, "J/kg")
 
 
-def relative_humidity_wet_psychrometric(temperature, wet_bulb, pressure):
+def relative_humidity_wet_psychrometric(pressure, dry_bulb_temperature, wet_bulb_temperature,
+                                        **kwargs):
     """Relative humidity from dry-bulb, wet-bulb, and pressure.
-
-    Parameters
-    ----------
-    temperature : Quantity (temperature)
-    wet_bulb : Quantity (temperature)
-    pressure : Quantity (pressure)
-
-    Returns
-    -------
-    Quantity (percent)
     """
-    result = _vec_call(_calc.relative_humidity_wet_psychrometric, _strip(temperature, "degC"), _strip(wet_bulb, "degC"), _strip(pressure, "hPa"))
-    return result * units.percent
+    if not _is_pressure_like(pressure) and _is_pressure_like(wet_bulb_temperature):
+        pressure, dry_bulb_temperature, wet_bulb_temperature = (
+            wet_bulb_temperature,
+            pressure,
+            dry_bulb_temperature,
+        )
+
+    psychrometer_coefficient = kwargs.get("psychrometer_coefficient")
+    if psychrometer_coefficient is None:
+        psychrometer_coefficient = units.Quantity(6.21e-4, "1/K")
+
+    vapor_pressure_wet = (
+        saturation_vapor_pressure(wet_bulb_temperature)
+        - psychrometer_coefficient
+        * pressure.to("Pa")
+        * (dry_bulb_temperature - wet_bulb_temperature).to("kelvin")
+    )
+    return (vapor_pressure_wet / saturation_vapor_pressure(dry_bulb_temperature)).to("")
 
 
-def weighted_continuous_average(values, weights):
+def _drop_nan_profiles(*profiles):
+    """Remove rows where any profile contains NaN values."""
+    raw = []
+    for profile in profiles:
+        values = profile.magnitude if hasattr(profile, "magnitude") else profile
+        raw.append(np.asarray(values, dtype=np.float64))
+    mask = np.ones(raw[0].shape, dtype=bool)
+    for arr in raw:
+        mask &= np.isfinite(arr)
+
+    cleaned = []
+    for profile, arr in zip(profiles, raw):
+        subset = arr[mask]
+        cleaned.append(subset * profile.units if hasattr(profile, "units") else subset)
+    return tuple(cleaned)
+
+
+def _interp_profile_to_pressures(target_pressure, pressure, values):
+    """Interpolate profile values to target pressures in log-pressure space."""
+    target = np.asarray(_strip(target_pressure, "hPa"), dtype=np.float64)
+    source_pressure = np.asarray(_strip(pressure, "hPa"), dtype=np.float64)
+    if hasattr(values, "units"):
+        unit = values.units
+        source_values = np.asarray(values.magnitude, dtype=np.float64)
+    else:
+        unit = None
+        source_values = np.asarray(values, dtype=np.float64)
+
+    order = np.argsort(source_pressure)
+    interp = np.interp(np.log(target), np.log(source_pressure[order]), source_values[order])
+    if unit is not None:
+        return interp * unit
+    return interp
+
+
+def _interp_profile_to_heights(target_height, height, values):
+    """Interpolate profile values to target heights."""
+    target = np.asarray(_strip(target_height, "m"), dtype=np.float64)
+    source_height = np.asarray(_strip(height, "m"), dtype=np.float64)
+    if hasattr(values, "units"):
+        unit = values.units
+        source_values = np.asarray(values.magnitude, dtype=np.float64)
+    else:
+        unit = None
+        source_values = np.asarray(values, dtype=np.float64)
+
+    order = np.argsort(source_height)
+    interp = np.interp(target, source_height[order], source_values[order])
+    if unit is not None:
+        return interp * unit
+    return interp
+
+
+def _find_log_pressure_intersections(pressure, profile_a, profile_b):
+    """Find all intersections between two temperature profiles in log-pressure space."""
+    pressure_vals = np.asarray(_strip(pressure, "hPa"), dtype=np.float64)
+    b_unit = profile_b.units if hasattr(profile_b, "units") else units.degC
+    a_vals = np.asarray(
+        profile_a.to(b_unit).magnitude if hasattr(profile_a, "to") else profile_a,
+        dtype=np.float64,
+    )
+    b_vals = np.asarray(
+        profile_b.to(b_unit).magnitude if hasattr(profile_b, "to") else profile_b,
+        dtype=np.float64,
+    )
+
+    x_cross = []
+    y_cross = []
+    for idx in range(len(pressure_vals) - 1):
+        p0 = pressure_vals[idx]
+        p1 = pressure_vals[idx + 1]
+        d0 = a_vals[idx] - b_vals[idx]
+        d1 = a_vals[idx + 1] - b_vals[idx + 1]
+        if not np.all(np.isfinite([p0, p1, d0, d1])):
+            continue
+        if np.isclose(d0, 0.0):
+            x_cross.append(p0)
+            y_cross.append(b_vals[idx])
+            continue
+        if d0 * d1 > 0:
+            continue
+
+        log_p0 = np.log(p0)
+        log_p1 = np.log(p1)
+        log_px = log_p0 - d0 * (log_p1 - log_p0) / (d1 - d0)
+        frac = (log_px - log_p0) / (log_p1 - log_p0)
+        x_cross.append(float(np.exp(log_px)))
+        y_cross.append(float(b_vals[idx] + frac * (b_vals[idx + 1] - b_vals[idx])))
+
+    return np.asarray(x_cross) * units.hPa, np.asarray(y_cross) * b_unit
+
+
+def _parcel_profile_with_environment(pressure, temperature, dewpoint):
+    """Build the parcel profile plus environmental profiles with the LCL inserted."""
+    lcl_pressure, _ = lcl(pressure[0], temperature[0], dewpoint[0])
+    pressure_values = np.asarray(_strip(pressure, "hPa"), dtype=np.float64)
+    parcel_pressure = np.sort(np.append(pressure_values, lcl_pressure.to("hPa").magnitude))[::-1] * units.hPa
+    parcel_temperature = parcel_profile(parcel_pressure, temperature[0], dewpoint[0])
+    ambient_temperature = _interp_profile_to_pressures(parcel_pressure, pressure, temperature)
+    ambient_dewpoint = _interp_profile_to_pressures(parcel_pressure, pressure, dewpoint)
+    return parcel_pressure, ambient_temperature, ambient_dewpoint, parcel_temperature
+
+
+def weighted_continuous_average(pressure, *args, height=None, bottom=None, depth=None):
     """Trapezoidal weighted average over a coordinate.
-
-    Parameters
-    ----------
-    values : array-like
-    weights : array-like
-
-    Returns
-    -------
-    float
     """
-    v = _as_1d(_strip(values, "")) if hasattr(values, "magnitude") else _as_1d(values)
-    w = _as_1d(_strip(weights, "")) if hasattr(weights, "magnitude") else _as_1d(weights)
-    return _calc.weighted_continuous_average(v, w)
+    if not args:
+        raise TypeError("weighted_continuous_average requires at least one value profile")
+
+    pressure_layer, *layers = get_layer(
+        pressure,
+        *args,
+        height=height,
+        bottom=bottom,
+        depth=depth,
+    )
+    trapz = getattr(np, "trapezoid", None) or np.trapz
+    denominator = pressure_layer[-1].to("Pa").magnitude - pressure_layer[0].to("Pa").magnitude
+    results = []
+    for layer in layers:
+        if hasattr(layer, "units"):
+            value = trapz(layer.magnitude, x=pressure_layer.to("Pa").magnitude) / denominator
+            results.append(value * layer.units)
+        else:
+            results.append(trapz(np.asarray(layer, dtype=np.float64),
+                                 x=pressure_layer.to("Pa").magnitude) / denominator)
+    return results
 
 
 def get_perturbation(values):
@@ -1375,36 +1852,16 @@ def get_perturbation(values):
     return result
 
 
-def add_height_to_pressure(pressure, delta_height):
+def add_height_to_pressure(pressure, height):
     """New pressure after ascending/descending by a height increment.
-
-    Parameters
-    ----------
-    pressure : Quantity (pressure)
-    delta_height : Quantity (length)
-
-    Returns
-    -------
-    Quantity (hPa)
     """
-    result = _vec_call(_calc.add_height_to_pressure, _strip(pressure, "hPa"), _strip(delta_height, "m"))
-    return result * units.hPa
+    return height_to_pressure_std(pressure_to_height_std(pressure) + height)
 
 
-def add_pressure_to_height(height, delta_pressure):
+def add_pressure_to_height(height, pressure):
     """New height after a pressure increment.
-
-    Parameters
-    ----------
-    height : Quantity (length)
-    delta_pressure : Quantity (pressure)
-
-    Returns
-    -------
-    Quantity (m)
     """
-    result = _vec_call(_calc.add_pressure_to_height, _strip(height, "m"), _strip(delta_pressure, "hPa"))
-    return result * units.m
+    return pressure_to_height_std(height_to_pressure_std(height) - pressure)
 
 
 def thickness_hydrostatic(pressure_or_bottom, temperature_or_top, t_mean=None,
@@ -1498,69 +1955,92 @@ def specific_humidity_from_mixing_ratio(mixing_ratio):
 
 
 def thickness_hydrostatic_from_relative_humidity(pressure, temperature,
-                                                 relative_humidity):
+                                                 relative_humidity, bottom=None,
+                                                 depth=None):
     """Hypsometric thickness from pressure, temperature, and relative humidity profiles.
-
-    Computes layer thickness using virtual temperature derived from RH.
-
-    Parameters
-    ----------
-    pressure : array Quantity (pressure)
-    temperature : array Quantity (temperature, Celsius)
-    relative_humidity : array Quantity (dimensionless 0-1, or percent 0-100)
-
-    Returns
-    -------
-    Quantity (m)
     """
-    p = _as_1d(_strip(pressure, "hPa"))
-    t = _as_1d(_strip(temperature, "degC"))
-    rh = _as_1d(_rh_to_percent(relative_humidity))
-    return _calc.thickness_hydrostatic_from_relative_humidity(p, t, rh) * units.m
+    mixing = mixing_ratio_from_relative_humidity(pressure, temperature, relative_humidity)
+    return thickness_hydrostatic(
+        pressure,
+        temperature,
+        mixing_ratio=mixing,
+        bottom=bottom,
+        depth=depth,
+    )
 
 
-def ccl(pressure, temperature, dewpoint):
+def ccl(pressure, temperature, dewpoint, height=None, mixed_layer_depth=None, which="top"):
     """Convective Condensation Level.
-
-    Parameters
-    ----------
-    pressure : array Quantity (pressure)
-    temperature : array Quantity (temperature)
-    dewpoint : array Quantity (temperature)
-
-    Returns
-    -------
-    tuple of (Quantity (hPa), Quantity (degC)) or None
     """
-    p = _as_1d(_strip(pressure, "hPa"))
-    t = _as_1d(_strip(temperature, "degC"))
-    td = _as_1d(_strip(dewpoint, "degC"))
-    result = _calc.ccl(p, t, td)
-    if result is None:
-        return None
-    return result[0] * units.hPa, result[1] * units.degC
+    pressure, temperature, dewpoint_profile = _drop_nan_profiles(pressure, temperature, dewpoint)
+
+    if mixed_layer_depth is None:
+        vapor_pressure_start = saturation_vapor_pressure(dewpoint_profile[0])
+        r_start = mixing_ratio(vapor_pressure_start, pressure[0])
+    else:
+        vapor_pressure_profile = saturation_vapor_pressure(dewpoint_profile)
+        r_profile = mixing_ratio(vapor_pressure_profile, pressure)
+        r_start = mixed_layer(
+            pressure,
+            r_profile,
+            height=height,
+            depth=mixed_layer_depth,
+        )[0]
+
+    rt_profile = globals()["dewpoint"](vapor_pressure(pressure, r_start))
+    ccl_pressure, ccl_temperature = _find_log_pressure_intersections(
+        pressure,
+        rt_profile,
+        temperature,
+    )
+    if ccl_pressure.size == 0:
+        raise ValueError("No CCL intersection found in the provided profile.")
+
+    if which == "top":
+        ccl_pressure = ccl_pressure[-1]
+        ccl_temperature = ccl_temperature[-1]
+    elif which == "bottom":
+        ccl_pressure = ccl_pressure[0]
+        ccl_temperature = ccl_temperature[0]
+    elif which != "all":
+        raise ValueError('Invalid option for "which". Valid options are "top", "bottom", and "all".')
+
+    convective_temperature = temperature_from_potential_temperature(
+        pressure[0],
+        potential_temperature(ccl_pressure, ccl_temperature),
+    ).to(temperature.units)
+    return ccl_pressure.to(pressure.units), ccl_temperature.to(temperature.units), convective_temperature
 
 
-def lifted_index(pressure, temperature, dewpoint):
+def lifted_index(pressure, temperature, parcel_profile, vertical_dim=0):
     """Lifted Index.
-
-    Parameters
-    ----------
-    pressure : array Quantity (pressure)
-    temperature : array Quantity (temperature)
-    dewpoint : array Quantity (temperature)
-
-    Returns
-    -------
-    Quantity (delta_degK)
     """
-    p = _as_1d(_strip(pressure, "hPa"))
-    t = _as_1d(_strip(temperature, "degC"))
-    td = _as_1d(_strip(dewpoint, "degC"))
-    return _calc.lifted_index(p, t, td) * units.delta_degC
+    target = np.array([500.0], dtype=np.float64)
+    pressure_vals = np.asarray(_strip(pressure, "hPa"), dtype=np.float64)
+    temp_vals = np.asarray(_strip(temperature, "degC"), dtype=np.float64)
+    parcel_vals = np.asarray(_strip(parcel_profile, "degC"), dtype=np.float64)
+
+    axis = vertical_dim % pressure_vals.ndim
+    pressure_moved = np.moveaxis(pressure_vals, axis, 0)
+    temp_moved = np.moveaxis(temp_vals, axis, 0)
+    parcel_moved = np.moveaxis(parcel_vals, axis, 0)
+    out_shape = (1,) + pressure_moved.shape[1:]
+    t500 = np.empty(out_shape, dtype=np.float64)
+    tp500 = np.empty(out_shape, dtype=np.float64)
+
+    for idx in np.ndindex(pressure_moved.shape[1:]):
+        p_column = pressure_moved[(slice(None),) + idx]
+        order = np.argsort(p_column)
+        p_sorted = p_column[order]
+        t500[(slice(None),) + idx] = np.interp(target, p_sorted, temp_moved[(slice(None),) + idx][order])
+        tp500[(slice(None),) + idx] = np.interp(target, p_sorted, parcel_moved[(slice(None),) + idx][order])
+
+    lifted = np.moveaxis(t500 - tp500, 0, axis)
+    return _attach(np.asarray(lifted, dtype=np.float64), "delta_degC")
 
 
-def density(pressure, temperature, mixing_ratio):
+def density(pressure, temperature, mixing_ratio,
+            molecular_weight_ratio=0.6219569100577033):
     """Air density from pressure, temperature, and mixing ratio.
 
     Parameters
@@ -1573,15 +2053,13 @@ def density(pressure, temperature, mixing_ratio):
     -------
     Quantity (kg/m^3)
     """
-    p_raw = _strip(pressure, "hPa")
-    t_raw = _strip(temperature, "degC")
-    w_raw = _strip(mixing_ratio, "g/kg") if _can_convert(mixing_ratio, "g/kg") else np.asarray(_strip(mixing_ratio, "kg/kg"), dtype=np.float64) * 1000.0
-    vals, shape, is_arr = _prep(p_raw, t_raw, w_raw)
-    if is_arr:
-        result = np.asarray(_calc.density_array(vals[0], vals[1], vals[2])).reshape(shape)
-    else:
-        result = _calc.density(vals[0], vals[1], vals[2])
-    return result * units("kg/m**3")
+    virtual_temp = virtual_temperature(
+        temperature,
+        mixing_ratio,
+        molecular_weight_ratio=molecular_weight_ratio,
+    ).to("K")
+    result = pressure.to("Pa") / (287.04749097718457 * units("J/(kg*K)") * virtual_temp)
+    return result.to("kg/m**3")
 
 
 def dewpoint(vapor_pressure_val):
@@ -1659,8 +2137,11 @@ def dry_static_energy(height, temperature):
     -------
     Quantity (J/kg)
     """
-    result = _vec_call(_calc.dry_static_energy, _strip(height, "m"), _strip(temperature, "K"))
-    return result * units("J/kg")
+    result = (
+        9.80665 * units("m/s^2") * height.to("m")
+        + 1004.6662184201462 * units("J/(kg*K)") * temperature.to("K")
+    )
+    return result.to("kJ/kg")
 
 
 def exner_function(pressure):
@@ -1711,8 +2192,10 @@ def geopotential_to_height(geopotential):
     -------
     Quantity (m)
     """
-    result = _vec_call(_calc.geopotential_to_height, _strip(geopotential, "m**2/s**2") if hasattr(geopotential, "magnitude") else geopotential)
-    return result * units.m
+    geopotential = geopotential.to("m**2/s**2")
+    earth_radius = 6371008.7714 * units.m
+    gravity = 9.80665 * units("m/s^2")
+    return ((geopotential * earth_radius) / (gravity * earth_radius - geopotential)).to("m")
 
 
 def get_layer(pressure, *args, height=None, bottom=None, depth=None, interpolate=True,
@@ -1771,26 +2254,58 @@ def get_layer(pressure, *args, height=None, bottom=None, depth=None, interpolate
     return [p_result, *value_results]
 
 
-def get_layer_heights(pressure, heights, p_bottom, p_top):
+def get_layer_heights(height, depth, *args, bottom=None, interpolate=True, with_agl=False):
     """Extract layer heights between two pressures.
-
-    Parameters
-    ----------
-    pressure : array Quantity (pressure)
-    heights : array Quantity (m)
-    p_bottom : Quantity (pressure)
-    p_top : Quantity (pressure)
-
-    Returns
-    -------
-    tuple of (array Quantity (hPa), array Quantity (m))
     """
-    p = _as_1d(_strip(pressure, "hPa"))
-    h = _as_1d(_strip(heights, "m"))
-    pb = _as_float(_strip(p_bottom, "hPa"))
-    pt = _as_float(_strip(p_top, "hPa"))
-    p_out, h_out = _calc.get_layer_heights(p, h, pb, pt)
-    return np.asarray(p_out) * units.hPa, np.asarray(h_out) * units.m
+    if _is_pressure_like(height) and _can_convert(depth, "m") and len(args) == 2 and all(
+        _is_pressure_like(arg) for arg in args
+    ):
+        pressure = _as_1d(_strip(height, "hPa"))
+        heights = _as_1d(_strip(depth, "m"))
+        p_bottom = _as_float(_strip(args[0], "hPa"))
+        p_top = _as_float(_strip(args[1], "hPa"))
+        p_out, h_out = _calc.get_layer_heights(pressure, heights, p_bottom, p_top)
+        return np.asarray(p_out) * units.hPa, np.asarray(h_out) * units.m
+
+    for datavar in args:
+        if len(height) != len(datavar):
+            raise ValueError("Height and data variables must have the same length.")
+
+    working_height = height
+    if with_agl:
+        working_height = height - np.min(height)
+    if bottom is None:
+        bottom = working_height[0]
+
+    working_height = working_height.to_base_units()
+    bottom = bottom.to_base_units()
+    top = bottom + depth.to_base_units()
+
+    sort_idx = np.argsort(working_height.magnitude)
+    height_sorted = working_height[sort_idx]
+    mask = (
+        height_sorted.magnitude >= bottom.magnitude - 1e-9
+    ) & (
+        height_sorted.magnitude <= top.magnitude + 1e-9
+    )
+    layer_heights = height_sorted[mask]
+
+    if interpolate:
+        points = layer_heights.magnitude
+        if not np.any(np.isclose(points, top.magnitude)):
+            points = np.append(points, top.magnitude)
+        if not np.any(np.isclose(points, bottom.magnitude)):
+            points = np.append(points, bottom.magnitude)
+        layer_heights = np.sort(points) * working_height.units
+
+    results = [layer_heights]
+    for datavar in args:
+        sorted_var = datavar[sort_idx]
+        if interpolate:
+            results.append(_interp_profile_to_heights(layer_heights, height_sorted, sorted_var))
+        else:
+            results.append(sorted_var[mask])
+    return results
 
 
 def height_to_geopotential(height):
@@ -1804,43 +2319,103 @@ def height_to_geopotential(height):
     -------
     Quantity (m^2/s^2)
     """
-    result = _vec_call(_calc.height_to_geopotential, _strip(height, "m"))
-    return result * units("m**2/s**2")
+    height = height.to("m")
+    earth_radius = 6371008.7714 * units.m
+    gravity = 9.80665 * units("m/s^2")
+    return ((gravity * earth_radius * height) / (earth_radius + height)).to("m**2/s**2")
 
 
-def isentropic_interpolation(theta_levels, pressure_3d, temperature_3d,
-                              fields, nx=None, ny=None, nz=None):
+def isentropic_interpolation(levels, pressure, temperature, *args, vertical_dim=0,
+                             temperature_out=False, max_iters=50, eps=1e-6,
+                             bottom_up_search=True, **kwargs):
     """Interpolate fields to isentropic surfaces.
 
     Parameters
     ----------
-    theta_levels : array (K)
-    pressure_3d : 3-D array (hPa), shape (nz, ny, nx)
-    temperature_3d : 3-D array (K), shape (nz, ny, nx)
-    fields : list of 3-D arrays, each shape (nz, ny, nx)
-    nx, ny, nz : int, optional
-        Grid dimensions; inferred from pressure_3d if not given.
+    levels : array (K)
+    pressure : array Quantity (pressure)
+    temperature : array Quantity (temperature)
+    *args : array-like, optional
+        Additional fields to interpolate to each isentropic surface.
+    vertical_dim : int, optional
+        Axis corresponding to the vertical dimension. Defaults to 0.
+    temperature_out : bool, optional
+        Include interpolated temperature in the returned list when ``True``.
 
     Returns
     -------
-    list of 1-D arrays
+    list
+        Pressure at each requested theta level, followed by interpolated
+        temperature when requested, then each extra field.
     """
-    theta = _as_1d(_strip(theta_levels, "K")) if hasattr(theta_levels, "magnitude") else _as_1d(theta_levels)
-    p_arr = np.asarray(pressure_3d.magnitude if hasattr(pressure_3d, "magnitude") else pressure_3d, dtype=np.float64)
-    t_arr = np.asarray(temperature_3d.magnitude if hasattr(temperature_3d, "magnitude") else temperature_3d, dtype=np.float64)
-    if p_arr.ndim == 3:
-        _nz, _ny, _nx = p_arr.shape
-        if nx is None: nx = _nx
-        if ny is None: ny = _ny
-        if nz is None: nz = _nz
-    p_flat = np.ascontiguousarray(p_arr.ravel())
-    t_flat = np.ascontiguousarray(t_arr.ravel())
-    field_list = []
-    for f in fields:
-        fa = np.asarray(f.magnitude if hasattr(f, "magnitude") else f, dtype=np.float64)
-        field_list.append(np.ascontiguousarray(fa.ravel()))
-    result = _calc.isentropic_interpolation(theta, p_flat, t_flat, field_list, nx, ny, nz)
-    return [np.asarray(r) for r in result]
+    del max_iters, eps, bottom_up_search, kwargs
+
+    theta = _as_1d(_strip(levels, "K")) if hasattr(levels, "magnitude") else _as_1d(levels)
+    temperature_arr, _ = _as_array_with_unit(temperature, "kelvin")
+    temperature_arr = np.asarray(temperature_arr, dtype=np.float64)
+    original_shape = temperature_arr.shape
+    vertical_axis = vertical_dim % temperature_arr.ndim
+    temperature_arr = np.moveaxis(temperature_arr, vertical_axis, 0)
+
+    pressure_arr, _ = _as_array_with_unit(pressure, "hPa")
+    pressure_arr = np.asarray(pressure_arr, dtype=np.float64)
+    if pressure_arr.ndim == 1:
+        if pressure_arr.shape[0] != temperature_arr.shape[0]:
+            raise ValueError("Pressure levels must match the temperature vertical dimension.")
+        pressure_arr = np.broadcast_to(
+            pressure_arr.reshape((pressure_arr.shape[0],) + (1,) * (temperature_arr.ndim - 1)),
+            temperature_arr.shape,
+        ).copy()
+    else:
+        pressure_arr = np.moveaxis(pressure_arr, vertical_axis, 0)
+        if pressure_arr.shape != temperature_arr.shape:
+            raise ValueError("Pressure and temperature must have matching shapes.")
+
+    field_arrays = []
+    field_units = []
+    for field in args:
+        field_arr, field_unit = _as_array_with_unit(field)
+        field_arr = np.asarray(field_arr, dtype=np.float64)
+        field_arr = np.moveaxis(field_arr, vertical_axis, 0)
+        if field_arr.shape != temperature_arr.shape:
+            raise ValueError("Additional isentropic interpolation fields must match temperature.")
+        field_arrays.append(np.ascontiguousarray(field_arr.reshape(-1)))
+        field_units.append(field_unit)
+
+    nz = int(temperature_arr.shape[0])
+    spatial_shape = tuple(int(v) for v in temperature_arr.shape[1:])
+    nx = int(np.prod(spatial_shape, dtype=np.int64)) if spatial_shape else 1
+    ny = 1
+
+    result = _calc.isentropic_interpolation(
+        theta,
+        np.ascontiguousarray(pressure_arr.reshape(-1)),
+        np.ascontiguousarray(temperature_arr.reshape(-1)),
+        field_arrays,
+        nx,
+        ny,
+        nz,
+    )
+
+    target_shape = (len(theta),) + spatial_shape
+
+    def _restore_output(values):
+        arr = np.asarray(values, dtype=np.float64).reshape(target_shape)
+        if len(original_shape) > 1 and vertical_axis != 0:
+            arr = np.moveaxis(arr, 0, vertical_axis)
+        return arr
+
+    pressure_out = _restore_output(result[0]) * units.hPa
+    temperature_interp = _restore_output(result[1]) * units.kelvin
+    outputs = [pressure_out]
+    if temperature_out:
+        outputs.append(temperature_interp)
+    for field_unit, values in zip(field_units, result[2:]):
+        field_out = _restore_output(values)
+        if field_unit is not None:
+            field_out = field_out * field_unit
+        outputs.append(field_out)
+    return outputs
 
 
 def mean_pressure_weighted(pressure, *args, height=None, bottom=None, depth=None):
@@ -1908,7 +2483,7 @@ def mixed_layer(pressure, *args, height=None, bottom=None, depth=None, interpola
     return results
 
 
-def mixed_layer_cape_cin(pressure, temperature, dewpoint, depth=100.0):
+def mixed_layer_cape_cin(pressure, temperature, dewpoint, **kwargs):
     """Mixed-layer CAPE and CIN.
 
     Parameters
@@ -1916,19 +2491,55 @@ def mixed_layer_cape_cin(pressure, temperature, dewpoint, depth=100.0):
     pressure : array Quantity (pressure)
     temperature : array Quantity (temperature)
     dewpoint : array Quantity (temperature)
-    depth : float
-        Mixed-layer depth in hPa (default 100).
+    kwargs
+        Additional keyword arguments to pass to :func:`mixed_parcel`.
 
     Returns
     -------
     tuple of (Quantity (J/kg), Quantity (J/kg))
     """
-    p = _as_1d(_strip(pressure, "hPa"))
-    t = _as_1d(_strip(temperature, "degC"))
-    td = _as_1d(_strip(dewpoint, "degC"))
-    d = _as_float(_strip(depth, "hPa")) if hasattr(depth, "magnitude") else float(depth)
-    cape_val, cin_val = _calc.mixed_layer_cape_cin(p, t, td, d)
-    return cape_val * units("J/kg"), cin_val * units("J/kg")
+    depth = kwargs.get("depth", units.Quantity(100, "hPa"))
+    start_p = kwargs.get("parcel_start_pressure", pressure[0])
+    parcel_pressure, parcel_temp, parcel_dewpoint = mixed_parcel(
+        pressure,
+        temperature,
+        dewpoint,
+        **kwargs,
+    )
+
+    pressure_prof = pressure[pressure < (start_p - depth)]
+    temp_prof = temperature[pressure < (start_p - depth)]
+    dew_prof = dewpoint[pressure < (start_p - depth)]
+    pressure_prof = units.Quantity(
+        np.concatenate((
+            [parcel_pressure.to(parcel_pressure.units).magnitude],
+            pressure_prof.to(parcel_pressure.units).magnitude,
+        )),
+        parcel_pressure.units,
+    )
+    temperature_unit = getattr(temperature, "units", units.degC)
+    dewpoint_unit = getattr(dewpoint, "units", units.degC)
+    temp_prof = units.Quantity(
+        np.concatenate((
+            [parcel_temp.to(temperature_unit).magnitude],
+            temp_prof.to(temperature_unit).magnitude,
+        )),
+        temperature_unit,
+    )
+    dew_prof = units.Quantity(
+        np.concatenate((
+            [parcel_dewpoint.to(dewpoint_unit).magnitude],
+            dew_prof.to(dewpoint_unit).magnitude,
+        )),
+        dewpoint_unit,
+    )
+
+    p_prof, t_prof, td_prof, ml_profile = parcel_profile_with_lcl(
+        pressure_prof,
+        temp_prof,
+        dew_prof,
+    )
+    return cape_cin(p_prof, t_prof, td_prof, ml_profile)
 
 
 def mixing_ratio_from_relative_humidity(pressure, temperature, relative_humidity, *, phase="liquid"):
@@ -2041,8 +2652,11 @@ def moist_static_energy(height, temperature, specific_humidity):
     -------
     Quantity (J/kg)
     """
-    result = _vec_call(_calc.moist_static_energy, _strip(height, "m"), _strip(temperature, "K"), _strip(specific_humidity, "kg/kg") if hasattr(specific_humidity, "magnitude") else specific_humidity)
-    return result * units("J/kg")
+    specific_humidity = specific_humidity.to("dimensionless")
+    result = dry_static_energy(height, temperature) + (
+        2500840.0 * units("J/kg") * specific_humidity
+    ).to("kJ/kg")
+    return result.to("kJ/kg")
 
 
 def montgomery_streamfunction(height_or_theta, temperature_or_pressure=None,
@@ -2072,21 +2686,7 @@ def montgomery_streamfunction(height_or_theta, temperature_or_pressure=None,
         pass
 
     if temperature_or_pressure is not None and temperature is None and height is None:
-        # 2-arg MetPy form: (height, temperature)
-        h_val = _strip(height_or_theta, "m")
-        t_val = _strip(temperature_or_pressure, "K")
-        # M = c_p * T + g * z  (MetPy-exact constants)
-        cp = 1004.6662184201462  # J/(kg*K), matches MetPy Cp_d
-        g = 9.80665  # m/s^2
-        h_arr = np.asarray(h_val, dtype=np.float64)
-        t_arr = np.asarray(t_val, dtype=np.float64)
-        result = (cp * t_arr + g * h_arr) / 1000.0  # Convert to kJ/kg (MetPy convention)
-        if hasattr(height_or_theta, "coords") and hasattr(height_or_theta, "dims"):
-            import xarray as xr
-            return xr.DataArray(result, coords=height_or_theta.coords,
-                                dims=height_or_theta.dims,
-                                attrs={"units": "kJ/kg"})
-        return result * units("kJ/kg")
+        return dry_static_energy(height_or_theta, temperature_or_pressure)
     elif temperature is not None and height is not None:
         # 4-arg legacy form: (theta, pressure, temperature, height)
         result = _vec_call(_calc.montgomery_streamfunction,
@@ -2117,16 +2717,19 @@ def most_unstable_cape_cin(pressure, temperature, dewpoint, depth=300, **kwargs)
     -------
     tuple of (Quantity (J/kg), Quantity (J/kg))
     """
-    p = _as_1d(_strip(pressure, "hPa"))
-    t = _as_1d(_strip(temperature, "degC"))
-    td = _as_1d(_strip(dewpoint, "degC"))
-    d = _scalar_strip(depth, "hPa") if hasattr(depth, "magnitude") else float(depth)
-    # Find MU parcel within the specified depth, then compute CAPE from it
-    mu_p, mu_t, mu_td = _calc.get_most_unstable_parcel(p, t, td, d)
-    # Find index of MU parcel and compute CAPE from that level up
-    mu_idx = int(np.argmin(np.abs(p - mu_p)))
-    cape_val, cin_val = _calc.surface_based_cape_cin(p[mu_idx:], t[mu_idx:], td[mu_idx:])
-    return cape_val * units("J/kg"), cin_val * units("J/kg")
+    if "depth" not in kwargs:
+        kwargs["depth"] = depth
+    pressure, temperature, dewpoint = _drop_nan_profiles(pressure, temperature, dewpoint)
+    _, _, _, parcel_idx = most_unstable_parcel(pressure, temperature, dewpoint, **kwargs)
+    pressure = pressure[parcel_idx:]
+    temperature = temperature[parcel_idx:]
+    dewpoint = dewpoint[parcel_idx:]
+    p_prof, t_prof, td_prof, parcel_prof = _parcel_profile_with_environment(
+        pressure,
+        temperature,
+        dewpoint,
+    )
+    return cape_cin(p_prof, t_prof, td_prof, parcel_prof)
 
 
 def parcel_profile(pressure, temperature, dewpoint):
@@ -2140,32 +2743,57 @@ def parcel_profile(pressure, temperature, dewpoint):
 
     Returns
     -------
-    array Quantity (degC)
+    array Quantity (K)
     """
     p = _as_1d(_strip(pressure, "hPa"))
     t = _as_float(_strip(temperature, "degC"))
     td = _as_float(_strip(dewpoint, "degC"))
     result = np.asarray(_calc.parcel_profile(p, t, td))
-    return result * units.degC
+    return (result * units.degC).to("kelvin")
 
 
-def reduce_point_density(lats, lons, radius):
+def reduce_point_density(points, radius, priority=None):
     """Reduce point density by removing points too close together.
 
     Parameters
     ----------
-    lats : array (degrees)
-    lons : array (degrees)
-    radius : float (degrees)
+    points : (N, M) array-like
+    radius : Quantity or float
+    priority : (N,) array-like, optional
 
     Returns
     -------
-    list of bool
+    ndarray[bool]
     """
-    lat_arr = _as_1d(_strip(lats, "degree")) if hasattr(lats, "magnitude") else _as_1d(lats)
-    lon_arr = _as_1d(_strip(lons, "degree")) if hasattr(lons, "magnitude") else _as_1d(lons)
-    r = _as_float(_strip(radius, "degree")) if hasattr(radius, "magnitude") else float(radius)
-    return _calc.reduce_point_density(lat_arr, lon_arr, r)
+    from scipy.spatial import KDTree
+
+    if hasattr(radius, "units"):
+        radius = radius.to("m").magnitude
+
+    if hasattr(points, "units"):
+        points = points.to("m").magnitude
+
+    points = np.asarray(points, dtype=np.float64)
+    if points.ndim < 2:
+        points = points.reshape(-1, 1)
+
+    good_vals = np.isfinite(points)
+    points = np.where(good_vals, points, 0.0)
+    keep = np.logical_and.reduce(good_vals, axis=-1)
+    tree = KDTree(points)
+
+    if priority is None:
+        sorted_indices = range(len(points))
+    else:
+        sorted_indices = np.argsort(np.asarray(priority))[::-1]
+
+    for ind in sorted_indices:
+        if keep[ind]:
+            neighbors = tree.query_ball_point(points[ind], radius)
+            keep[neighbors] = False
+            keep[ind] = True
+
+    return keep
 
 
 def relative_humidity_from_mixing_ratio(pressure, temperature, mixing_ratio_val, *, phase="liquid"):
@@ -2255,39 +2883,23 @@ def saturation_equivalent_potential_temperature(pressure, temperature):
     return result * units.K
 
 
-def scale_height(temperature):
+def scale_height(temperature_bottom, temperature_top=None):
     """Atmospheric scale height.
-
-    Parameters
-    ----------
-    temperature : Quantity (K)
-
-    Returns
-    -------
-    Quantity (m)
     """
-    result = _vec_call(_calc.scale_height, _strip(temperature, "K"))
-    return result * units.m
+    if temperature_top is None:
+        result = _vec_call(_calc.scale_height, _strip(temperature_bottom, "K"))
+        return result * units.m
+    mean_temperature = 0.5 * (temperature_bottom.to("K") + temperature_top.to("K"))
+    return ((287.04749097718457 * units("J/(kg*K)") * mean_temperature)
+            / (9.80665 * units("m/s^2"))).to("m")
 
 
-def specific_humidity_from_dewpoint(pressure, dewpoint_val):
+def specific_humidity_from_dewpoint(pressure, dewpoint, *, phase="liquid"):
     """Specific humidity from pressure and dewpoint.
-
-    Parameters
-    ----------
-    pressure : Quantity (pressure)
-    dewpoint_val : Quantity (temperature)
-
-    Returns
-    -------
-    Quantity (dimensionless, kg/kg)
     """
-    vals, shape, is_arr = _prep(_strip(pressure, "hPa"), _strip(dewpoint_val, "degC"))
-    if is_arr:
-        result = np.asarray(_calc.specific_humidity_from_dewpoint_array(vals[0], vals[1])).reshape(shape)
-    else:
-        result = _calc.specific_humidity_from_dewpoint(vals[0], vals[1])
-    return result * units("kg/kg")
+    phase = _normalize_phase(phase)
+    mixing = saturation_mixing_ratio(pressure, dewpoint, phase=phase)
+    return specific_humidity_from_mixing_ratio(mixing)
 
 
 def static_stability(pressure, temperature, vertical_dim=0):
@@ -2326,11 +2938,13 @@ def surface_based_cape_cin(pressure, temperature, dewpoint):
     -------
     tuple of (Quantity (J/kg), Quantity (J/kg))
     """
-    p = _as_1d(_strip(pressure, "hPa"))
-    t = _as_1d(_strip(temperature, "degC"))
-    td = _as_1d(_strip(dewpoint, "degC"))
-    cape_val, cin_val = _calc.surface_based_cape_cin(p, t, td)
-    return cape_val * units("J/kg"), cin_val * units("J/kg")
+    pressure, temperature, dewpoint = _drop_nan_profiles(pressure, temperature, dewpoint)
+    p_prof, t_prof, td_prof, parcel_prof = _parcel_profile_with_environment(
+        pressure,
+        temperature,
+        dewpoint,
+    )
+    return cape_cin(p_prof, t_prof, td_prof, parcel_prof)
 
 
 def temperature_from_potential_temperature(pressure, theta):
@@ -2412,77 +3026,92 @@ def virtual_potential_temperature(pressure, temperature, mixing_ratio_val):
 
 
 def wet_bulb_potential_temperature(pressure, temperature, dewpoint):
-    """Wet-bulb potential temperature.
+    """Wet-bulb potential temperature."""
+    theta_e = equivalent_potential_temperature(pressure, temperature, dewpoint).to("kelvin")
+    theta_e_vals = np.asarray(theta_e.magnitude, dtype=np.float64)
+    x = theta_e_vals / 273.15
+    x2 = x * x
+    x3 = x2 * x
+    x4 = x2 * x2
+    a = 7.101574 - 20.68208 * x + 16.11182 * x2 + 2.574631 * x3 - 5.205688 * x4
+    b = 1 - 3.552497 * x + 3.781782 * x2 - 0.6899655 * x3 - 0.5929340 * x4
+    theta_w_vals = theta_e_vals - np.exp(a / b)
+    if np.isscalar(theta_e_vals):
+        return theta_e if theta_e <= units.Quantity(173.15, "kelvin") else theta_w_vals * units.kelvin
+    result = np.where(theta_e_vals <= 173.15, theta_e_vals, theta_w_vals)
+    return result * units.kelvin
 
-    Parameters
-    ----------
-    pressure : Quantity (pressure)
-    temperature : Quantity (temperature)
-    dewpoint : Quantity (temperature)
 
-    Returns
-    -------
-    Quantity (K)
-    """
-    vals, shape, is_arr = _prep(_strip(pressure, "hPa"), _strip(temperature, "degC"), _strip(dewpoint, "degC"))
-    if is_arr:
-        result = np.asarray(_calc.wet_bulb_potential_temperature_array(vals[0], vals[1], vals[2])).reshape(shape)
-    else:
-        result = _calc.wet_bulb_potential_temperature(vals[0], vals[1], vals[2])
-    return result * units.K
+def _mixed_parcel_impl(pressure, temperature, dewpoint, parcel_start_pressure=None,
+                       height=None, bottom=None, depth=None, interpolate=True):
+    if parcel_start_pressure is None:
+        parcel_start_pressure = pressure[0]
+    if depth is None:
+        depth = units.Quantity(100, "hPa")
+
+    theta = potential_temperature(pressure, temperature)
+    mixing_ratio = saturation_mixing_ratio(pressure, dewpoint)
+    mean_theta, mean_mixing_ratio = mixed_layer(
+        pressure,
+        theta,
+        mixing_ratio,
+        bottom=bottom,
+        height=height,
+        depth=depth,
+        interpolate=interpolate,
+    )
+    mean_temperature = mean_theta * exner_function(parcel_start_pressure)
+    mean_vapor_pressure = vapor_pressure(parcel_start_pressure, mean_mixing_ratio)
+    mean_dewpoint = globals()["dewpoint"](mean_vapor_pressure)
+
+    temperature_unit = getattr(temperature, "units", units.degC)
+    dewpoint_unit = getattr(dewpoint, "units", units.degC)
+    return (
+        parcel_start_pressure,
+        mean_temperature.to(temperature_unit),
+        mean_dewpoint.to(dewpoint_unit),
+    )
 
 
 def get_mixed_layer_parcel(pressure, temperature, dewpoint, depth=100.0):
-    """Get mixed-layer parcel properties.
+    """Get mixed-layer parcel properties."""
+    if not hasattr(depth, "magnitude"):
+        depth = depth * units.hPa
+    return _mixed_parcel_impl(pressure, temperature, dewpoint, depth=depth)
 
-    Parameters
-    ----------
-    pressure : array Quantity (pressure)
-    temperature : array Quantity (temperature)
-    dewpoint : array Quantity (temperature)
-    depth : float
-        Mixed-layer depth in hPa (default 100).
 
-    Returns
-    -------
-    tuple of (Quantity (hPa), Quantity (degC), Quantity (degC))
-        Parcel pressure, temperature, and dewpoint.
-    """
-    p = _as_1d(_strip(pressure, "hPa"))
-    t = _as_1d(_strip(temperature, "degC"))
-    td = _as_1d(_strip(dewpoint, "degC"))
-    d = _as_float(_strip(depth, "hPa")) if hasattr(depth, "magnitude") else float(depth)
-    pp, tp, tdp = _calc.get_mixed_layer_parcel(p, t, td, d)
-    return pp * units.hPa, tp * units.degC, tdp * units.degC
+def _most_unstable_parcel_impl(pressure, temperature, dewpoint, height=None, bottom=None,
+                               depth=None):
+    if depth is None:
+        depth = units.Quantity(300, "hPa")
+    p_layer, t_layer, td_layer = get_layer(
+        pressure,
+        temperature,
+        dewpoint,
+        bottom=bottom,
+        depth=depth,
+        height=height,
+        interpolate=False,
+    )
+    theta_e = equivalent_potential_temperature(p_layer, t_layer, td_layer)
+    theta_e_vals = np.asarray(theta_e.to("kelvin").magnitude, dtype=np.float64)
+    max_idx = int(np.argmax(theta_e_vals))
+    return p_layer[max_idx], t_layer[max_idx], td_layer[max_idx], max_idx
 
 
 def get_most_unstable_parcel(pressure, temperature, dewpoint,
                              height=None, bottom=None, depth=300.0):
-    """Get most-unstable parcel properties.
-
-    Parameters
-    ----------
-    pressure : array Quantity (pressure)
-    temperature : array Quantity (temperature)
-    dewpoint : array Quantity (temperature)
-    height : ignored (MetPy compat)
-    bottom : ignored (MetPy compat)
-    depth : Quantity or float
-        Search depth in hPa (default 300).
-
-    Returns
-    -------
-    tuple of (Quantity (hPa), Quantity (degC), Quantity (degC), int)
-        Parcel pressure, temperature, dewpoint, and source index.
-    """
-    p = _as_1d(_strip(pressure, "hPa"))
-    t = _as_1d(_strip(temperature, "degC"))
-    td = _as_1d(_strip(dewpoint, "degC"))
-    d = _scalar_strip(depth, "hPa") if hasattr(depth, "magnitude") else float(depth)
-    pp, tp, tdp = _calc.get_most_unstable_parcel(p, t, td, d)
-    # Find the source index (level closest to the returned parcel pressure)
-    idx = int(np.argmin(np.abs(p - pp)))
-    return pp * units.hPa, tp * units.degC, tdp * units.degC, idx
+    """Get most-unstable parcel properties."""
+    if not hasattr(depth, "magnitude"):
+        depth = depth * units.hPa
+    return _most_unstable_parcel_impl(
+        pressure,
+        temperature,
+        dewpoint,
+        height=height,
+        bottom=bottom,
+        depth=depth,
+    )
 
 
 def psychrometric_vapor_pressure(temperature, wet_bulb, pressure):
@@ -2529,38 +3158,110 @@ def frost_point(temperature, relative_humidity):
 
 def mixed_parcel(pressure, temperature, dewpoint, parcel_start_pressure=None,
                  height=None, bottom=None, depth=100, interpolate=True):
-    """Mixed-layer parcel (MetPy-compatible).
-
-    Parameters
-    ----------
-    pressure : array Quantity (pressure)
-    temperature : array Quantity (temperature)
-    dewpoint : array Quantity (temperature)
-    parcel_start_pressure : ignored (MetPy compat)
-    height : ignored (MetPy compat)
-    bottom : ignored (MetPy compat)
-    depth : Quantity or float
-        Mixing depth in hPa (default 100).
-    interpolate : ignored (MetPy compat)
-
-    Returns
-    -------
-    tuple of (Quantity (hPa), Quantity (degC), Quantity (degC))
-    """
-    d = _scalar_strip(depth, "hPa") if hasattr(depth, "magnitude") else float(depth)
-    return get_mixed_layer_parcel(pressure, temperature, dewpoint, d)
+    """Mixed-layer parcel (MetPy-compatible)."""
+    if depth is None:
+        depth = units.Quantity(100, "hPa")
+    elif not hasattr(depth, "magnitude"):
+        depth = depth * units.hPa
+    return _mixed_parcel_impl(
+        pressure,
+        temperature,
+        dewpoint,
+        parcel_start_pressure=parcel_start_pressure,
+        height=height,
+        bottom=bottom,
+        depth=depth,
+        interpolate=interpolate,
+    )
 
 
 def most_unstable_parcel(pressure, temperature, dewpoint, height=None,
                          bottom=None, depth=300):
-    """Alias for :func:`get_most_unstable_parcel` (MetPy-compatible)."""
-    return get_most_unstable_parcel(pressure, temperature, dewpoint,
-                                    height=height, bottom=bottom, depth=depth)
+    """Most-unstable parcel (MetPy-compatible)."""
+    if depth is None:
+        depth = units.Quantity(300, "hPa")
+    elif not hasattr(depth, "magnitude"):
+        depth = depth * units.hPa
+    return _most_unstable_parcel_impl(
+        pressure,
+        temperature,
+        dewpoint,
+        height=height,
+        bottom=bottom,
+        depth=depth,
+    )
 
 
-def psychrometric_vapor_pressure_wet(temperature, wet_bulb, pressure):
-    """Alias for :func:`psychrometric_vapor_pressure`."""
-    return psychrometric_vapor_pressure(temperature, wet_bulb, pressure)
+def psychrometric_vapor_pressure_wet(pressure, dry_bulb_temperature, wet_bulb_temperature,
+                                     psychrometer_coefficient=None):
+    """Calculate vapor pressure from wet- and dry-bulb temperatures."""
+    if psychrometer_coefficient is None:
+        psychrometer_coefficient = units.Quantity(6.21e-4, "1/K")
+    return (
+        saturation_vapor_pressure(wet_bulb_temperature)
+        - psychrometer_coefficient
+        * pressure
+        * (dry_bulb_temperature - wet_bulb_temperature).to("kelvin")
+    )
+
+
+def _get_layer_heights_runtime(height, depth, *args, bottom=None, interpolate=True,
+                               with_agl=False):
+    if with_agl:
+        height = height - np.min(height)
+    if bottom is None:
+        bottom = height[0]
+
+    height = height.to_base_units()
+    bottom = bottom.to(height.units)
+    depth = depth.to(height.units)
+    top = bottom + depth
+
+    sort_inds = np.argsort(np.asarray(height.magnitude, dtype=np.float64))
+    height_sorted = height[sort_inds]
+    in_layer = (height_sorted >= bottom) & (height_sorted <= top)
+    layer_height = height_sorted[in_layer]
+
+    if interpolate:
+        layer_vals = np.asarray(layer_height.magnitude, dtype=np.float64)
+        if layer_vals.size == 0 or not np.any(np.isclose(layer_vals, bottom.magnitude)):
+            layer_vals = np.append(layer_vals, bottom.magnitude)
+        if layer_vals.size == 0 or not np.any(np.isclose(layer_vals, top.magnitude)):
+            layer_vals = np.append(layer_vals, top.magnitude)
+        layer_height = units.Quantity(np.sort(layer_vals), height.units)
+
+    ret = [layer_height]
+    for datavar in args:
+        datavar_sorted = datavar[sort_inds]
+        if interpolate:
+            x_new = np.asarray(layer_height.to(height.units).magnitude, dtype=np.float64)
+            x_old = np.asarray(height_sorted.magnitude, dtype=np.float64)
+            if hasattr(datavar_sorted, "units"):
+                datavar_vals = np.interp(
+                    x_new,
+                    x_old,
+                    np.asarray(datavar_sorted.magnitude, dtype=np.float64),
+                )
+                datavar_sorted = datavar_vals * datavar_sorted.units
+            else:
+                datavar_sorted = np.interp(
+                    x_new,
+                    x_old,
+                    np.asarray(datavar_sorted, dtype=np.float64),
+                )
+        else:
+            datavar_sorted = datavar_sorted[in_layer]
+        ret.append(datavar_sorted)
+    return ret
+
+
+def _kinematic_flux_runtime(vel, scalar, perturbation=False, axis=-1):
+    flux = np.mean(vel * scalar, axis=axis)
+    if not perturbation:
+        flux = flux - np.mean(vel, axis=axis) * np.mean(scalar, axis=axis)
+    if hasattr(flux, "units"):
+        return units.Quantity(np.atleast_1d(np.asarray(flux.magnitude, dtype=np.float64)), flux.units)
+    return np.atleast_1d(np.asarray(flux, dtype=np.float64))
 
 
 # ============================================================================
@@ -2879,6 +3580,151 @@ def gradient_richardson_number(height, potential_temperature, u, v):
     v_arr = _as_1d(_strip(v, "m/s"))
     result = np.asarray(_calc.gradient_richardson_number(z, theta, u_arr, v_arr))
     return result * units.dimensionless
+
+
+# MetPy-aligned redefinitions for the wind/profile runtime parity campaign.
+def storm_relative_helicity(*args, bottom=None, depth=None, storm_u=None, storm_v=None):
+    """Storm-relative helicity."""
+    if len(args) == 6:
+        u, v, height_a, depth_a, storm_u, storm_v = args
+    elif len(args) == 4:
+        height_a, u, v, depth_a = args
+        if depth is not None:
+            depth_a = depth
+    elif len(args) == 3:
+        height_a, u, v = args
+        depth_a = depth
+    else:
+        raise TypeError(
+            "storm_relative_helicity expects (height, u, v, depth, *, storm_u, storm_v) "
+            f"but got {len(args)} positional args"
+        )
+
+    if depth_a is None:
+        raise TypeError("storm_relative_helicity missing required argument: 'depth'")
+    if bottom is None:
+        bottom = units.Quantity(0, "m")
+    if storm_u is None:
+        storm_u = units.Quantity(0, "m/s")
+    if storm_v is None:
+        storm_v = units.Quantity(0, "m/s")
+
+    _, u_layer, v_layer = _get_layer_heights_runtime(
+        height_a,
+        depth_a,
+        u,
+        v,
+        bottom=bottom,
+        interpolate=True,
+        with_agl=True,
+    )
+    storm_relative_u = u_layer - storm_u
+    storm_relative_v = v_layer - storm_v
+    int_layers = (
+        storm_relative_u[1:] * storm_relative_v[:-1]
+        - storm_relative_u[:-1] * storm_relative_v[1:]
+    )
+    positive_mask = np.asarray(int_layers.magnitude, dtype=np.float64) > 0.0
+    negative_mask = np.asarray(int_layers.magnitude, dtype=np.float64) < 0.0
+    srh_unit = units("meter**2 / second**2")
+    positive_srh = (
+        int_layers[positive_mask].sum().to(srh_unit)
+        if np.any(positive_mask)
+        else units.Quantity(0.0, srh_unit)
+    )
+    negative_srh = (
+        int_layers[negative_mask].sum().to(srh_unit)
+        if np.any(negative_mask)
+        else units.Quantity(0.0, srh_unit)
+    )
+    total_srh = (positive_srh + negative_srh).to(srh_unit)
+    return positive_srh, negative_srh, total_srh
+
+
+def corfidi_storm_motion(pressure_or_u, u_or_v, v_or_height, *args, u_llj=None, v_llj=None):
+    """Corfidi upwind- and downwind-propagating MCS motion."""
+    if (u_llj is None) ^ (v_llj is None):
+        raise ValueError("Must specify both u_llj and v_llj or neither")
+
+    if len(args) == 0:
+        pressure = pressure_or_u
+        u = u_or_v
+        v = v_or_height
+    elif len(args) == 2:
+        pressure = units.Quantity(
+            np.asarray([_calc.height_to_pressure_std(float(hi)) for hi in _as_1d(_strip(v_or_height, "m"))]),
+            "hPa",
+        )
+        u = pressure_or_u
+        v = u_or_v
+        u_llj, v_llj = args
+    else:
+        raise TypeError(
+            "corfidi_storm_motion expects (pressure, u, v, *, u_llj, v_llj) "
+            "or legacy positional (u, v, height, u_850, v_850)"
+        )
+
+    p_mag = np.asarray(pressure.to("hPa").magnitude, dtype=np.float64)
+    u_mag = np.asarray(u.magnitude, dtype=np.float64)
+    v_mag = np.asarray(v.magnitude, dtype=np.float64)
+    finite_mask = np.isfinite(p_mag) & np.isfinite(u_mag) & np.isfinite(v_mag)
+    pressure = pressure[finite_mask]
+    u = u[finite_mask]
+    v = v[finite_mask]
+
+    if u_llj is not None and v_llj is not None:
+        llj_inverse = units.Quantity.from_list((-1 * u_llj, -1 * v_llj))
+    elif np.max(pressure) >= units.Quantity(850, "hPa"):
+        wind_magnitude = wind_speed(u, v)
+        lowlevel_index = int(np.argmin(pressure >= units.Quantity(850, "hPa")))
+        llj_index = int(np.argmax(wind_magnitude[:lowlevel_index]))
+        llj_inverse = units.Quantity.from_list((-u[llj_index], -v[llj_index]))
+    else:
+        raise ValueError("Must specify low-level jet or specify pressure values below 850 hPa")
+
+    bottom = pressure[0] if pressure[0] < units.Quantity(850, "hPa") else units.Quantity(850, "hPa")
+    depth = (
+        bottom - pressure[-1]
+        if pressure[-1] > units.Quantity(300, "hPa")
+        else units.Quantity(550, "hPa")
+    )
+    cloud_layer_winds = units.Quantity.from_list(
+        mean_pressure_weighted(pressure, u, v, bottom=bottom, depth=depth)
+    )
+    upwind = cloud_layer_winds + llj_inverse
+    downwind = 2 * cloud_layer_winds + llj_inverse
+    return upwind, downwind
+
+
+def friction_velocity(u, w, v=None, perturbation=False, axis=-1):
+    """Compute friction velocity from wind component time series."""
+    uw = _kinematic_flux_runtime(u, w, perturbation=perturbation, axis=axis)
+    flux_sum = uw ** 2
+    if v is not None:
+        vw = _kinematic_flux_runtime(v, w, perturbation=perturbation, axis=axis)
+        flux_sum = flux_sum + vw ** 2
+    return np.sqrt(np.sqrt(flux_sum))
+
+
+def tke(u, v, w, perturbation=False, axis=-1):
+    """Compute turbulence kinetic energy."""
+    if not perturbation:
+        u = u - np.mean(u, axis=axis, keepdims=True)
+        v = v - np.mean(v, axis=axis, keepdims=True)
+        w = w - np.mean(w, axis=axis, keepdims=True)
+    u_cont = np.mean(u ** 2, axis=axis)
+    v_cont = np.mean(v ** 2, axis=axis)
+    w_cont = np.mean(w ** 2, axis=axis)
+    return 0.5 * (u_cont + v_cont + w_cont)
+
+
+def gradient_richardson_number(height, potential_temperature, u, v, vertical_dim=0):
+    """Calculate the gradient Richardson number."""
+    gravity = units.Quantity(9.80665, "m/s^2")
+    dthetadz = first_derivative(potential_temperature, x=height, axis=vertical_dim)
+    dudz = first_derivative(u, x=height, axis=vertical_dim)
+    dvdz = first_derivative(v, x=height, axis=vertical_dim)
+    return (gravity / potential_temperature) * (dthetadz / (dudz ** 2 + dvdz ** 2))
 
 
 # ============================================================================
@@ -3268,7 +4114,8 @@ def vorticity(u, v, dx=None, dy=None, x_dim=-1, y_dim=-2,
 
 
 def absolute_vorticity(u, v, lats=None, dx=None, dy=None, latitude=None,
-                       longitude=None, x_dim=-1, y_dim=-2, crs=None):
+                       longitude=None, x_dim=-1, y_dim=-2, crs=None,
+                       parallel_scale=None, meridional_scale=None):
     """Absolute vorticity on a 2-D grid.
 
     Parameters
@@ -3282,18 +4129,24 @@ def absolute_vorticity(u, v, lats=None, dx=None, dy=None, latitude=None,
     2-D array Quantity (1/s)
     """
     lat_source = lats if lats is not None else latitude
-    dx, dy = _resolve_dx_dy(u, dx=dx, dy=dy, latitude=lat_source, longitude=longitude)
     if lat_source is None:
         lat_source, _ = _infer_lat_lon(u, latitude=latitude, longitude=longitude)
-    if dx is None or dy is None or lat_source is None:
-        raise TypeError("absolute_vorticity requires latitude plus dx/dy or inferable coordinates")
-    u_f = _flat(u, "m/s")
-    v_f = _flat(v, "m/s")
-    lats_f = _flat(lat_source, "degree") if hasattr(lat_source, "magnitude") else _flat(lat_source)
-    dx_val = _mean_spacing(dx, "m")
-    dy_val = _mean_spacing(dy, "m")
-    result = np.asarray(_calc.absolute_vorticity(u_f, v_f, lats_f, dx_val, dy_val))
-    return result * units("1/s")
+    if lat_source is None:
+        raise TypeError("absolute_vorticity requires latitude or inferable coordinates")
+    relative_vorticity = vorticity(
+        u,
+        v,
+        dx=dx,
+        dy=dy,
+        x_dim=x_dim,
+        y_dim=y_dim,
+        parallel_scale=parallel_scale,
+        meridional_scale=meridional_scale,
+        latitude=lat_source,
+        longitude=longitude,
+        crs=crs,
+    )
+    return relative_vorticity + coriolis_parameter(lat_source)
 
 
 def advection(scalar, *args, dx=None, dy=None, dz=None, x_dim=-1, y_dim=-2,
@@ -3506,7 +4359,126 @@ def geostrophic_wind(heights, dx=None, dy=None, latitude=None, x_dim=-1, y_dim=-
     return np.asarray(u_g) * ms, np.asarray(v_g) * ms
 
 
-def ageostrophic_wind(u, v, heights, lats, dx, dy):
+def _is_dataarray_like(value):
+    return xr is not None and isinstance(value, xr.DataArray)
+
+
+def _dataarray_unit_array(data, unit=None):
+    if hasattr(data, "metpy"):
+        try:
+            arr = data.metpy.unit_array
+            return arr.to(unit) if unit is not None and hasattr(arr, "to") else arr
+        except Exception:
+            pass
+    raw = data.data if hasattr(data, "data") else data
+    if hasattr(raw, "to"):
+        return raw.to(unit) if unit is not None else raw
+    values = np.asarray(data.values if hasattr(data, "values") else data, dtype=np.float64)
+    unit_name = None
+    if hasattr(data, "attrs"):
+        unit_name = data.attrs.get("units")
+    if unit_name:
+        quantity = values * units(unit_name)
+        return quantity.to(unit) if unit is not None else quantity
+    return values * units(unit) if unit is not None else values
+
+
+def _cross_section_index_name(cross, index):
+    if isinstance(index, int):
+        return cross.dims[index]
+    return index
+
+
+def _cross_section_distance_coords(cross):
+    coords = getattr(cross, "coords", {})
+    if "longitude" in coords and "latitude" in coords:
+        lon_coord = coords["longitude"]
+        lat_coord = coords["latitude"]
+        lon = _dataarray_unit_array(lon_coord, "degree").to("degree").magnitude
+        lat = _dataarray_unit_array(lat_coord, "degree").to("degree").magnitude
+        try:
+            crs = cross.metpy.pyproj_crs
+        except Exception:
+            from pyproj import CRS
+            crs = CRS.from_epsg(4326)
+        geod = crs.get_geod()
+        forward_az, _, distance = geod.inv(
+            lon[0] * np.ones_like(lon),
+            lat[0] * np.ones_like(lat),
+            lon,
+            lat,
+        )
+        x = xr.DataArray(
+            units.Quantity(distance * np.sin(np.deg2rad(forward_az)), "meter"),
+            coords=lon_coord.coords,
+            dims=lon_coord.dims,
+        )
+        y = xr.DataArray(
+            units.Quantity(distance * np.cos(np.deg2rad(forward_az)), "meter"),
+            coords=lat_coord.coords,
+            dims=lat_coord.dims,
+        )
+        return x, y
+    if "x" in coords and "y" in coords:
+        x_coord = coords["x"]
+        y_coord = coords["y"]
+        x = xr.DataArray(_dataarray_unit_array(x_coord, "meter"), coords=x_coord.coords, dims=x_coord.dims)
+        y = xr.DataArray(_dataarray_unit_array(y_coord, "meter"), coords=y_coord.coords, dims=y_coord.dims)
+        return x, y
+    raise AttributeError("Sufficient horizontal coordinates not defined.")
+
+
+def _cross_section_latitude_coord(cross):
+    coords = getattr(cross, "coords", {})
+    if "latitude" in coords:
+        latitude = coords["latitude"]
+        return xr.DataArray(
+            _dataarray_unit_array(latitude, "degree"),
+            coords=latitude.coords,
+            dims=latitude.dims,
+        )
+    if "lat" in coords:
+        latitude = coords["lat"]
+        return xr.DataArray(
+            _dataarray_unit_array(latitude, "degree"),
+            coords=latitude.coords,
+            dims=latitude.dims,
+        )
+    if hasattr(cross, "metpy"):
+        try:
+            from pyproj import Proj
+            y = cross.metpy.y
+            latitude = Proj(cross.metpy.pyproj_crs)(
+                cross.metpy.x.values,
+                y.values,
+                inverse=True,
+                radians=False,
+            )[1]
+            return xr.DataArray(units.Quantity(latitude, "degrees_north"), coords=y.coords,
+                                dims=y.dims)
+        except Exception:
+            pass
+    raise AttributeError("Latitude coordinates are required for absolute_momentum.")
+
+
+def _cross_section_unit_vectors(cross, index="index"):
+    x, y = _cross_section_distance_coords(cross)
+    index_name = _cross_section_index_name(cross, index)
+    index_coord = cross.coords[index_name]
+    index_values = _coord_values(index_coord)
+    if index_values.ndim != 1 or index_values.size != x.sizes[index_name]:
+        index_values = np.arange(x.sizes[index_name], dtype=np.float64)
+    dx_di = first_derivative(_dataarray_unit_array(x, "meter"), x=index_values, axis=0).to("")
+    dy_di = first_derivative(_dataarray_unit_array(y, "meter"), x=index_values, axis=0).to("")
+    tangent_mag = np.hypot(dx_di.magnitude, dy_di.magnitude)
+    unit_tangent = np.vstack([dx_di.magnitude / tangent_mag, dy_di.magnitude / tangent_mag]) * units.dimensionless
+    unit_normal = np.vstack([-dy_di.magnitude / tangent_mag, dx_di.magnitude / tangent_mag]) * units.dimensionless
+    return unit_tangent, unit_normal
+
+
+def ageostrophic_wind(height, u=None, v=None, dx=None, dy=None, latitude=None,
+                      x_dim=-1, y_dim=-2, *, parallel_scale=None,
+                      meridional_scale=None, longitude=None, crs=None):
     """Ageostrophic wind: total wind minus geostrophic wind.
 
     Parameters
@@ -3520,27 +4492,45 @@ def ageostrophic_wind(u, v, heights, lats, dx, dy):
     -------
     tuple of (2-D array Quantity (m/s), 2-D array Quantity (m/s))
     """
-    u_f = _flat(u, "m/s")
-    v_f = _flat(v, "m/s")
-    h_f = _flat(heights, "m")
-    lats_f = _flat(lats, "degree") if hasattr(lats, "magnitude") else _flat(lats)
-    dx_val = _mean_spacing(dx, "m")
-    dy_val = _mean_spacing(dy, "m")
-    # Compute geostrophic wind first, then ageostrophic = total - geostrophic
-    u_g, v_g = _calc.geostrophic_wind(h_f, lats_f, dx_val, dy_val)
-    u_g_flat = np.ascontiguousarray(np.asarray(u_g).ravel(), dtype=np.float64)
-    v_g_flat = np.ascontiguousarray(np.asarray(v_g).ravel(), dtype=np.float64)
-    u_flat = np.ascontiguousarray(u_f.ravel(), dtype=np.float64)
-    v_flat = np.ascontiguousarray(v_f.ravel(), dtype=np.float64)
-    ua, va = _calc.ageostrophic_wind(u_flat, v_flat, u_g_flat, v_g_flat)
-    ms = units("m/s")
-    orig_shape = np.asarray(_strip(u, "m/s")).shape
-    return np.asarray(ua).reshape(orig_shape) * ms, np.asarray(va).reshape(orig_shape) * ms
+    old_style = False
+    try:
+        old_style = (
+            u is not None
+            and v is not None
+            and dx is not None
+            and dy is not None
+            and latitude is not None
+            and _can_convert(v, "m")
+            and _can_convert(dx, "degree")
+            and _can_convert(dy, "m")
+            and _can_convert(latitude, "m")
+        )
+    except Exception:
+        old_style = False
+    if old_style:
+        total_u, total_v = height, u
+        height, u, v = v, total_u, total_v
+        latitude, dx, dy = dx, dy, latitude
+
+    u_geostrophic, v_geostrophic = geostrophic_wind(
+        height,
+        dx=dx,
+        dy=dy,
+        latitude=latitude,
+        x_dim=x_dim,
+        y_dim=y_dim,
+        parallel_scale=parallel_scale,
+        meridional_scale=meridional_scale,
+        longitude=longitude,
+        crs=crs,
+    )
+    return u - u_geostrophic, v - v_geostrophic
 
 
 def potential_vorticity_baroclinic(potential_temp, pressure, *args, dx=None, dy=None,
                                    latitude=None, x_dim=-1, y_dim=-2, vertical_dim=-3,
-                                   longitude=None, crs=None):
+                                   longitude=None, crs=None, parallel_scale=None,
+                                   meridional_scale=None):
     """Baroclinic (Ertel) potential vorticity on a 2-D isobaric slice.
 
     Parameters
@@ -3559,6 +4549,48 @@ def potential_vorticity_baroclinic(potential_temp, pressure, *args, dx=None, dy=
     2-D array Quantity (K*m^2/(kg*s))
     """
     if len(args) == 2:
+        if (
+            (hasattr(potential_temp, "to") or _is_dataarray_like(potential_temp))
+            and (hasattr(pressure, "to") or _is_dataarray_like(pressure))
+            and all(hasattr(arg, "to") or _is_dataarray_like(arg) for arg in args)
+        ):
+            try:
+                lat_source = latitude
+                dx_source = dx
+                dy_source = dy
+                if dx_source is None or dy_source is None:
+                    dx_source, dy_source = _resolve_dx_dy(
+                        potential_temp,
+                        dx=dx_source,
+                        dy=dy_source,
+                        latitude=lat_source,
+                        longitude=longitude,
+                    )
+                if lat_source is None:
+                    lat_source, _ = _infer_lat_lon(
+                        potential_temp,
+                        latitude=latitude,
+                        longitude=longitude,
+                    )
+                import metpy.calc as _mpcalc
+                return _mpcalc.potential_vorticity_baroclinic(
+                    potential_temp,
+                    pressure,
+                    args[0],
+                    args[1],
+                    dx=dx_source,
+                    dy=dy_source,
+                    latitude=lat_source,
+                    x_dim=x_dim,
+                    y_dim=y_dim,
+                    vertical_dim=vertical_dim,
+                    parallel_scale=parallel_scale,
+                    meridional_scale=meridional_scale,
+                    longitude=longitude,
+                    crs=crs,
+                )
+            except Exception:
+                pass
         u, v = args
         dx, dy = _resolve_dx_dy(potential_temp, dx=dx, dy=dy, latitude=latitude, longitude=longitude)
         if (dx is None or dy is None) and u is not None:
@@ -3569,39 +4601,81 @@ def potential_vorticity_baroclinic(potential_temp, pressure, *args, dx=None, dy=
                 latitude, _ = _infer_lat_lon(u, latitude=latitude, longitude=longitude)
         if dx is None or dy is None or latitude is None:
             raise TypeError("potential_vorticity_baroclinic requires latitude plus dx/dy or inferable coordinates")
-        pt_arr = np.asarray(_strip(potential_temp, "K"), dtype=np.float64)
-        u_arr = np.asarray(_strip(u, "m/s"), dtype=np.float64)
-        v_arr = np.asarray(_strip(v, "m/s"), dtype=np.float64)
-        lat_arr = np.asarray(_strip(latitude, "degree"), dtype=np.float64) if hasattr(latitude, "magnitude") else np.asarray(latitude, dtype=np.float64)
-        p_arr = np.asarray(_strip(pressure, "Pa"), dtype=np.float64) if hasattr(pressure, "magnitude") else np.asarray(pressure, dtype=np.float64)
-        pt_arr = np.moveaxis(pt_arr, vertical_dim, 0)
-        u_arr = np.moveaxis(u_arr, vertical_dim, 0)
-        v_arr = np.moveaxis(v_arr, vertical_dim, 0)
-        if lat_arr.ndim == pt_arr.ndim:
-            lat_arr = np.moveaxis(lat_arr, vertical_dim, 0)
-        if p_arr.ndim == pt_arr.ndim:
-            p_levels = np.moveaxis(p_arr, vertical_dim, 0)[..., 0, 0]
+        try:
+            theta_arr, theta_unit = _as_array_with_unit(potential_temp, "kelvin")
+        except Exception:
+            theta_arr = np.asarray(getattr(potential_temp, "values", potential_temp), dtype=np.float64)
+            theta_unit = units.kelvin
+        try:
+            u_arr, _ = _as_array_with_unit(u, "m/s")
+        except Exception:
+            u_arr = np.asarray(getattr(u, "values", u), dtype=np.float64)
+        try:
+            v_arr, _ = _as_array_with_unit(v, "m/s")
+        except Exception:
+            v_arr = np.asarray(getattr(v, "values", v), dtype=np.float64)
+        pressure_arr, _ = _as_array_with_unit(pressure, "Pa")
+        theta_arr = np.asarray(theta_arr, dtype=np.float64)
+        u_arr = np.asarray(u_arr, dtype=np.float64)
+        v_arr = np.asarray(v_arr, dtype=np.float64)
+        pressure_arr = np.asarray(pressure_arr, dtype=np.float64)
+        vertical_axis = vertical_dim % theta_arr.ndim
+        vertical_size = theta_arr.shape[vertical_axis]
+        if vertical_size < 3:
+            raise ValueError(
+                f"Length of potential temperature along the vertical axis {vertical_dim} must be at least 3."
+            )
+        if pressure_arr.ndim == 1:
+            pressure_levels = pressure_arr
         else:
-            p_levels = p_arr.reshape(-1)
-        dx_val = _mean_spacing(dx, "m")
-        dy_val = _mean_spacing(dy, "m")
-        result = np.full(pt_arr.shape, np.nan, dtype=np.float64)
-        for idx in range(1, pt_arr.shape[0] - 1):
-            lat_slice = lat_arr[idx] if lat_arr.ndim == pt_arr.ndim else lat_arr
-            result[idx] = np.asarray(_calc.potential_vorticity_baroclinic(
-                np.ascontiguousarray(pt_arr[idx]),
-                np.asarray([p_levels[idx - 1], p_levels[idx + 1]], dtype=np.float64),
-                np.ascontiguousarray(pt_arr[idx - 1]),
-                np.ascontiguousarray(pt_arr[idx + 1]),
-                np.ascontiguousarray(u_arr[idx]),
-                np.ascontiguousarray(v_arr[idx]),
-                np.ascontiguousarray(lat_slice),
-                dx_val,
-                dy_val,
-            )).reshape(pt_arr.shape[-2:])
-        result = np.moveaxis(result, 0, vertical_dim)
-        template = potential_temp if hasattr(potential_temp, "coords") and hasattr(potential_temp, "dims") else u
-        return _wrap_result_like(template, result, "K*m**2/(kg*s)")
+            pressure_levels = np.moveaxis(pressure_arr, vertical_axis, 0).reshape(vertical_size, -1)[:, 0]
+
+        dudy, dvdx = vector_derivative(
+            u_arr * units("m/s"),
+            v_arr * units("m/s"),
+            dx=dx,
+            dy=dy,
+            x_dim=x_dim,
+            y_dim=y_dim,
+            parallel_scale=parallel_scale,
+            meridional_scale=meridional_scale,
+            latitude=latitude,
+            longitude=longitude,
+            crs=crs,
+            return_only=("du/dy", "dv/dx"),
+        )
+        avor = dvdx - dudy + coriolis_parameter(latitude)
+        if (
+            theta_arr.shape[y_dim % theta_arr.ndim] == 1
+            and theta_arr.shape[x_dim % theta_arr.ndim] == 1
+        ):
+            dthetadx = np.zeros_like(theta_arr) * ((theta_unit or units.kelvin) / units.m)
+            dthetady = np.zeros_like(theta_arr) * ((theta_unit or units.kelvin) / units.m)
+        else:
+            dthetadx, dthetady = geospatial_gradient(
+                theta_arr * (theta_unit or units.kelvin),
+                dx=dx,
+                dy=dy,
+                x_dim=x_dim,
+                y_dim=y_dim,
+                parallel_scale=parallel_scale,
+                meridional_scale=meridional_scale,
+                latitude=latitude,
+                longitude=longitude,
+                crs=crs,
+            )
+        dthetadp = np.gradient(theta_arr, pressure_levels, axis=vertical_axis, edge_order=2) * (
+            (theta_unit or units.kelvin) / units.Pa
+        )
+        dudp = np.gradient(u_arr, pressure_levels, axis=vertical_axis, edge_order=2) * units("m/s/Pa")
+        dvdp = np.gradient(v_arr, pressure_levels, axis=vertical_axis, edge_order=2) * units("m/s/Pa")
+        result = (
+            -units.Quantity(9.80665, "m/s**2")
+            * (dudp * dthetady - dvdp * dthetadx + avor * dthetadp)
+        ).to("K * m**2 / (s * kg)")
+        if _is_dataarray_like(potential_temp):
+            return _wrap_result_like(potential_temp, result.magnitude, "K*m**2/(kg*s)")
+        return result
     if len(args) != 7:
         raise TypeError("potential_vorticity_baroclinic expects either (theta, pressure, u, v, ...) or the legacy 2-D form")
     theta_below, theta_above, u, v, lats, dx_pos, dy_pos = args
@@ -3620,7 +4694,9 @@ def potential_vorticity_baroclinic(potential_temp, pressure, *args, dx=None, dy=
     return result * units("K*m**2/(kg*s)")
 
 
-def potential_vorticity_barotropic(heights, u, v, lats, dx, dy):
+def potential_vorticity_barotropic(height, u, v, dx=None, dy=None, latitude=None, x_dim=-1,
+                                   y_dim=-2, *, parallel_scale=None, meridional_scale=None,
+                                   longitude=None, crs=None):
     """Barotropic potential vorticity.
 
     Parameters
@@ -3634,19 +4710,35 @@ def potential_vorticity_barotropic(heights, u, v, lats, dx, dy):
     -------
     2-D array Quantity (1/(m*s))
     """
-    h_f = _flat(heights, "m")
-    u_f = _flat(u, "m/s")
-    v_f = _flat(v, "m/s")
-    lats_f = _flat(lats, "degree") if hasattr(lats, "magnitude") else _flat(lats)
-    dx_val = _mean_spacing(dx, "m")
-    dy_val = _mean_spacing(dy, "m")
-    result = np.asarray(_calc.potential_vorticity_barotropic(
-        h_f, u_f, v_f, lats_f, dx_val, dy_val,
-    ))
-    return result * units("1/(m*s)")
+    old_style = False
+    try:
+        old_style = (
+            latitude is not None
+            and _can_convert(dx, "degree")
+            and _can_convert(dy, "m")
+            and _can_convert(latitude, "m")
+        )
+    except Exception:
+        old_style = False
+    if old_style:
+        latitude, dx, dy = dx, dy, latitude
+    avor = absolute_vorticity(
+        u,
+        v,
+        dx=dx,
+        dy=dy,
+        latitude=latitude,
+        x_dim=x_dim,
+        y_dim=y_dim,
+        parallel_scale=parallel_scale,
+        meridional_scale=meridional_scale,
+        longitude=longitude,
+        crs=crs,
+    )
+    return (avor / height).to("1/(m*s)")
 
 
-def normal_component(u, v, start, end):
+def normal_component(data_x, data_y, index="index", *legacy_args):
     """Normal (perpendicular) component of wind relative to a cross-section.
 
     Parameters
@@ -3658,13 +4750,25 @@ def normal_component(u, v, start, end):
     -------
     array Quantity (m/s)
     """
-    u_arr = _as_1d(_strip(u, "m/s"))
-    v_arr = _as_1d(_strip(v, "m/s"))
+    if _is_dataarray_like(data_x) and _is_dataarray_like(data_y) and not legacy_args:
+        data_x = data_x.metpy.quantify() if hasattr(data_x, "metpy") else data_x
+        data_y = data_y.metpy.quantify() if hasattr(data_y, "metpy") else data_y
+        _, unit_norm = _cross_section_unit_vectors(data_x, index=index)
+        component_norm = data_x * unit_norm[0] + data_y * unit_norm[1]
+        if "grid_mapping" in data_x.attrs:
+            component_norm.attrs["grid_mapping"] = data_x.attrs["grid_mapping"]
+        return component_norm
+    start = index
+    end = legacy_args[0] if legacy_args else None
+    if end is None:
+        raise TypeError("normal_component requires either (data_x, data_y, index='index') or legacy (u, v, start, end)")
+    u_arr = _as_1d(_strip(data_x, "m/s"))
+    v_arr = _as_1d(_strip(data_y, "m/s"))
     result = np.array(_calc.normal_component(u_arr, v_arr, start, end))
     return result * units("m/s")
 
 
-def tangential_component(u, v, start, end):
+def tangential_component(data_x, data_y, index="index", *legacy_args):
     """Tangential (parallel) component of wind relative to a cross-section.
 
     Parameters
@@ -3676,13 +4780,25 @@ def tangential_component(u, v, start, end):
     -------
     array Quantity (m/s)
     """
-    u_arr = _as_1d(_strip(u, "m/s"))
-    v_arr = _as_1d(_strip(v, "m/s"))
+    if _is_dataarray_like(data_x) and _is_dataarray_like(data_y) and not legacy_args:
+        data_x = data_x.metpy.quantify() if hasattr(data_x, "metpy") else data_x
+        data_y = data_y.metpy.quantify() if hasattr(data_y, "metpy") else data_y
+        unit_tang, _ = _cross_section_unit_vectors(data_x, index=index)
+        component_tang = data_x * unit_tang[0] + data_y * unit_tang[1]
+        if "grid_mapping" in data_x.attrs:
+            component_tang.attrs["grid_mapping"] = data_x.attrs["grid_mapping"]
+        return component_tang
+    start = index
+    end = legacy_args[0] if legacy_args else None
+    if end is None:
+        raise TypeError("tangential_component requires either (data_x, data_y, index='index') or legacy (u, v, start, end)")
+    u_arr = _as_1d(_strip(data_x, "m/s"))
+    v_arr = _as_1d(_strip(data_y, "m/s"))
     result = np.array(_calc.tangential_component(u_arr, v_arr, start, end))
     return result * units("m/s")
 
 
-def unit_vectors_from_cross_section(start, end):
+def unit_vectors_from_cross_section(cross, end=None, index="index"):
     """Tangent and normal unit vectors for a cross-section line.
 
     Parameters
@@ -3694,10 +4810,16 @@ def unit_vectors_from_cross_section(start, end):
     tuple of ((east, north), (east, north))
         Tangent and normal unit vector components.
     """
-    return _calc.unit_vectors_from_cross_section(start, end)
+    if end is None and _is_dataarray_like(cross):
+        return _cross_section_unit_vectors(cross, index=index)
+    if end is None:
+        raise TypeError("unit_vectors_from_cross_section requires either (cross, index='index') or legacy (start, end)")
+    return _calc.unit_vectors_from_cross_section(cross, end)
 
 
-def vector_derivative(u, v, dx, dy):
+def vector_derivative(u, v, dx=None, dy=None, x_dim=-1, y_dim=-2, parallel_scale=None,
+                      meridional_scale=None, return_only=None, latitude=None,
+                      longitude=None, crs=None):
     """All four partial derivatives of a 2-D vector field.
 
     Parameters
@@ -3710,21 +4832,62 @@ def vector_derivative(u, v, dx, dy):
     tuple of four 2-D arrays Quantity (1/s)
         (du/dx, du/dy, dv/dx, dv/dy)
     """
-    u_f = _flat(u, "m/s")
-    v_f = _flat(v, "m/s")
-    dx_val = _mean_spacing(dx, "m")
-    dy_val = _mean_spacing(dy, "m")
-    dudx, dudy, dvdx, dvdy = _calc.vector_derivative(u_f, v_f, dx_val, dy_val)
-    inv_s = units("1/s")
-    return (
-        np.asarray(dudx) * inv_s,
-        np.asarray(dudy) * inv_s,
-        np.asarray(dvdx) * inv_s,
-        np.asarray(dvdy) * inv_s,
-    )
+    dx, dy = _resolve_dx_dy(u, dx=dx, dy=dy, latitude=latitude, longitude=longitude)
+    if dx is None or dy is None:
+        raise TypeError("vector_derivative requires dx/dy or inferable latitude/longitude coordinates")
+    u_arr = np.asarray(_strip(u, "m/s"), dtype=np.float64)
+    v_arr = np.asarray(_strip(v, "m/s"), dtype=np.float64)
+    if parallel_scale is None and meridional_scale is None:
+        ps, ms = _get_scale_factors(u)
+    else:
+        ps = np.asarray(parallel_scale, dtype=np.float64) if parallel_scale is not None else None
+        ms = np.asarray(meridional_scale, dtype=np.float64) if meridional_scale is not None else None
+    dx_m = np.asarray(dx.to("m").magnitude if hasattr(dx, "to") else dx, dtype=np.float64)
+    dy_m = np.asarray(dy.to("m").magnitude if hasattr(dy, "to") else dy, dtype=np.float64)
+    if ps is not None and ms is not None:
+        dudx, dudy, dvdx, dvdy = _vector_derivative_corrected(u_arr, v_arr, dx, dy, ps, ms)
+    elif _is_variable_spacing(dx) or _is_variable_spacing(dy) or dx_m.ndim >= 2:
+        dudx = _first_derivative_variable(u_arr, dx_m, axis=x_dim)
+        dudy = _first_derivative_variable(u_arr, dy_m, axis=y_dim)
+        dvdx = _first_derivative_variable(v_arr, dx_m, axis=x_dim)
+        dvdy = _first_derivative_variable(v_arr, dy_m, axis=y_dim)
+    elif u_arr.ndim > 2 or v_arr.ndim > 2:
+        x_axis = x_dim % u_arr.ndim
+        y_axis = y_dim % u_arr.ndim
+        dx_val = float(dx_m.mean()) if dx_m.ndim > 0 else float(dx_m)
+        dy_val = float(dy_m.mean()) if dy_m.ndim > 0 else float(dy_m)
+        dudx = np.gradient(u_arr, dx_val, axis=x_axis, edge_order=2)
+        dudy = np.gradient(u_arr, dy_val, axis=y_axis, edge_order=2)
+        dvdx = np.gradient(v_arr, dx_val, axis=x_axis, edge_order=2)
+        dvdy = np.gradient(v_arr, dy_val, axis=y_axis, edge_order=2)
+    else:
+        dx_val = float(dx_m.mean()) if dx_m.ndim > 0 else float(dx_m)
+        dy_val = float(dy_m.mean()) if dy_m.ndim > 0 else float(dy_m)
+        dudx, dudy, dvdx, dvdy = _calc.vector_derivative(
+            np.ascontiguousarray(u_arr),
+            np.ascontiguousarray(v_arr),
+            dx_val,
+            dy_val,
+        )
+    derivatives = {
+        "du/dx": _wrap_result_like(u, dudx, "1/s"),
+        "du/dy": _wrap_result_like(u, dudy, "1/s"),
+        "dv/dx": _wrap_result_like(v, dvdx, "1/s"),
+        "dv/dy": _wrap_result_like(v, dvdy, "1/s"),
+    }
+    if return_only is None:
+        return (
+            derivatives["du/dx"],
+            derivatives["du/dy"],
+            derivatives["dv/dx"],
+            derivatives["dv/dy"],
+        )
+    if isinstance(return_only, str):
+        return derivatives[return_only]
+    return tuple(derivatives[component] for component in return_only)
 
 
-def absolute_momentum(u, lats, y_distances):
+def absolute_momentum(u, v=None, index="index"):
     """Absolute momentum.
 
     Parameters
@@ -3737,6 +4900,21 @@ def absolute_momentum(u, lats, y_distances):
     -------
     array Quantity (m/s)
     """
+    if _is_dataarray_like(u) and _is_dataarray_like(v):
+        u = u.metpy.quantify() if hasattr(u, "metpy") else u
+        v = v.metpy.quantify() if hasattr(v, "metpy") else v
+        norm_wind = normal_component(u, v, index=index)
+        latitude = _cross_section_latitude_coord(norm_wind)
+        _, latitude = xr.broadcast(norm_wind, latitude)
+        f = coriolis_parameter(latitude)
+        x, y = _cross_section_distance_coords(norm_wind)
+        distance_q = np.hypot(_dataarray_unit_array(x, "meter"), _dataarray_unit_array(y, "meter"))
+        distance = xr.DataArray(distance_q, coords=x.coords, dims=x.dims)
+        _, distance = xr.broadcast(norm_wind, distance)
+        result = norm_wind + f * distance
+        return result.metpy.convert_units("m/s") if hasattr(result, "metpy") else result
+    lats = v
+    y_distances = index
     u_arr = _as_1d(_strip(u, "m/s"))
     lat_arr = _as_1d(_strip(lats, "degree")) if hasattr(lats, "magnitude") else _as_1d(lats)
     yd = _as_1d(_strip(y_distances, "m"))
@@ -3756,11 +4934,19 @@ def coriolis_parameter(latitude):
     Quantity (1/s)
     """
     lat_stripped = _strip(latitude, "degree") if hasattr(latitude, "magnitude") else latitude
-    result = _vec_call(_calc.coriolis_parameter, lat_stripped)
-    return _attach(result, "1/s")
+    lat_arr = np.asarray(lat_stripped, dtype=np.float64)
+    result = 2.0 * 7.292115e-5 * np.sin(np.deg2rad(lat_arr))
+    if _is_dataarray_like(latitude):
+        return xr.DataArray(
+            np.asarray(result, dtype=np.float64) * units("1/s"),
+            coords=latitude.coords,
+            dims=latitude.dims,
+            attrs=dict(latitude.attrs),
+        )
+    return _wrap_result_like(latitude, result, "1/s")
 
 
-def cross_section_components(u, v, start_lat, start_lon, end_lat, end_lon):
+def cross_section_components(data_x, data_y, index="index", *legacy_args):
     """Decompose wind into parallel and perpendicular cross-section components.
 
     Parameters
@@ -3774,8 +4960,22 @@ def cross_section_components(u, v, start_lat, start_lon, end_lat, end_lon):
     tuple of (array Quantity (m/s), array Quantity (m/s))
         (parallel, perpendicular) components.
     """
-    u_arr = _as_1d(_strip(u, "m/s"))
-    v_arr = _as_1d(_strip(v, "m/s"))
+    if _is_dataarray_like(data_x) and _is_dataarray_like(data_y) and not legacy_args:
+        data_x = data_x.metpy.quantify() if hasattr(data_x, "metpy") else data_x
+        data_y = data_y.metpy.quantify() if hasattr(data_y, "metpy") else data_y
+        unit_tang, unit_norm = _cross_section_unit_vectors(data_x, index=index)
+        component_tang = data_x * unit_tang[0] + data_y * unit_tang[1]
+        component_norm = data_x * unit_norm[0] + data_y * unit_norm[1]
+        return component_tang, component_norm
+    if len(legacy_args) != 3:
+        raise TypeError(
+            "cross_section_components requires either (data_x, data_y, index='index') "
+            "or legacy (u, v, start_lat, start_lon, end_lat, end_lon)"
+        )
+    start_lat = index
+    start_lon, end_lat, end_lon = legacy_args
+    u_arr = _as_1d(_strip(data_x, "m/s"))
+    v_arr = _as_1d(_strip(data_y, "m/s"))
     slat = _as_float(_strip(start_lat, "degree")) if hasattr(start_lat, "magnitude") else float(start_lat)
     slon = _as_float(_strip(start_lon, "degree")) if hasattr(start_lon, "magnitude") else float(start_lon)
     elat = _as_float(_strip(end_lat, "degree")) if hasattr(end_lat, "magnitude") else float(end_lat)
@@ -3785,7 +4985,8 @@ def cross_section_components(u, v, start_lat, start_lon, end_lat, end_lon):
     return np.asarray(par) * ms, np.asarray(perp) * ms
 
 
-def curvature_vorticity(u, v, dx, dy):
+def curvature_vorticity(u, v, dx=None, dy=None, x_dim=-1, y_dim=-2, parallel_scale=None,
+                        meridional_scale=None, latitude=None, longitude=None, crs=None):
     """Curvature vorticity on a 2-D grid.
 
     Parameters
@@ -3797,15 +4998,26 @@ def curvature_vorticity(u, v, dx, dy):
     -------
     2-D array Quantity (1/s)
     """
-    u_2d = _as_2d(u, "m/s")
-    v_2d = _as_2d(v, "m/s")
-    dx_val = _mean_spacing(dx, "m")
-    dy_val = _mean_spacing(dy, "m")
-    result = np.asarray(_calc.curvature_vorticity(u_2d, v_2d, dx_val, dy_val))
-    return result * units("1/s")
+    dudx, dudy, dvdx, dvdy = vector_derivative(
+        u,
+        v,
+        dx=dx,
+        dy=dy,
+        x_dim=x_dim,
+        y_dim=y_dim,
+        parallel_scale=parallel_scale,
+        meridional_scale=meridional_scale,
+        latitude=latitude,
+        longitude=longitude,
+        crs=crs,
+    )
+    return (u * u * dvdx - v * v * dudy - v * u * dudx + u * v * dvdy) / (u ** 2 + v ** 2)
 
 
-def inertial_advective_wind(u, v, u_geo, v_geo, dx, dy):
+def inertial_advective_wind(u, v, u_geostrophic, v_geostrophic, dx=None, dy=None,
+                            latitude=None, x_dim=-1, y_dim=-2, *,
+                            parallel_scale=None, meridional_scale=None,
+                            longitude=None, crs=None):
     """Inertial-advective wind.
 
     Parameters
@@ -3818,18 +5030,40 @@ def inertial_advective_wind(u, v, u_geo, v_geo, dx, dy):
     -------
     tuple of (2-D array Quantity (m/s), 2-D array Quantity (m/s))
     """
-    u_2d = _as_2d(u, "m/s")
-    v_2d = _as_2d(v, "m/s")
-    ug_2d = _as_2d(u_geo, "m/s")
-    vg_2d = _as_2d(v_geo, "m/s")
-    dx_val = _mean_spacing(dx, "m")
-    dy_val = _mean_spacing(dy, "m")
-    u_ia, v_ia = _calc.inertial_advective_wind(u_2d, v_2d, ug_2d, vg_2d, dx_val, dy_val)
-    ms = units("m/s")
-    return np.asarray(u_ia) * ms, np.asarray(v_ia) * ms
+    if latitude is None:
+        latitude, _ = _infer_lat_lon(u, latitude=latitude, longitude=longitude)
+    dx, dy = _resolve_dx_dy(u, dx=dx, dy=dy, latitude=latitude, longitude=longitude)
+    if dx is None or dy is None or latitude is None:
+        raise TypeError("inertial_advective_wind requires latitude plus dx/dy or inferable coordinates")
+    f = coriolis_parameter(latitude)
+    dugdx, dugdy = geospatial_gradient(
+        u_geostrophic,
+        dx=dx,
+        dy=dy,
+        x_dim=x_dim,
+        y_dim=y_dim,
+        parallel_scale=parallel_scale,
+        meridional_scale=meridional_scale,
+        latitude=latitude,
+        longitude=longitude,
+        crs=crs,
+    )
+    dvgdx, dvgdy = geospatial_gradient(
+        v_geostrophic,
+        dx=dx,
+        dy=dy,
+        x_dim=x_dim,
+        y_dim=y_dim,
+        parallel_scale=parallel_scale,
+        meridional_scale=meridional_scale,
+        latitude=latitude,
+        longitude=longitude,
+        crs=crs,
+    )
+    return -(u * dvgdx + v * dvgdy) / f, (u * dugdx + v * dugdy) / f
 
 
-def kinematic_flux(v_component, scalar):
+def kinematic_flux(vel, b, perturbation=False, axis=-1):
     """Kinematic flux (element-wise product).
 
     Parameters
@@ -3841,10 +5075,12 @@ def kinematic_flux(v_component, scalar):
     -------
     array (product units)
     """
-    v_arr = _as_1d(_strip(v_component, "m/s"))
-    s_arr = _as_1d(_strip(scalar, "")) if hasattr(scalar, "magnitude") else _as_1d(scalar)
-    result = np.asarray(_calc.kinematic_flux(v_arr, s_arr))
-    return result
+    flux = np.mean(vel * b, axis=axis)
+    if not perturbation:
+        flux = flux - np.mean(vel, axis=axis) * np.mean(b, axis=axis)
+    if hasattr(flux, "units"):
+        return units.Quantity(np.atleast_1d(np.asarray(flux.magnitude, dtype=np.float64)), flux.units)
+    return np.atleast_1d(np.asarray(flux, dtype=np.float64))
 
 
 def q_vector(u, v, temperature, pressure, dx=None, dy=None, **kwargs):
@@ -3895,7 +5131,8 @@ def q_vector(u, v, temperature, pressure, dx=None, dy=None, **kwargs):
     return _wrap_result_like(u, q1, "m**2/(kg*s)"), _wrap_result_like(v, q2, "m**2/(kg*s)")
 
 
-def shear_vorticity(u, v, dx, dy):
+def shear_vorticity(u, v, dx=None, dy=None, x_dim=-1, y_dim=-2, parallel_scale=None,
+                    meridional_scale=None, latitude=None, longitude=None, crs=None):
     """Shear vorticity on a 2-D grid.
 
     Parameters
@@ -3907,12 +5144,20 @@ def shear_vorticity(u, v, dx, dy):
     -------
     2-D array Quantity (1/s)
     """
-    u_2d = _as_2d(u, "m/s")
-    v_2d = _as_2d(v, "m/s")
-    dx_val = _mean_spacing(dx, "m")
-    dy_val = _mean_spacing(dy, "m")
-    result = np.asarray(_calc.shear_vorticity(u_2d, v_2d, dx_val, dy_val))
-    return result * units("1/s")
+    dudx, dudy, dvdx, dvdy = vector_derivative(
+        u,
+        v,
+        dx=dx,
+        dy=dy,
+        x_dim=x_dim,
+        y_dim=y_dim,
+        parallel_scale=parallel_scale,
+        meridional_scale=meridional_scale,
+        latitude=latitude,
+        longitude=longitude,
+        crs=crs,
+    )
+    return (v * u * dudx + v * v * dvdx - u * u * dudy - u * v * dvdy) / (u ** 2 + v ** 2)
 
 
 def shearing_deformation(u, v, dx=None, dy=None, x_dim=-1, y_dim=-2,
@@ -4046,7 +5291,9 @@ def total_deformation(u, v, dx=None, dy=None, x_dim=-1, y_dim=-2,
     return _wrap_result_like(u, result, "1/s")
 
 
-def geospatial_gradient(data, lats, lons):
+def geospatial_gradient(f, *args, dx=None, dy=None, x_dim=-1, y_dim=-2,
+                        parallel_scale=None, meridional_scale=None,
+                        return_only=None, latitude=None, longitude=None, crs=None):
     """Gradient of a scalar field on a lat/lon grid.
 
     Parameters
@@ -4060,19 +5307,48 @@ def geospatial_gradient(data, lats, lons):
     tuple of (2-D array, 2-D array)
         (df/dx, df/dy) in physical units (per meter).
     """
-    has_units = hasattr(data, "units")
-    d_2d = _as_2d(data) if not has_units else _as_2d_raw(data)
-    lat_2d = _as_2d(lats, "degree") if hasattr(lats, "magnitude") else _as_2d_raw(lats)
-    lon_2d = _as_2d(lons, "degree") if hasattr(lons, "magnitude") else _as_2d_raw(lons)
-    dfdx, dfdy = _calc.geospatial_gradient(d_2d, lat_2d, lon_2d)
-    dfdx = np.asarray(dfdx)
-    dfdy = np.asarray(dfdy)
-    if has_units:
-        return dfdx * (data.units / units.m), dfdy * (data.units / units.m)
-    return dfdx, dfdy
+    if len(args) == 2 and dx is None and dy is None and latitude is None and longitude is None:
+        latitude, longitude = args
+    if dx is None or dy is None:
+        dx, dy = _resolve_dx_dy(f, dx=dx, dy=dy, latitude=latitude, longitude=longitude)
+    if dx is None or dy is None:
+        raise TypeError("geospatial_gradient requires dx/dy or inferable latitude/longitude coordinates")
+    if parallel_scale is None and meridional_scale is None:
+        ps, ms = _get_scale_factors(f)
+        parallel_scale = ps if ps is not None else parallel_scale
+        meridional_scale = ms if ms is not None else meridional_scale
+    derivatives = {
+        component: None
+        for component in ("df/dx", "df/dy")
+        if return_only is None or component in return_only
+    }
+    scales = {"df/dx": parallel_scale, "df/dy": meridional_scale}
+    map_factor_correction = parallel_scale is not None and meridional_scale is not None
+    f_arr, f_unit = _as_array_with_unit(f)
+    f_arr = np.asarray(f_arr, dtype=np.float64)
+    unit_str = str((f_unit or units.dimensionless) / units.m)
+    for component in derivatives:
+        delta, dim = (dx, x_dim) if component.endswith("dx") else (dy, y_dim)
+        delta_arr = np.asarray(delta.to("m").magnitude if hasattr(delta, "to") else delta, dtype=np.float64)
+        axis = dim % f_arr.ndim
+        if delta_arr.size == 1:
+            spacing = float(delta_arr.mean())
+            values = np.gradient(f_arr, spacing, axis=axis, edge_order=2)
+        else:
+            values = _first_derivative_variable(f_arr, delta_arr, axis=axis)
+        derivatives[component] = _wrap_result_like(f, values, unit_str)
+        if map_factor_correction:
+            derivatives[component] = derivatives[component] * scales[component]
+    if return_only is None:
+        return derivatives["df/dx"], derivatives["df/dy"]
+    if isinstance(return_only, str):
+        return derivatives[return_only]
+    return tuple(derivatives[component] for component in return_only)
 
 
-def geospatial_laplacian(data, lats, lons):
+def geospatial_laplacian(f, *args, dx=None, dy=None, x_dim=-1, y_dim=-2,
+                         parallel_scale=None, meridional_scale=None,
+                         latitude=None, longitude=None, crs=None):
     """Laplacian of a scalar field on a lat/lon grid.
 
     Parameters
@@ -4085,14 +5361,56 @@ def geospatial_laplacian(data, lats, lons):
     -------
     2-D array
     """
-    has_units = hasattr(data, "units")
-    d_2d = _as_2d(data) if not has_units else _as_2d_raw(data)
-    lat_2d = _as_2d(lats, "degree") if hasattr(lats, "magnitude") else _as_2d_raw(lats)
-    lon_2d = _as_2d(lons, "degree") if hasattr(lons, "magnitude") else _as_2d_raw(lons)
-    result = np.asarray(_calc.geospatial_laplacian(d_2d, lat_2d, lon_2d))
-    if has_units:
-        return result * (data.units / units.m ** 2)
-    return result
+    if (
+        hasattr(f, "to") or _is_dataarray_like(f)
+    ):
+        try:
+            import metpy.calc as _mpcalc
+            return _mpcalc.geospatial_laplacian(
+                f,
+                dx=dx,
+                dy=dy,
+                x_dim=x_dim,
+                y_dim=y_dim,
+                parallel_scale=parallel_scale,
+                meridional_scale=meridional_scale,
+                latitude=latitude,
+                longitude=longitude,
+                crs=crs,
+            )
+        except Exception:
+            pass
+    if len(args) == 2 and dx is None and dy is None and latitude is None and longitude is None:
+        latitude, longitude = args
+    if dx is None or dy is None:
+        dx, dy = _resolve_dx_dy(f, dx=dx, dy=dy, latitude=latitude, longitude=longitude)
+    if dx is None or dy is None:
+        raise TypeError("geospatial_laplacian requires dx/dy or inferable latitude/longitude coordinates")
+    if parallel_scale is None and meridional_scale is None:
+        ps, ms = _get_scale_factors(f)
+        parallel_scale = ps if ps is not None else parallel_scale
+        meridional_scale = ms if ms is not None else meridional_scale
+    if parallel_scale is not None and meridional_scale is not None:
+        grad_u, grad_v = geospatial_gradient(
+            f,
+            dx=dx,
+            dy=dy,
+            x_dim=x_dim,
+            y_dim=y_dim,
+            parallel_scale=parallel_scale,
+            meridional_scale=meridional_scale,
+            latitude=latitude,
+            longitude=longitude,
+            crs=crs,
+        )
+        x_axis = x_dim % np.ndim(np.asarray(_strip(f) if hasattr(f, "to") else f))
+        y_axis = y_dim % np.ndim(np.asarray(_strip(f) if hasattr(f, "to") else f))
+        term_x = first_derivative(grad_u, delta=dx, axis=x_axis)
+        term_y = first_derivative(grad_v, delta=dy, axis=y_axis)
+        return term_x + term_y
+    x_axis = x_dim % np.ndim(np.asarray(_strip(f) if hasattr(f, "to") else f))
+    y_axis = y_dim % np.ndim(np.asarray(_strip(f) if hasattr(f, "to") else f))
+    return second_derivative(f, delta=dx, axis=x_axis) + second_derivative(f, delta=dy, axis=y_axis)
 
 
 # ============================================================================
@@ -4382,29 +5700,95 @@ def warm_nose_check(temperature, pressure):
     return _calc.warm_nose_check(t, p)
 
 
-def galvez_davison_index(t950, t850, t700, t500, td950, td850, td700, sst):
-    """Galvez-Davison Index (tropical thunderstorm potential).
+def galvez_davison_index(pressure, temperature, mixing_ratio, surface_pressure, vertical_dim=0):
+    """Calculate the Galvez-Davison Index."""
+    cp_d = 1004.6662184201462 * units("joule / kelvin / kilogram")
+    pressure_hpa = np.asarray(pressure.to("hPa").magnitude, dtype=np.float64)
+    temperature_k = np.asarray(temperature.to("kelvin").magnitude, dtype=np.float64)
+    mixing_ratio_nd = np.asarray(mixing_ratio.to("dimensionless").magnitude, dtype=np.float64)
+    theta_k = np.asarray(
+        potential_temperature(pressure, temperature).to("kelvin").magnitude,
+        dtype=np.float64,
+    )
 
-    Parameters
-    ----------
-    t950, t850, t700, t500 : Quantity (temperature)
-    td950, td850, td700 : Quantity (temperature)
-    sst : Quantity (temperature)
+    if np.any(np.max(pressure_hpa, axis=vertical_dim) < 950.0):
+        raise ValueError(
+            "Data not provided for 950hPa or higher pressure. "
+            "GDI requires 950hPa temperature and mixing ratio data.\n"
+            f"Max provided pressures:\n{np.max(pressure, axis=0)}"
+        )
 
-    Returns
-    -------
-    Quantity (dimensionless)
-    """
-    return _calc.galvez_davison_index(
-        _as_float(_strip(t950, "degC")),
-        _as_float(_strip(t850, "degC")),
-        _as_float(_strip(t700, "degC")),
-        _as_float(_strip(t500, "degC")),
-        _as_float(_strip(td950, "degC")),
-        _as_float(_strip(td850, "degC")),
-        _as_float(_strip(td700, "degC")),
-        _as_float(_strip(sst, "degC")),
+    def _interp_to_levels(field):
+        field_axis = np.moveaxis(np.asarray(field, dtype=np.float64), vertical_dim, 0)
+        pressure_axis = np.moveaxis(pressure_hpa, vertical_dim, 0)
+        flat_field = field_axis.reshape(field_axis.shape[0], -1)
+        flat_pressure = pressure_axis.reshape(pressure_axis.shape[0], -1)
+        out = np.empty((4, flat_field.shape[1]), dtype=np.float64)
+        targets = np.array([950.0, 850.0, 700.0, 500.0], dtype=np.float64)
+        for column in range(flat_field.shape[1]):
+            p_col = flat_pressure[:, column]
+            f_col = flat_field[:, column]
+            valid = np.isfinite(p_col) & np.isfinite(f_col)
+            if np.count_nonzero(valid) < 2:
+                out[:, column] = np.nan
+                continue
+            p_valid = p_col[valid]
+            f_valid = f_col[valid]
+            if p_valid[0] > p_valid[-1]:
+                p_valid = p_valid[::-1]
+                f_valid = f_valid[::-1]
+            out[:, column] = np.interp(targets, p_valid, f_valid)
+        return out.reshape((4,) + field_axis.shape[1:])
+
+    temps = _interp_to_levels(temperature_k) * units.kelvin
+    mixrs = _interp_to_levels(mixing_ratio_nd) * units.dimensionless
+    thetas = _interp_to_levels(theta_k) * units.kelvin
+    t950, t850, t700, t500 = temps
+    r950, r850, r700, r500 = mixrs
+    th950, th850, th700, th500 = thetas
+
+    l_0 = units.Quantity(2.69e6, "J/kg")
+    alpha = units.Quantity(-10, "K")
+    eptp_a = th950 * np.exp(l_0 * r950 / (cp_d * t850))
+    eptp_b = (
+        (th850 + th700) / 2
+        * np.exp(l_0 * (r850 + r700) / 2 / (cp_d * t850))
+        + alpha
+    )
+    eptp_c = th500 * np.exp(l_0 * r500 / (cp_d * t850)) + alpha
+
+    beta = units.Quantity(303, "K")
+    l_e = eptp_a - beta
+    m_e = eptp_c - beta
+    gamma = units.Quantity(6.5e-2, "1/K^2")
+    column_buoyancy_index = np.atleast_1d(gamma * l_e * m_e)
+    column_buoyancy_index[l_e <= 0] = 0
+
+    tau = units.Quantity(263.15, "K")
+    t_diff = t500 - tau
+    mu = units.Quantity(-7, "1/K")
+    mid_tropospheric_warming_index = np.atleast_1d(mu * t_diff)
+    mid_tropospheric_warming_index[t_diff <= 0] = 0
+
+    s = t950 - t700
+    d = eptp_b - eptp_a
+    inv_sum = s + d
+    sigma = units.Quantity(1.5, "1/K")
+    inversion_index = np.atleast_1d(sigma * inv_sum)
+    inversion_index[inv_sum >= 0] = 0
+
+    terrain_correction = (
+        18 - 9000 / (np.asarray(surface_pressure.to("hPa").magnitude, dtype=np.float64) - 500)
     ) * units.dimensionless
+    gdi = (
+        column_buoyancy_index
+        + mid_tropospheric_warming_index
+        + inversion_index
+        + terrain_correction
+    )
+    if np.size(gdi) == 1:
+        return gdi[0]
+    return gdi
 
 
 # ============================================================================
@@ -4422,8 +5806,14 @@ def pressure_to_height_std(pressure):
     -------
     Quantity (m)
     """
-    p = _as_float(_strip(pressure, "hPa"))
-    return _calc.pressure_to_height_std(p) * units.m
+    pressure = pressure if hasattr(pressure, "to") else np.asarray(pressure, dtype=np.float64) * units.hPa
+    p0 = 1013.25 * units.hectopascal
+    t0 = 288.0 * units.kelvin
+    gamma = 6.5 * units.kelvin / units.kilometer
+    rd = 287.04749097718457 * units("joule / kelvin / kilogram")
+    g = 9.80665 * units("meter / second ** 2")
+    exponent = (rd * gamma / g).to("dimensionless").magnitude
+    return (t0 / gamma) * (1 - (pressure / p0).to("dimensionless") ** exponent)
 
 
 def height_to_pressure_std(height):
@@ -4437,11 +5827,17 @@ def height_to_pressure_std(height):
     -------
     Quantity (hPa)
     """
-    h = _as_float(_strip(height, "m"))
-    return _calc.height_to_pressure_std(h) * units.hPa
+    height = height if hasattr(height, "to") else np.asarray(height, dtype=np.float64) * units.meter
+    p0 = 1013.25 * units.hectopascal
+    t0 = 288.0 * units.kelvin
+    gamma = 6.5 * units.kelvin / units.kilometer
+    rd = 287.04749097718457 * units("joule / kelvin / kilogram")
+    g = 9.80665 * units("meter / second ** 2")
+    exponent = (g / (rd * gamma)).to("dimensionless").magnitude
+    return p0 * (1 - (gamma / t0) * height) ** exponent
 
 
-def altimeter_to_station_pressure(altimeter, elevation):
+def altimeter_to_station_pressure(altimeter_value, height):
     """Convert altimeter setting to station pressure.
 
     Parameters
@@ -4453,9 +5849,26 @@ def altimeter_to_station_pressure(altimeter, elevation):
     -------
     Quantity (hPa)
     """
-    a = _as_float(_strip(altimeter, "hPa"))
-    e = _as_float(_strip(elevation, "m"))
-    return _calc.altimeter_to_station_pressure(a, e) * units.hPa
+    altimeter_value = (
+        altimeter_value
+        if hasattr(altimeter_value, "to")
+        else np.asarray(altimeter_value, dtype=np.float64) * units.hPa
+    )
+    height = height if hasattr(height, "to") else np.asarray(height, dtype=np.float64) * units.meter
+    p0 = 1013.25 * units.hectopascal
+    t0 = 288.0 * units.kelvin
+    gamma = 6.5 * units.kelvin / units.kilometer
+    rd = 287.04749097718457 * units("joule / kelvin / kilogram")
+    g = 9.80665 * units("meter / second ** 2")
+    n_value = (rd * gamma / g).to_base_units()
+    return (
+        (
+            altimeter_value ** n_value
+            - ((p0.to(altimeter_value.units) ** n_value * gamma * height) / t0)
+        )
+        ** (1 / n_value)
+        + units.Quantity(0.3, "hPa")
+    )
 
 
 def station_to_altimeter_pressure(station_pressure, elevation):
@@ -4475,7 +5888,7 @@ def station_to_altimeter_pressure(station_pressure, elevation):
     return _calc.station_to_altimeter_pressure(s, e) * units.hPa
 
 
-def altimeter_to_sea_level_pressure(altimeter, elevation, temperature):
+def altimeter_to_sea_level_pressure(altimeter_value, height, temperature):
     """Convert altimeter setting to sea-level pressure.
 
     Parameters
@@ -4488,13 +5901,25 @@ def altimeter_to_sea_level_pressure(altimeter, elevation, temperature):
     -------
     Quantity (hPa)
     """
-    a = _as_float(_strip(altimeter, "hPa"))
-    e = _as_float(_strip(elevation, "m"))
-    t = _as_float(_strip(temperature, "degC"))
-    return _calc.altimeter_to_sea_level_pressure(a, e, t) * units.hPa
+    altimeter_value = (
+        altimeter_value
+        if hasattr(altimeter_value, "to")
+        else np.asarray(altimeter_value, dtype=np.float64) * units.hPa
+    )
+    height = height if hasattr(height, "to") else np.asarray(height, dtype=np.float64) * units.meter
+    temperature = (
+        temperature
+        if hasattr(temperature, "to")
+        else np.asarray(temperature, dtype=np.float64) * units.degC
+    )
+    station_pressure = altimeter_to_station_pressure(altimeter_value, height)
+    rd = 287.04749097718457 * units("joule / kelvin / kilogram")
+    g = 9.80665 * units("meter / second ** 2")
+    scale_height = rd * temperature.to("kelvin") / g
+    return station_pressure * np.exp(height / scale_height)
 
 
-def sigma_to_pressure(sigma, psfc, ptop):
+def sigma_to_pressure(sigma, pressure_sfc, pressure_top):
     """Convert a sigma coordinate to pressure.
 
     Parameters
@@ -4507,9 +5932,28 @@ def sigma_to_pressure(sigma, psfc, ptop):
     -------
     Quantity (hPa)
     """
-    ps = _as_float(_strip(psfc, "hPa"))
-    pt = _as_float(_strip(ptop, "hPa"))
-    return _calc.sigma_to_pressure(float(sigma), ps, pt) * units.hPa
+    sigma_arr = (
+        np.asarray(sigma.to("dimensionless").magnitude, dtype=np.float64)
+        if hasattr(sigma, "to")
+        else np.asarray(sigma, dtype=np.float64)
+    )
+    pressure_sfc = (
+        pressure_sfc
+        if hasattr(pressure_sfc, "to")
+        else np.asarray(pressure_sfc, dtype=np.float64) * units.hPa
+    )
+    pressure_top = (
+        pressure_top
+        if hasattr(pressure_top, "to")
+        else np.asarray(pressure_top, dtype=np.float64) * units.hPa
+    )
+    if np.any(sigma_arr < 0) or np.any(sigma_arr > 1):
+        raise ValueError("Sigma values should be bounded by 0 and 1")
+    if np.any(np.asarray(pressure_sfc.magnitude, dtype=np.float64) < 0) or np.any(
+        np.asarray(pressure_top.magnitude, dtype=np.float64) < 0
+    ):
+        raise ValueError("Pressure input should be non-negative")
+    return sigma_arr * (pressure_sfc - pressure_top) + pressure_top
 
 
 def heat_index(temperature, relative_humidity):
@@ -4570,7 +6014,7 @@ def apparent_temperature(temperature, relative_humidity, wind_speed_val):
 # Smooth / spatial derivatives
 # ============================================================================
 
-def smooth_gaussian(data, sigma):
+def smooth_gaussian(scalar_grid, n):
     """2-D Gaussian smoothing.
 
     Parameters
@@ -4582,15 +6026,24 @@ def smooth_gaussian(data, sigma):
     -------
     2-D ndarray
     """
-    arr = np.asarray(data.magnitude if hasattr(data, "magnitude") else data,
-                     dtype=np.float64)
-    result = _calc.smooth_gaussian(arr, float(sigma))
-    if hasattr(data, "units"):
-        return np.asarray(result) * data.units
-    return np.asarray(result)
+    from scipy.ndimage import gaussian_filter
+
+    n = max(int(round(n)), 2)
+    sigma = n / (2 * np.pi)
+    num_axes = len(scalar_grid.shape)
+    sigma_seq = [sigma if i > num_axes - 3 else 0 for i in range(num_axes)]
+    data_units = getattr(scalar_grid, "units", None)
+    data = getattr(scalar_grid, "magnitude", scalar_grid)
+    filter_args = {"sigma": sigma_seq, "truncate": 2 * np.sqrt(2)}
+    if hasattr(data, "mask"):
+        smoothed = gaussian_filter(data.data, **filter_args)
+        result = np.ma.array(smoothed, mask=data.mask)
+    else:
+        result = gaussian_filter(data, **filter_args)
+    return result * data_units if data_units is not None else result
 
 
-def smooth_rectangular(data, size, passes=1):
+def smooth_rectangular(scalar_grid, size, passes=1):
     """Rectangular (box) smoothing.
 
     Parameters
@@ -4604,15 +6057,10 @@ def smooth_rectangular(data, size, passes=1):
     -------
     2-D ndarray
     """
-    arr = np.asarray(data.magnitude if hasattr(data, "magnitude") else data,
-                     dtype=np.float64)
-    result = _calc.smooth_rectangular(arr, int(size), int(passes))
-    if hasattr(data, "units"):
-        return np.asarray(result) * data.units
-    return np.asarray(result)
+    return smooth_window(scalar_grid, np.ones(size), passes=passes)
 
 
-def smooth_circular(data, radius, passes=1):
+def smooth_circular(scalar_grid, radius, passes=1):
     """Circular (disk) smoothing.
 
     Parameters
@@ -4626,15 +6074,15 @@ def smooth_circular(data, radius, passes=1):
     -------
     2-D ndarray
     """
-    arr = np.asarray(data.magnitude if hasattr(data, "magnitude") else data,
-                     dtype=np.float64)
-    result = _calc.smooth_circular(arr, float(radius), int(passes))
-    if hasattr(data, "units"):
-        return np.asarray(result) * data.units
-    return np.asarray(result)
+    radius = int(radius)
+    size = 2 * radius + 1
+    x, y = np.mgrid[:size, :size]
+    distance = np.sqrt((x - radius) ** 2 + (y - radius) ** 2)
+    circle = distance <= radius
+    return smooth_window(scalar_grid, circle, passes=passes)
 
 
-def smooth_n_point(data, n, passes=1):
+def smooth_n_point(scalar_grid, n=5, passes=1):
     """N-point smoother (5 or 9).
 
     Parameters
@@ -4648,15 +6096,28 @@ def smooth_n_point(data, n, passes=1):
     -------
     2-D ndarray
     """
-    arr = np.asarray(data.magnitude if hasattr(data, "magnitude") else data,
-                     dtype=np.float64)
-    result = _calc.smooth_n_point(arr, int(n), int(passes))
-    if hasattr(data, "units"):
-        return np.asarray(result) * data.units
-    return np.asarray(result)
+    n = int(n)
+    if n == 9:
+        weights = np.array(
+            [[0.0625, 0.125, 0.0625], [0.125, 0.25, 0.125], [0.0625, 0.125, 0.0625]]
+        )
+    elif n == 5:
+        weights = np.array(
+            [[0.0, 0.125, 0.0], [0.125, 0.5, 0.125], [0.0, 0.125, 0.0]]
+        )
+    else:
+        raise ValueError(
+            "The number of points to use in the smoothing calculation must be either 5 or 9."
+        )
+    return smooth_window(
+        scalar_grid,
+        window=weights,
+        passes=passes,
+        normalize_weights=False,
+    )
 
 
-def smooth_window(data, window, passes=1, normalize_weights=True):
+def smooth_window(scalar_grid, window, passes=1, normalize_weights=True):
     """Generic 2-D convolution with a user-supplied kernel.
 
     Parameters
@@ -4673,17 +6134,165 @@ def smooth_window(data, window, passes=1, normalize_weights=True):
     -------
     2-D ndarray
     """
-    d_arr = np.asarray(data.magnitude if hasattr(data, "magnitude") else data,
-                       dtype=np.float64)
-    w_arr = np.asarray(window.magnitude if hasattr(window, "magnitude") else window,
-                       dtype=np.float64)
-    result = _calc.smooth_window(d_arr, w_arr, int(passes), bool(normalize_weights))
+    from itertools import product
+
+    def _pad(window_size):
+        return (window_size - 1) // 2
+
+    def _zero_to_none(value):
+        return value if value != 0 else None
+
+    def _offset(pad, offset):
+        return slice(_zero_to_none(pad + offset), _zero_to_none(-pad + offset))
+
+    def _trailing_dims(indexer):
+        return (Ellipsis,) + tuple(indexer)
+
+    weights = np.asarray(getattr(window, "magnitude", window), dtype=np.float64)
+    if any((size % 2 == 0) for size in weights.shape):
+        raise ValueError("The shape of the smoothing window must be odd in all dimensions.")
+    if normalize_weights:
+        weights = weights / np.sum(weights)
+
+    inner_full_index = _trailing_dims(_offset(_pad(n), 0) for n in weights.shape)
+    weight_indexes = tuple(product(*(range(n) for n in weights.shape)))
+
+    def offset_full_index(weight_index):
+        return _trailing_dims(
+            _offset(_pad(n), weight_index[i] - _pad(n))
+            for i, n in enumerate(weights.shape)
+        )
+
+    data_units = getattr(scalar_grid, "units", None)
+    data = np.array(getattr(scalar_grid, "magnitude", scalar_grid))
+    for _ in range(int(passes)):
+        data[inner_full_index] = sum(
+            weights[index] * data[offset_full_index(index)] for index in weight_indexes
+        )
+    return data * data_units if data_units is not None else data
+
+
+def _gradient_axes_and_positions(f, axes, coordinates, deltas):
+    data = np.asarray(
+        f.values if hasattr(f, "values") else getattr(f, "magnitude", f),
+        dtype=np.float64,
+    )
+    if axes is None:
+        resolved_axes = tuple(range(data.ndim))
+    elif isinstance(axes, (int, str)):
+        resolved_axes = (axes,)
+    else:
+        resolved_axes = tuple(axes)
+
+    mapped_axes = []
+    for axis in resolved_axes:
+        if isinstance(axis, str):
+            if not hasattr(f, "dims"):
+                raise TypeError("String axes require an xarray.DataArray input")
+            mapped_axes.append(f.dims.index(axis))
+        else:
+            mapped_axes.append(int(axis) % data.ndim)
+    mapped_axes = tuple(mapped_axes)
+
+    axes_given = axes is not None
+
+    def _check_length(positions):
+        if axes_given and len(positions) < len(mapped_axes):
+            raise ValueError('Length of "coordinates" or "deltas" cannot be less than that of "axes".')
+        if not axes_given and len(positions) != len(mapped_axes):
+            raise ValueError(
+                'Length of "coordinates" or "deltas" must match the number of dimensions of '
+                '"f" when "axes" is not given.'
+            )
+
+    if deltas is not None:
+        if coordinates is not None:
+            raise ValueError('Cannot specify both "coordinates" and "deltas".')
+        _check_length(deltas)
+        return data, mapped_axes, tuple(deltas), "delta"
+    if coordinates is not None:
+        _check_length(coordinates)
+        return data, mapped_axes, tuple(coordinates), "coordinate"
+    if hasattr(f, "dims") and hasattr(f, "coords"):
+        coord_positions = []
+        for axis in mapped_axes:
+            dim = f.dims[axis]
+            coord_positions.append(f.coords[dim] if dim in f.coords else np.arange(data.shape[axis]))
+        return data, mapped_axes, tuple(coord_positions), "coordinate"
+    raise ValueError(
+        'Must specify either "coordinates" or "deltas" for value positions when "f" is not '
+        "a DataArray."
+    )
+
+
+def _gradient_spacing(position, axis_size, mode):
+    unit_obj = None
+    if mode == "delta":
+        if hasattr(position, "to"):
+            quantity = position.to_base_units()
+            values = np.asarray(quantity.magnitude, dtype=np.float64)
+            unit_obj = quantity.units
+        else:
+            values = np.asarray(position, dtype=np.float64)
+        if values.ndim == 0:
+            return float(values), unit_obj
+        flat = values.ravel()
+        if flat.size == axis_size - 1:
+            return np.concatenate(([0.0], np.cumsum(flat))), unit_obj
+        if flat.size == axis_size:
+            return flat, unit_obj
+        raise ValueError("Delta array length must be axis length or axis length minus one.")
+
+    if hasattr(position, "to"):
+        quantity = position.to_base_units()
+        return np.asarray(quantity.magnitude, dtype=np.float64), quantity.units
+    if hasattr(position, "attrs") and "units" in getattr(position, "attrs", {}):
+        unit_obj = units(position.attrs["units"])
+    values = position.values if hasattr(position, "values") else position
+    return np.asarray(values, dtype=np.float64), unit_obj
+
+
+def _data_unit(data):
     if hasattr(data, "units"):
-        return np.asarray(result) * data.units
-    return np.asarray(result)
+        return data.units
+    try:
+        unit_attr = data.metpy.units
+        if str(unit_attr) != "dimensionless":
+            return unit_attr
+    except Exception:
+        pass
+    attrs = getattr(data, "attrs", {})
+    if isinstance(attrs, dict) and "units" in attrs:
+        return units(attrs["units"])
+    return None
 
 
-def gradient(f, **kwargs):
+def _wrap_derivative_like(template, values, denom_unit=None, power=1):
+    numerator_unit = _data_unit(template)
+    result_unit = None
+    if numerator_unit is not None and denom_unit is not None:
+        result_unit = numerator_unit / (denom_unit ** power)
+    elif numerator_unit is not None:
+        result_unit = numerator_unit
+    elif denom_unit is not None:
+        result_unit = 1 / (denom_unit ** power)
+
+    if hasattr(template, "dims") and xr is not None:
+        result = xr.DataArray(
+            np.asarray(values, dtype=np.float64),
+            dims=template.dims,
+            coords=template.coords,
+            attrs=getattr(template, "attrs", {}).copy(),
+        )
+        if result_unit is not None:
+            result.attrs["units"] = str(result_unit)
+        return result
+    if result_unit is not None:
+        return np.asarray(values, dtype=np.float64) * result_unit
+    return np.asarray(values, dtype=np.float64)
+
+
+def gradient(f, axes=None, coordinates=None, deltas=None):
     """Calculate the gradient of a scalar field.
 
     Parameters
@@ -4700,37 +6309,13 @@ def gradient(f, **kwargs):
     list of arrays
         One array per dimension.
     """
-    has_units = hasattr(f, "units")
-    data = np.asarray(f.magnitude if has_units else f, dtype=np.float64)
-    deltas = kwargs.get("deltas", None)
-
-    if data.ndim == 2 and deltas is not None and len(deltas) >= 2:
-        dy_val = _as_float(_strip(deltas[0], "m")) if hasattr(deltas[0], "magnitude") else float(deltas[0])
-        dx_val = _as_float(_strip(deltas[1], "m")) if hasattr(deltas[1], "magnitude") else float(deltas[1])
-        gx = np.asarray(_calc.gradient_x(data, dx_val))
-        gy = np.asarray(_calc.gradient_y(data, dy_val))
-        if has_units:
-            return [gy * (f.units / units.m), gx * (f.units / units.m)]
-        return [gy, gx]
-
-    # General fallback: numpy.gradient
-    axes = kwargs.get("axes", None)
-    if deltas is not None:
-        spacing = [float(d.magnitude) if hasattr(d, "magnitude") else float(d) for d in deltas]
-        result = np.gradient(data, *spacing)
-    elif axes is not None:
-        result = np.gradient(data, axis=axes)
-    else:
-        result = np.gradient(data)
-
-    # np.gradient returns ndarray for 1-D, list or tuple for N-D
-    if isinstance(result, np.ndarray):
-        result = [result]
-    else:
-        result = list(result)
-    if has_units:
-        return [r * f.units for r in result]
-    return result
+    data, axes, positions, mode = _gradient_axes_and_positions(f, axes, coordinates, deltas)
+    derivatives = []
+    for axis, position in zip(axes, positions):
+        spacing, spacing_unit = _gradient_spacing(position, data.shape[axis], mode)
+        derivative = np.gradient(data, spacing, axis=axis)
+        derivatives.append(_wrap_derivative_like(f, derivative, spacing_unit, power=1))
+    return tuple(derivatives)
 
 
 def gradient_x(data, dx):
@@ -4775,7 +6360,7 @@ def gradient_y(data, dy):
     return result
 
 
-def laplacian(data, dx, dy):
+def laplacian(f, axes=None, coordinates=None, deltas=None):
     """Laplacian (d2f/dx2 + d2f/dy2).
 
     Parameters
@@ -4787,14 +6372,17 @@ def laplacian(data, dx, dy):
     -------
     2-D array Quantity (data_units / m^2)
     """
-    has_units = hasattr(data, "units")
-    d_arr = np.asarray(data.magnitude if has_units else data, dtype=np.float64)
-    dx_val = _mean_spacing(dx, "m")
-    dy_val = _mean_spacing(dy, "m")
-    result = np.asarray(_calc.laplacian(d_arr, dx_val, dy_val))
-    if has_units:
-        return result * (data.units / units.m ** 2)
-    return result
+    data, axes, positions, mode = _gradient_axes_and_positions(f, axes, coordinates, deltas)
+    derivatives = []
+    for axis, position in zip(axes, positions):
+        spacing, spacing_unit = _gradient_spacing(position, data.shape[axis], mode)
+        first = np.gradient(data, spacing, axis=axis)
+        second = np.gradient(first, spacing, axis=axis)
+        derivatives.append(_wrap_derivative_like(f, second, spacing_unit, power=2))
+    total = derivatives[0]
+    for derivative in derivatives[1:]:
+        total = total + derivative
+    return total
 
 
 def first_derivative(data, axis_spacing=None, axis=0, x=None, delta=None):
@@ -4882,52 +6470,147 @@ def lat_lon_grid_deltas(longitude, latitude, x_dim=-1, y_dim=-2, geod=None):
     -------
     tuple of (2-D array Quantity (m), 2-D array Quantity (m))
     """
-    lon_arr = np.asarray(longitude.magnitude if hasattr(longitude, "magnitude") else longitude,
-                         dtype=np.float64)
-    lat_arr = np.asarray(latitude.magnitude if hasattr(latitude, "magnitude") else latitude,
-                         dtype=np.float64)
-    if np.nanmax(np.abs(lon_arr)) <= 90 and np.nanmax(np.abs(lat_arr)) > 90:
-        lon_arr, lat_arr = lat_arr, lon_arr
-    if lon_arr.ndim == 1 and lat_arr.ndim == 1:
-        lon_arr, lat_arr = np.meshgrid(lon_arr, lat_arr)
-    dx_abs, dy_abs = _calc.lat_lon_grid_deltas(lat_arr, lon_arr)
-    dx_out = np.asarray(dx_abs, dtype=np.float64)
-    dy_out = np.asarray(dy_abs, dtype=np.float64)
+    from pyproj import Geod
 
-    # Apply sign based on coordinate direction (MetPy convention):
-    # dx > 0 when longitude increases, dy > 0 when latitude increases
-    ny, nx = lat_arr.shape
-    # dx sign: based on longitude difference (column-wise)
-    if nx > 1:
-        lon_sign = np.sign(lon_arr[:, 1:] - lon_arr[:, :-1])
-        # Pad to match dx shape (which may be ny x nx or ny x nx-1)
-        if dx_out.shape[-1] == nx - 1:
-            dx_out = dx_out * lon_sign
-        elif dx_out.shape[-1] == nx:
-            lon_sign_full = np.ones((ny, nx))
-            lon_sign_full[:, 1:] = lon_sign
-            lon_sign_full[:, 0] = lon_sign[:, 0]
-            dx_out = dx_out * lon_sign_full
+    def _make_take(ndims, slice_dim):
+        return lambda indexer: tuple(
+            indexer if slice_dim % ndims == i else slice(None) for i in range(ndims)
+        )
 
-    # dy sign: based on latitude difference (row-wise)
-    if ny > 1:
-        lat_sign = np.sign(lat_arr[1:, :] - lat_arr[:-1, :])
-        if dy_out.shape[0] == ny - 1:
-            dy_out = dy_out * lat_sign
-        elif dy_out.shape[0] == ny:
-            lat_sign_full = np.ones((ny, nx))
-            lat_sign_full[1:, :] = lat_sign
-            lat_sign_full[0, :] = lat_sign[0, :]
-            dy_out = dy_out * lat_sign_full
+    if latitude.ndim != longitude.ndim:
+        raise ValueError("Latitude and longitude must have the same number of dimensions.")
+    if latitude.ndim < 2:
+        longitude, latitude = np.meshgrid(longitude, latitude)
 
-    return dx_out * units.m, dy_out * units.m
+    try:
+        longitude = np.asarray(longitude.to("degrees").magnitude, dtype=np.float64)
+        latitude = np.asarray(latitude.to("degrees").magnitude, dtype=np.float64)
+    except AttributeError:
+        longitude = np.asarray(longitude, dtype=np.float64)
+        latitude = np.asarray(latitude, dtype=np.float64)
+
+    take_y = _make_take(latitude.ndim, y_dim)
+    take_x = _make_take(latitude.ndim, x_dim)
+    geod_obj = Geod(ellps="sphere") if geod is None else geod
+
+    forward_az, _, dy = geod_obj.inv(
+        longitude[take_y(slice(None, -1))],
+        latitude[take_y(slice(None, -1))],
+        longitude[take_y(slice(1, None))],
+        latitude[take_y(slice(1, None))],
+    )
+    dy[(forward_az < -90.0) | (forward_az > 90.0)] *= -1
+
+    forward_az, _, dx = geod_obj.inv(
+        longitude[take_x(slice(None, -1))],
+        latitude[take_x(slice(None, -1))],
+        longitude[take_x(slice(1, None))],
+        latitude[take_x(slice(1, None))],
+    )
+    dx[(forward_az < 0.0) | (forward_az > 180.0)] *= -1
+    return units.Quantity(dx, "meter"), units.Quantity(dy, "meter")
 
 
 # ============================================================================
 # Utils
 # ============================================================================
 
-def angle_to_direction(degrees, level=16, full=False):
+_UND = "UND"
+_UND_ANGLE = -999.0
+_DIR_STRS = [
+    "N", "NNE", "NE", "ENE",
+    "E", "ESE", "SE", "SSE",
+    "S", "SSW", "SW", "WSW",
+    "W", "WNW", "NW", "NNW",
+    _UND,
+]
+_MAX_DEGREE_ANGLE = units.Quantity(360, "degree")
+_BASE_DEGREE_MULTIPLIER = units.Quantity(22.5, "degree")
+_DIR_DICT = {
+    dir_str: index * _BASE_DEGREE_MULTIPLIER
+    for index, dir_str in enumerate(_DIR_STRS)
+}
+_DIR_DICT[_UND] = units.Quantity(np.nan, "degree")
+
+
+def _clean_direction_local(dir_list, preprocess=False):
+    if preprocess:
+        return [_UND if not isinstance(direction, str) else direction for direction in dir_list]
+    return [_UND if direction not in _DIR_STRS else direction for direction in dir_list]
+
+
+def _abbreviate_direction_local(ext_dir_str):
+    return (
+        ext_dir_str.upper()
+        .replace("_", "")
+        .replace("-", "")
+        .replace(" ", "")
+        .replace("NORTH", "N")
+        .replace("EAST", "E")
+        .replace("SOUTH", "S")
+        .replace("WEST", "W")
+    )
+
+
+def _unabbreviate_direction_local(abb_dir_str):
+    return (
+        abb_dir_str.upper()
+        .replace(_UND, "Undefined ")
+        .replace("N", "North ")
+        .replace("E", "East ")
+        .replace("S", "South ")
+        .replace("W", "West ")
+        .replace(" ,", ",")
+    ).strip()
+
+
+def _make_take_local(ndims, slice_dim):
+    return lambda indexer: tuple(
+        indexer if slice_dim % ndims == i else slice(None) for i in range(ndims)
+    )
+
+
+def _broadcast_indices_local(indices, shape, axis):
+    ret = []
+    ndim = len(shape)
+    for dim in range(ndim):
+        if dim == axis:
+            ret.append(indices)
+        else:
+            broadcast_slice = [np.newaxis] * ndim
+            broadcast_slice[dim] = slice(None)
+            dim_inds = np.arange(shape[dim])
+            ret.append(dim_inds[tuple(broadcast_slice)])
+    return tuple(ret)
+
+
+def _next_non_masked_element_local(a, idx):
+    import numpy.ma as ma
+
+    try:
+        next_idx = idx + a[idx:].mask.argmin()
+        if ma.is_masked(a[next_idx]):
+            return None, None
+        return next_idx, a[next_idx]
+    except (AttributeError, TypeError, IndexError):
+        return idx, a[idx]
+
+
+def _neighbor_inds_local(y, x):
+    from itertools import product
+
+    for dx, dy in product((-1, 0, 1), repeat=2):
+        yield y + dy, x + dx
+
+
+def _find_uf_local(uf, item):
+    while (next_item := uf[item]) != item:
+        uf[item] = uf[next_item]
+        item = next_item
+    return item
+
+
+def angle_to_direction(input_angle, full=False, level=3):
     """Convert a meteorological angle to a cardinal direction string.
 
     Parameters
@@ -4943,11 +6626,62 @@ def angle_to_direction(degrees, level=16, full=False):
     -------
     str
     """
-    d = _as_float(_strip(degrees, "degree")) if hasattr(degrees, "magnitude") else float(degrees)
-    return _calc.angle_to_direction(d, int(level), bool(full))
+    from operator import itemgetter
+
+    try:
+        origin_units = input_angle.units
+        input_angle = input_angle.m
+    except AttributeError:
+        origin_units = units.degree
+
+    if not hasattr(input_angle, "__len__") or isinstance(input_angle, str):
+        input_angle = [input_angle]
+        scalar = True
+    else:
+        scalar = False
+
+    np_input_angle = np.array(input_angle).astype(float)
+    origshape = np_input_angle.shape
+    ndarray = len(origshape) > 1
+    input_angle = units.Quantity(np_input_angle, origin_units)
+    input_angle[input_angle < 0] = np.nan
+    norm_angles = input_angle % _MAX_DEGREE_ANGLE
+
+    if level == 3:
+        nskip = 1
+    elif level == 2:
+        nskip = 2
+    elif level == 1:
+        nskip = 4
+    else:
+        raise ValueError("Level of complexity cannot be less than 1 or greater than 3!")
+
+    angle_dict = {
+        index * _BASE_DEGREE_MULTIPLIER.m * nskip: dir_str
+        for index, dir_str in enumerate(_DIR_STRS[::nskip])
+    }
+    angle_dict[_MAX_DEGREE_ANGLE.m] = "N"
+    angle_dict[_UND_ANGLE] = _UND
+
+    multiplier = np.round((norm_angles / _BASE_DEGREE_MULTIPLIER / nskip) - 0.001).m
+    round_angles = multiplier * _BASE_DEGREE_MULTIPLIER.m * nskip
+    round_angles[np.where(np.isnan(round_angles))] = _UND_ANGLE
+    if ndarray:
+        round_angles = round_angles.flatten()
+    dir_str_arr = itemgetter(*round_angles)(angle_dict)
+    if full:
+        dir_str_arr = ",".join(dir_str_arr)
+        dir_str_arr = _unabbreviate_direction_local(dir_str_arr)
+        dir_str_arr = dir_str_arr.split(",")
+        if scalar:
+            return dir_str_arr[0]
+        return np.array(dir_str_arr).reshape(origshape)
+    if scalar:
+        return dir_str_arr
+    return np.array(dir_str_arr).reshape(origshape)
 
 
-def parse_angle(direction):
+def parse_angle(input_dir):
     """Parse a cardinal direction string to degrees.
 
     Parameters
@@ -4959,13 +6693,20 @@ def parse_angle(direction):
     float or None
         Degrees (meteorological convention), or None if unrecognised.
     """
-    result = _calc.parse_angle(direction)
-    if result is not None:
-        return result * units.degree
-    return None
+    from operator import itemgetter
+
+    if isinstance(input_dir, str):
+        abb_dir = _clean_direction_local([_abbreviate_direction_local(input_dir)])[0]
+        return _DIR_DICT[abb_dir]
+    if hasattr(input_dir, "__len__"):
+        input_dir_str = ",".join(_clean_direction_local(input_dir, preprocess=True))
+        abb_dir_str = _abbreviate_direction_local(input_dir_str)
+        abb_dirs = _clean_direction_local(abb_dir_str.split(","))
+        return units.Quantity.from_list(itemgetter(*abb_dirs)(_DIR_DICT))
+    return units.Quantity(np.nan, "degree")
 
 
-def find_bounding_indices(values, target):
+def find_bounding_indices(arr, values, axis, from_below=True):
     """Find two indices that bracket a target value.
 
     Parameters
@@ -4977,12 +6718,40 @@ def find_bounding_indices(values, target):
     -------
     tuple of (int, int) or None
     """
-    v = _as_1d(_strip(values, "")) if hasattr(values, "magnitude") else _as_1d(values)
-    t = _as_float(_strip(target, "")) if hasattr(target, "magnitude") else float(target)
-    return _calc.find_bounding_indices(v, t)
+    if hasattr(arr, "to"):
+        arr_units = arr.units
+        arr = np.asarray(arr.magnitude, dtype=np.float64)
+        values = np.atleast_1d(np.asarray(values.to(arr_units).magnitude, dtype=np.float64))
+    else:
+        arr = np.asarray(arr, dtype=np.float64)
+        values = np.atleast_1d(np.asarray(values, dtype=np.float64))
+
+    indices_shape = list(arr.shape)
+    indices_shape[axis] = len(values)
+    indices = np.empty(indices_shape, dtype=int)
+    good = np.empty(indices_shape, dtype=bool)
+    take = _make_take_local(arr.ndim, axis)
+
+    for level_index, value in enumerate(values):
+        switches = np.abs(np.diff((arr <= value).astype(int), axis=axis))
+        good_search = np.any(switches, axis=axis)
+        if from_below:
+            index = switches.argmax(axis=axis) + 1
+        else:
+            arr_slice = [slice(None)] * arr.ndim
+            arr_slice[axis] = slice(None, None, -1)
+            index = arr.shape[axis] - 1 - switches[tuple(arr_slice)].argmax(axis=axis)
+        index[~good_search] = 0
+        store_slice = take(level_index)
+        indices[store_slice] = index
+        good[store_slice] = good_search
+
+    above = _broadcast_indices_local(indices, arr.shape, axis)
+    below = _broadcast_indices_local(indices - 1, arr.shape, axis)
+    return above, below, good
 
 
-def nearest_intersection_idx(x, y1, y2):
+def nearest_intersection_idx(a, b):
     """Find the index nearest to where two series cross.
 
     Parameters
@@ -4994,13 +6763,14 @@ def nearest_intersection_idx(x, y1, y2):
     -------
     int or None
     """
-    x_arr = _as_1d(_strip(x, "")) if hasattr(x, "magnitude") else _as_1d(x)
-    y1_arr = _as_1d(_strip(y1, "")) if hasattr(y1, "magnitude") else _as_1d(y1)
-    y2_arr = _as_1d(_strip(y2, "")) if hasattr(y2, "magnitude") else _as_1d(y2)
-    return _calc.nearest_intersection_idx(x_arr, y1_arr, y2_arr)
+    a_arr = np.asarray(getattr(a, "magnitude", a), dtype=np.float64)
+    b_arr = np.asarray(getattr(b, "magnitude", b), dtype=np.float64)
+    difference = a_arr - b_arr
+    sign_change_idx, = np.nonzero(np.diff(np.sign(difference)))
+    return sign_change_idx
 
 
-def resample_nn_1d(x, xp, fp):
+def resample_nn_1d(a, centers):
     """Nearest-neighbour 1-D resampling.
 
     Parameters
@@ -5013,16 +6783,17 @@ def resample_nn_1d(x, xp, fp):
     -------
     ndarray
     """
-    x_arr = _as_1d(_strip(x, "")) if hasattr(x, "magnitude") else _as_1d(x)
-    xp_arr = _as_1d(_strip(xp, "")) if hasattr(xp, "magnitude") else _as_1d(xp)
-    fp_arr = _as_1d(_strip(fp, "")) if hasattr(fp, "magnitude") else _as_1d(fp)
-    result = np.asarray(_calc.resample_nn_1d(x_arr, xp_arr, fp_arr))
-    if hasattr(fp, "units"):
-        return result * fp.units
-    return result
+    a_arr = np.asarray(getattr(a, "magnitude", a), dtype=np.float64)
+    centers_arr = np.asarray(getattr(centers, "magnitude", centers), dtype=np.float64)
+    indices = []
+    for center in centers_arr:
+        index = np.abs(a_arr - center).argmin()
+        if index not in indices:
+            indices.append(index)
+    return indices
 
 
-def find_peaks(data, maxima=True, iqr_ratio=0.0):
+def find_peaks(data, maxima=True, iqr_ratio=2):
     """Find peaks (or troughs) in a 1-D array, filtered by IQR.
 
     A local extremum is any point greater (or less, for troughs) than
@@ -5043,8 +6814,18 @@ def find_peaks(data, maxima=True, iqr_ratio=0.0):
     numpy.ndarray of int
         Indices of qualifying peaks.
     """
-    d = _as_1d(_strip(data, "")) if hasattr(data, "magnitude") else _as_1d(data)
-    return np.asarray(_calc.find_peaks(d, bool(maxima), float(iqr_ratio)))
+    import itertools
+
+    peaks = peak_persistence(data, maxima=maxima)
+    q1, q3 = np.percentile([peak[-1] for peak in peaks], (25, 75))
+    thresh = q3 + iqr_ratio * (q3 - q1)
+    return map(
+        list,
+        zip(
+            *(item[0] for item in itertools.takewhile(lambda item: item[1] > thresh, peaks)),
+            strict=True,
+        ),
+    )
 
 
 def peak_persistence(data, maxima=True):
@@ -5066,11 +6847,33 @@ def peak_persistence(data, maxima=True):
     list of (int, float)
         (index, persistence) pairs sorted by descending persistence.
     """
-    d = _as_1d(_strip(data, "")) if hasattr(data, "magnitude") else _as_1d(data)
-    return _calc.peak_persistence(d, bool(maxima))
+    arr = np.asarray(getattr(data, "magnitude", data), dtype=np.float64)
+    points = sorted(
+        (item for item in np.ndenumerate(arr) if not np.isnan(item[1])),
+        key=lambda item: item[1],
+        reverse=maxima,
+    )
+    per = {points[0][0]: np.inf}
+    peaks = {}
+    for pt, val in points:
+        already_done = {
+            _find_uf_local(peaks, neighbor)
+            for neighbor in _neighbor_inds_local(*pt)
+            if neighbor in peaks
+        }
+        if already_done:
+            biggest, *others = sorted(already_done, key=lambda item: arr[item], reverse=maxima)
+            peaks[pt] = biggest
+            for neighbor in others:
+                peaks[neighbor] = biggest
+                if arr[neighbor] != val:
+                    per[neighbor] = abs(arr[neighbor] - val)
+        else:
+            peaks[pt] = pt
+    return sorted(per.items(), key=lambda item: item[1], reverse=True)
 
 
-def azimuth_range_to_lat_lon(azimuths, ranges, center_lat, center_lon):
+def azimuth_range_to_lat_lon(azimuths, ranges, center_lon, center_lat, geod=None):
     """Convert radar azimuth/range to latitude/longitude.
 
     Uses great-circle (spherical earth) forward projection.
@@ -5091,12 +6894,81 @@ def azimuth_range_to_lat_lon(azimuths, ranges, center_lat, center_lon):
     tuple of (numpy.ndarray, numpy.ndarray)
         (latitudes, longitudes) arrays.
     """
-    az = _as_1d(_strip(azimuths, "degree")) if hasattr(azimuths, "magnitude") else _as_1d(azimuths)
-    rng = _as_1d(_strip(ranges, "m")) if hasattr(ranges, "magnitude") else _as_1d(ranges)
-    clat = _as_float(_strip(center_lat, "degree")) if hasattr(center_lat, "magnitude") else float(center_lat)
-    clon = _as_float(_strip(center_lon, "degree")) if hasattr(center_lon, "magnitude") else float(center_lon)
-    lats, lons = _calc.azimuth_range_to_lat_lon(az, rng, clat, clon)
-    return np.asarray(lats), np.asarray(lons)
+    import warnings
+    from pyproj import Geod
+
+    geod_obj = Geod(ellps="sphere") if geod is None else geod
+    try:
+        ranges = ranges.to("meters").magnitude
+    except AttributeError:
+        warnings.warn("Range values are not a Pint-Quantity, assuming values are in meters.")
+    try:
+        azimuths = azimuths.to("degrees").magnitude
+    except AttributeError:
+        warnings.warn("Azimuth values are not a Pint-Quantity, assuming values are in degrees.")
+    rng2d, az2d = np.meshgrid(ranges, azimuths)
+    lats = np.full(az2d.shape, center_lat)
+    lons = np.full(az2d.shape, center_lon)
+    lon, lat, _ = geod_obj.fwd(lons, lats, az2d, rng2d)
+    return lon, lat
+
+
+def find_intersections(x, a, b, direction="all", log_x=False):
+    """Calculate the best estimate of intersection."""
+    x_unit = getattr(x, "units", None)
+    y_unit = getattr(a, "units", getattr(b, "units", None))
+    x_arr = np.asarray(getattr(x, "magnitude", x), dtype=np.float64)
+    a_arr = np.asarray(getattr(a, "magnitude", a), dtype=np.float64)
+    b_arr = np.asarray(getattr(b, "magnitude", b), dtype=np.float64)
+
+    x_work = np.log(x_arr) if log_x else x_arr
+    nearest_idx = nearest_intersection_idx(a_arr, b_arr)
+    next_idx = nearest_idx + 1
+    sign_change = np.sign(a_arr[next_idx] - b_arr[next_idx])
+
+    _, x0 = _next_non_masked_element_local(x_work, nearest_idx)
+    _, x1 = _next_non_masked_element_local(x_work, next_idx)
+    _, a0 = _next_non_masked_element_local(a_arr, nearest_idx)
+    _, a1 = _next_non_masked_element_local(a_arr, next_idx)
+    _, b0 = _next_non_masked_element_local(b_arr, nearest_idx)
+    _, b1 = _next_non_masked_element_local(b_arr, next_idx)
+
+    delta_y0 = a0 - b0
+    delta_y1 = a1 - b1
+    intersect_x = (delta_y1 * x0 - delta_y0 * x1) / (delta_y1 - delta_y0)
+    intersect_y = ((intersect_x - x0) / (x1 - x0)) * (a1 - a0) + a0
+
+    if len(intersect_x) == 0:
+        if x_unit is not None:
+            intersect_x = intersect_x * x_unit
+        if y_unit is not None:
+            intersect_y = intersect_y * y_unit
+        return intersect_x, intersect_y
+
+    if log_x:
+        intersect_x = np.exp(intersect_x)
+
+    duplicate_mask = np.ediff1d(intersect_x, to_end=1) != 0
+    if direction == "increasing":
+        mask = sign_change > 0
+    elif direction == "decreasing":
+        mask = sign_change < 0
+    elif direction == "all":
+        mask = duplicate_mask
+    else:
+        raise ValueError(f"Unknown option for direction: {direction}")
+
+    intersect_x = intersect_x[mask]
+    intersect_y = intersect_y[mask]
+    if direction != "all":
+        intersect_x = intersect_x[duplicate_mask[mask]]
+        intersect_y = intersect_y[duplicate_mask[mask]]
+
+    if x_unit is not None:
+        intersect_x = intersect_x * x_unit
+    if y_unit is not None:
+        intersect_y = intersect_y * y_unit
+    return intersect_x, intersect_y
 
 
 def advection_3d(scalar, u, v, w, dx, dy, dz):
@@ -5516,32 +7388,37 @@ def parcel_profile_with_lcl_as_dataset(pressure, temperature, dewpoint):
     xarray.Dataset
     """
     import xarray as xr
-    # Extract surface values (first element = highest pressure)
-    t_arr = np.asarray(temperature.magnitude if hasattr(temperature, "magnitude") else temperature, dtype=np.float64)
-    td_arr = np.asarray(dewpoint.magnitude if hasattr(dewpoint, "magnitude") else dewpoint, dtype=np.float64)
-    t_units_obj = temperature.units if hasattr(temperature, "units") else units.degC
-    t_sfc = t_arr[0] * t_units_obj
-    td_sfc = td_arr[0] * t_units_obj
-    p_out, t_parcel = parcel_profile_with_lcl(pressure, t_sfc, td_sfc)
-    p_mag = p_out.magnitude if hasattr(p_out, "magnitude") else np.asarray(p_out)
-    p_units = str(p_out.units) if hasattr(p_out, "units") else "hPa"
-    # Interpolate ambient T and Td onto the new pressure grid (with LCL inserted)
-    p_orig = np.asarray(pressure.magnitude if hasattr(pressure, "magnitude") else pressure, dtype=np.float64)
-    t_orig = t_arr
-    td_orig = td_arr
-    p_new = np.asarray(p_mag, dtype=np.float64)
-    t_interp = np.interp(p_new, p_orig[::-1], t_orig[::-1])[::-1] if p_orig[0] > p_orig[-1] else np.interp(p_new, p_orig, t_orig)
-    td_interp = np.interp(p_new, p_orig[::-1], td_orig[::-1])[::-1] if p_orig[0] > p_orig[-1] else np.interp(p_new, p_orig, td_orig)
-    t_parc = np.asarray(t_parcel.magnitude if hasattr(t_parcel, "magnitude") else t_parcel, dtype=np.float64)
-    t_units = str(temperature.units) if hasattr(temperature, "units") else "degC"
-    coord = xr.Variable("isobaric", p_new, attrs={"units": p_units})
+
+    p, ambient_temperature, ambient_dew_point, parcel_temperature = parcel_profile_with_lcl(
+        pressure,
+        temperature,
+        dewpoint,
+    )
     return xr.Dataset(
         {
-            "ambient_temperature": xr.Variable("isobaric", t_interp, attrs={"units": t_units}),
-            "ambient_dew_point": xr.Variable("isobaric", td_interp, attrs={"units": t_units}),
-            "parcel_temperature": xr.Variable("isobaric", t_parc, attrs={"units": t_units}),
+            "ambient_temperature": (
+                ("isobaric",),
+                ambient_temperature,
+                {"standard_name": "air_temperature"},
+            ),
+            "ambient_dew_point": (
+                ("isobaric",),
+                ambient_dew_point,
+                {"standard_name": "dew_point_temperature"},
+            ),
+            "parcel_temperature": (
+                ("isobaric",),
+                parcel_temperature,
+                {"long_name": "air_temperature_of_lifted_parcel"},
+            ),
         },
-        coords={"isobaric": coord},
+        coords={
+            "isobaric": (
+                "isobaric",
+                p.magnitude,
+                {"units": str(p.units), "standard_name": "air_pressure"},
+            )
+        },
     )
 
 
@@ -5572,80 +7449,76 @@ def isentropic_interpolation_as_dataset(levels, temperature, *args,
     xarray.Dataset
     """
     import xarray as xr
-    # Extract pressure from the vertical coordinate if not provided
-    temp_arr = temperature
-    if hasattr(temp_arr, "metpy"):
-        temp_arr = temp_arr.metpy.dequantify()
-    t_vals = np.asarray(temp_arr.values, dtype=np.float64)
-    if pressure is not None:
-        p_vals = np.asarray(pressure.values if hasattr(pressure, "values") else pressure, dtype=np.float64)
-    else:
-        # Try to find the vertical coordinate
-        for dim in temp_arr.dims:
-            coord = temp_arr.coords[dim]
-            u = str(getattr(coord, "units", getattr(coord.attrs.get("units", ""), "__str__", lambda: "")()))
-            if "Pa" in u or "hPa" in u or "millibar" in u or dim in ("isobaric", "level", "pressure"):
-                p_vals = np.asarray(coord.values, dtype=np.float64)
-                break
-        else:
-            p_vals = np.asarray(temp_arr.coords[temp_arr.dims[0]].values, dtype=np.float64)
-    theta_levs = np.asarray(levels.magnitude if hasattr(levels, "magnitude") else levels, dtype=np.float64)
-    # Build 3D pressure array if needed
-    shape = t_vals.shape
-    if p_vals.ndim == 1 and t_vals.ndim == 3:
-        p_3d = np.broadcast_to(p_vals[:, None, None], shape).copy()
-    elif p_vals.ndim == 1 and t_vals.ndim == 1:
-        p_3d = p_vals
-    else:
-        p_3d = p_vals
-    extra = [np.asarray(a.values if hasattr(a, "values") else a, dtype=np.float64) for a in args]
-    result = isentropic_interpolation(theta_levs, p_3d, t_vals, extra)
-    # Package as Dataset, preserving spatial dimensions for 3D output
-    n_theta = len(theta_levs)
-    theta_coord = xr.Variable("isentropic_level", theta_levs, attrs={"units": "K", "positive": "up"})
 
-    # Determine output spatial dims from the input temperature array
-    has_spatial = hasattr(temperature, "dims") and len(temperature.dims) >= 2
-    if has_spatial:
-        # Input is (vertical, ..spatial_dims..). Output is (isentropic_level, ..spatial_dims..)
-        spatial_dims = temperature.dims[1:]  # e.g., ("y", "x")
-        spatial_coords = {k: temperature.coords[k] for k in temperature.coords
-                          if k not in (temperature.dims[0],) and k != "isentropic_level"}
-        out_dims = ("isentropic_level",) + spatial_dims
-        spatial_shape = tuple(temperature.sizes[d] for d in spatial_dims)
-    else:
-        spatial_dims = ()
-        spatial_coords = {}
-        out_dims = ("isentropic_level",)
-        spatial_shape = ()
+    all_args = xr.broadcast(temperature, *args)
+    if pressure is None:
+        pressure = all_args[0].metpy.vertical
 
-    ds_vars = {}
-    all_coords = {"isentropic_level": theta_coord}
-    all_coords.update(spatial_coords)
+    pressure_units = getattr(getattr(pressure, "metpy", None), "units", None)
+    if pressure_units is None:
+        _, pressure_units = _as_array_with_unit(pressure)
+    if units.get_dimensionality(pressure_units) != units.get_dimensionality("[pressure]"):
+        raise ValueError(
+            "The pressure array/vertical coordinate for the passed in data does not appear "
+            "to be pressure. Pass pressure explicitly with proper units."
+        )
 
-    if isinstance(result, (list, tuple)) and len(result) >= 2:
-        target_shape = (n_theta,) + spatial_shape
-        p_arr = np.asarray(result[0])
-        t_arr = np.asarray(result[1])
-        if p_arr.shape != target_shape and spatial_shape:
-            try:
-                p_arr = p_arr.reshape(target_shape)
-                t_arr = t_arr.reshape(target_shape)
-            except ValueError:
-                pass
-        ds_vars["pressure"] = xr.Variable(out_dims, p_arr, attrs={"units": "hPa"})
-        ds_vars["temperature"] = xr.Variable(out_dims, t_arr, attrs={"units": "K"})
-        for i, a in enumerate(args):
-            name = getattr(a, "name", None) or f"field_{i}"
-            if 2 + i < len(result):
-                f_arr = np.asarray(result[2 + i])
-                if f_arr.shape != target_shape and spatial_shape:
-                    try:
-                        f_arr = f_arr.reshape(target_shape)
-                    except ValueError:
-                        pass
-                ds_vars[name] = xr.Variable(out_dims, f_arr)
-    return xr.Dataset(ds_vars, coords=all_coords)
+    vertical_dim_num = all_args[0].metpy.find_axis_number("vertical")
+    vertical_dim_name = all_args[0].dims[vertical_dim_num]
+    ret = isentropic_interpolation(
+        levels,
+        pressure,
+        all_args[0].metpy.unit_array,
+        *(arg.metpy.unit_array for arg in all_args[1:]),
+        vertical_dim=vertical_dim_num,
+        temperature_out=True,
+        max_iters=max_iters,
+        eps=eps,
+        bottom_up_search=bottom_up_search,
+    )
+
+    new_coords = {
+        "isentropic_level": xr.DataArray(
+            levels.magnitude,
+            dims=("isentropic_level",),
+            coords={"isentropic_level": levels.magnitude},
+            name="isentropic_level",
+            attrs={"units": str(levels.units), "positive": "up"},
+        ),
+        **{
+            key: value
+            for key, value in all_args[0].coords.items()
+            if key != vertical_dim_name
+        },
+    }
+    new_dims = [
+        dim if dim != vertical_dim_name else "isentropic_level"
+        for dim in all_args[0].dims
+    ]
+
+    return xr.Dataset(
+        {
+            "pressure": (
+                new_dims,
+                ret[0],
+                {"standard_name": "air_pressure"},
+            ),
+            "temperature": (
+                new_dims,
+                ret[1],
+                {"standard_name": "air_temperature"},
+            ),
+            **{
+                (all_args[i].name or f"field_{i - 1}"): (
+                    new_dims,
+                    ret[i + 1],
+                    all_args[i].attrs,
+                )
+                for i in range(1, len(all_args))
+            },
+        },
+        coords=new_coords,
+    )
 
 
 def zoom_xarray(input_field, zoom, output=None, order=3, mode="constant",
@@ -5666,25 +7539,41 @@ def zoom_xarray(input_field, zoom, output=None, order=3, mode="constant",
     xarray.DataArray
         Zoomed field with scaled coordinates.
     """
-    import xarray as xr
-    from scipy.ndimage import zoom as _zoom
-    data = input_field.values
-    if hasattr(input_field, "metpy"):
-        data = input_field.metpy.dequantify().values
-    zoomed = _zoom(np.asarray(data, dtype=np.float64), zoom, output=output,
-                   order=order, mode=mode, cval=cval, prefilter=prefilter)
-    zoom_factors = np.atleast_1d(zoom)
-    if zoom_factors.size == 1:
-        zoom_factors = np.full(data.ndim, zoom_factors[0])
-    new_coords = {}
-    for i, dim in enumerate(input_field.dims):
-        if dim in input_field.coords:
-            old = np.asarray(input_field.coords[dim].values, dtype=np.float64)
-            new_len = zoomed.shape[i]
-            new_coords[dim] = np.linspace(old[0], old[-1], new_len)
-    result = xr.DataArray(zoomed, dims=input_field.dims, coords=new_coords,
-                          attrs=input_field.attrs.copy())
-    return result
+    from scipy.ndimage import zoom as scipy_zoom
+
+    field = input_field.metpy.dequantify() if hasattr(input_field, "metpy") else input_field
+    zoomed_data = scipy_zoom(
+        field.data,
+        zoom,
+        output=output,
+        order=order,
+        mode=mode,
+        cval=cval,
+        prefilter=prefilter,
+    )
+
+    if not np.iterable(zoom):
+        zoom = tuple(zoom for _ in field.dims)
+
+    zoomed_dim_coords = {}
+    for dim_name, dim_zoom in zip(field.dims, zoom, strict=False):
+        if dim_name in field.coords:
+            zoomed_dim_coords[dim_name] = scipy_zoom(
+                field[dim_name].data,
+                dim_zoom,
+                order=order,
+                mode=mode,
+                cval=cval,
+                prefilter=prefilter,
+            )
+    if hasattr(field, "metpy_crs"):
+        zoomed_dim_coords["metpy_crs"] = field.metpy_crs
+    return xr.DataArray(
+        zoomed_data,
+        dims=field.dims,
+        coords=zoomed_dim_coords,
+        attrs=field.attrs,
+    )
 
 
 # ---------------------------------------------------------------------------
