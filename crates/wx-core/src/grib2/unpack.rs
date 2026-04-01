@@ -120,7 +120,7 @@ pub fn unpack_message(msg: &Grib2Message) -> crate::error::Result<Vec<f64>> {
     };
 
     // Apply bitmap if present
-    let mut values = if let Some(ref bitmap) = msg.bitmap {
+    let values = if let Some(ref bitmap) = msg.bitmap {
         let n = bitmap.len();
         let mut result = vec![f64::NAN; n];
         let mut val_idx = 0;

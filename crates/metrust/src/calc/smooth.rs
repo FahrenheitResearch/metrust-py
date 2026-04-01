@@ -62,6 +62,7 @@ use rayon::prelude::*;
 
 /// Row-major index.
 #[inline(always)]
+#[cfg(test)]
 fn idx(j: usize, i: usize, nx: usize) -> usize {
     j * nx + i
 }

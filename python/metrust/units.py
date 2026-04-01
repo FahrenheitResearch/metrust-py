@@ -45,6 +45,21 @@ def _strip(quantity, target_unit):
     """
     if hasattr(quantity, "magnitude"):
         return quantity.to(target_unit).magnitude
+    data = getattr(quantity, "data", None)
+    if hasattr(data, "to"):
+        return data.to(target_unit).magnitude
+    if hasattr(quantity, "metpy"):
+        try:
+            return quantity.metpy.unit_array.to(target_unit).magnitude
+        except Exception:
+            pass
+    attrs = getattr(quantity, "attrs", None)
+    if isinstance(attrs, dict):
+        unit_name = attrs.get("units")
+        if unit_name:
+            return (np.asarray(data if data is not None else quantity, dtype=np.float64) * units(unit_name)).to(
+                target_unit
+            ).magnitude
     return quantity
 
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pytest
 import xarray as xr
@@ -244,5 +246,11 @@ KINEMATICS_CASES = [
 def test_runtime_parity_kinematics_extra(kinematics_context, name, builder, atol):
     args, kwargs = builder(kinematics_context)
     actual = getattr(mcalc, name)(*args, **kwargs)
-    expected = getattr(mpcalc, name)(*args, **kwargs)
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="invalid value encountered in divide",
+            category=RuntimeWarning,
+        )
+        expected = getattr(mpcalc, name)(*args, **kwargs)
     _assert_runtime_close(actual, expected, atol)

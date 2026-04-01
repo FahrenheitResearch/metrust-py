@@ -78,8 +78,14 @@ def _assert_close(actual, expected, atol):
     if hasattr(actual, "to") and hasattr(expected, "to"):
         actual_arr, expected_arr = _compare_quantity(actual, expected)
     else:
-        actual_arr = np.asarray(actual, dtype=np.float64)
-        expected_arr = np.asarray(expected, dtype=np.float64)
+        if hasattr(actual, "magnitude"):
+            actual_arr = np.asarray(actual.magnitude, dtype=np.float64)
+        else:
+            actual_arr = np.asarray(actual, dtype=np.float64)
+        if hasattr(expected, "magnitude"):
+            expected_arr = np.asarray(expected.magnitude, dtype=np.float64)
+        else:
+            expected_arr = np.asarray(expected, dtype=np.float64)
 
     assert actual_arr.shape == expected_arr.shape
     np.testing.assert_allclose(actual_arr, expected_arr, atol=atol, rtol=atol, equal_nan=True)

@@ -225,7 +225,7 @@ def test_qvector_and_frontogenesis_infer_dxdy_from_coords():
     assert qx.dims == ("y", "x")
     assert qy.dims == ("y", "x")
     assert qdiv.dims == ("y", "x")
-    assert qdiv.attrs["units"] == "1/s"
+    assert qdiv.attrs["units"] == "meter / kilogram / second"
     assert fronto.shape == (3, 3)
 
 

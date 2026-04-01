@@ -41,6 +41,7 @@ use std::io::Read;
 const BYTES_PER_WORD: usize = 4;
 const GEMPAK_HEADER: &[u8] = b"GEMPAK DATA MANAGEMENT FILE ";
 const USED_FLAG: i32 = 9999;
+#[cfg(test)]
 const MISSING_FLOAT: f32 = -9999.0;
 
 // ── Public types ───────────────────────────────────────────────────────
@@ -229,17 +230,8 @@ impl GemBuf {
         })
     }
 
-    fn remaining(&self) -> usize {
-        if self.pos >= self.data.len() { 0 } else { self.data.len() - self.pos }
-    }
-
     fn jump(&mut self, offset: usize) {
         self.pos = offset;
-    }
-
-    /// Jump to a word-based pointer (1-indexed, GEMPAK convention).
-    fn jump_to_word(&mut self, word: usize) {
-        self.pos = word_to_pos(word);
     }
 
     fn read_bytes(&mut self, n: usize) -> Result<&[u8], String> {
@@ -284,15 +276,6 @@ impl GemBuf {
         })
     }
 
-    fn read_u32(&mut self) -> Result<u32, String> {
-        let arr = self.read_4bytes()?;
-        Ok(if self.big_endian {
-            u32::from_be_bytes(arr)
-        } else {
-            u32::from_le_bytes(arr)
-        })
-    }
-
     fn read_f32(&mut self) -> Result<f32, String> {
         let arr = self.read_4bytes()?;
         Ok(if self.big_endian {
@@ -310,14 +293,6 @@ impl GemBuf {
     /// Read a 4-byte character field (GEMPAK stores identifiers this way).
     fn read_char4(&mut self) -> Result<String, String> {
         self.read_string(4)
-    }
-
-    /// Peek at raw bytes without advancing position.
-    fn peek_bytes(&self, offset: usize, n: usize) -> Result<&[u8], String> {
-        if offset + n > self.data.len() {
-            return Err("Peek past end of buffer".to_string());
-        }
-        Ok(&self.data[offset..offset + n])
     }
 }
 
@@ -345,7 +320,7 @@ fn fortran_ishift(i: i32, shift: i32) -> i32 {
 /// Parsed product description block.
 #[derive(Debug)]
 struct ProductDesc {
-    version: i32,
+    _version: i32,
     file_headers: i32,
     file_keys_ptr: i32,
     rows: i32,
@@ -358,7 +333,7 @@ struct ProductDesc {
     column_headers_ptr: i32,
     parts: i32,
     parts_ptr: i32,
-    data_mgmt_ptr: i32,
+    _data_mgmt_ptr: i32,
     _data_mgmt_length: i32,
     data_block_ptr: i32,
     file_type: i32,
@@ -395,7 +370,7 @@ impl ProductDesc {
         let missing_float = buf.read_f32()?;
 
         Ok(ProductDesc {
-            version,
+            _version: version,
             file_headers,
             file_keys_ptr,
             rows,
@@ -408,7 +383,7 @@ impl ProductDesc {
             column_headers_ptr,
             parts,
             parts_ptr,
-            data_mgmt_ptr,
+            _data_mgmt_ptr: data_mgmt_ptr,
             _data_mgmt_length: data_mgmt_length,
             data_block_ptr,
             file_type,
@@ -427,7 +402,7 @@ struct PartDesc {
     _name: String,
     header_length: i32,
     _data_type: i32,
-    parameter_count: i32,
+    _parameter_count: i32,
 }
 
 // ── Column header (grid metadata) ──────────────────────────────────────
@@ -710,7 +685,7 @@ impl GempakGrid {
                 _name: name,
                 header_length,
                 _data_type: data_type,
-                parameter_count,
+                _parameter_count: parameter_count,
             });
         }
 

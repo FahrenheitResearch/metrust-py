@@ -296,7 +296,6 @@ fn render_quadrant_block(
                 if has_prev && prev_bg != (0, 0, 0) {
                     out.push_str("\x1b[49m");
                 }
-                prev_bg = (0, 0, 0);
             } else if best_pattern == 0 {
                 // Space — only need background
                 if !has_prev || bg_tuple != prev_bg {
@@ -399,9 +398,9 @@ fn find_best_block(block: &[[i16; 3]; 4]) -> (usize, [u8; 3], [u8; 3]) {
 #[inline]
 fn redmean_distance(c1: [u8; 3], c2: [u8; 3]) -> f64 {
     let rmean = (c1[0] as f64 + c2[0] as f64) / 2.0;
-    let dr = (c1[0] as f64 - c2[0] as f64);
-    let dg = (c1[1] as f64 - c2[1] as f64);
-    let db = (c1[2] as f64 - c2[2] as f64);
+    let dr = c1[0] as f64 - c2[0] as f64;
+    let dg = c1[1] as f64 - c2[1] as f64;
+    let db = c1[2] as f64 - c2[2] as f64;
     ((2.0 + rmean / 256.0) * dr * dr + 4.0 * dg * dg + (2.0 + (255.0 - rmean) / 256.0) * db * db)
         .sqrt()
 }

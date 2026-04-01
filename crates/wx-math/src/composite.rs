@@ -308,11 +308,6 @@ fn compute_srh_column(
         let sr_u_top = u_top_val - storm_u;
         let sr_v_top = v_top_val - storm_v;
 
-        let du = u_top_val - u_bot;
-        let dv = v_top_val - v_bot;
-        let avg_sr_u = 0.5 * (sr_u_bot + sr_u_top);
-        let avg_sr_v = 0.5 * (sr_v_bot + sr_v_top);
-
         srh += sr_u_top * sr_v_bot - sr_u_bot * sr_v_top;
     }
 

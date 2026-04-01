@@ -4082,6 +4082,16 @@ def _safe_unit_str(unit_obj):
     return str(unit_obj)
 
 
+def _normalize_unit_obj(unit_obj):
+    if unit_obj is None:
+        return None
+    if isinstance(unit_obj, str):
+        return units(unit_obj).units
+    if hasattr(unit_obj, "units"):
+        return unit_obj.units
+    return unit_obj
+
+
 def _first_derivative_variable(field, delta, axis):
     """Compute first derivative with variable spacing along an axis.
 
@@ -4248,8 +4258,10 @@ def divergence(u, v, dx=None, dy=None, x_dim=-1, y_dim=-2, parallel_scale=None,
         dx, dy = _resolve_dx_dy(v, dx=dx, dy=dy, latitude=latitude, longitude=longitude)
     if dx is None or dy is None:
         raise TypeError("divergence requires dx/dy or inferable latitude/longitude coordinates")
-    u_arr = np.asarray(_strip(u, "m/s"), dtype=np.float64)
-    v_arr = np.asarray(_strip(v, "m/s"), dtype=np.float64)
+    u_unit = _data_unit(u)
+    v_unit = _data_unit(v)
+    u_arr = np.asarray(_strip(u, str(u_unit) if u_unit is not None else "m/s"), dtype=np.float64)
+    v_arr = np.asarray(_strip(v, str(v_unit) if v_unit is not None else "m/s"), dtype=np.float64)
 
     # Check for map projection scale factors (spherical corrections)
     if parallel_scale is None and meridional_scale is None:
@@ -4266,6 +4278,8 @@ def divergence(u, v, dx=None, dy=None, x_dim=-1, y_dim=-2, parallel_scale=None,
         du_dx_corr, _, _, dv_dy_corr = _vector_derivative_corrected(
             u_arr, v_arr, dx, dy, ps, ms)
         result = du_dx_corr + dv_dy_corr
+        if u_unit is not None or v_unit is not None:
+            return _wrap_derivative_like(u if u_unit is not None else v, result, units.m)
         return _wrap_result_like(u, result, "1/s")
 
     # Variable spacing without scale factors
@@ -4273,6 +4287,8 @@ def divergence(u, v, dx=None, dy=None, x_dim=-1, y_dim=-2, parallel_scale=None,
         dudx = _first_derivative_variable(u_arr, dx_m, axis=-1)
         dvdy = _first_derivative_variable(v_arr, dy_m, axis=-2)
         result = dudx + dvdy
+        if u_unit is not None or v_unit is not None:
+            return _wrap_derivative_like(u if u_unit is not None else v, result, units.m)
         return _wrap_result_like(u, result, "1/s")
 
     # Uniform grid: fast Rust path
@@ -4280,6 +4296,8 @@ def divergence(u, v, dx=None, dy=None, x_dim=-1, y_dim=-2, parallel_scale=None,
     dy_val = float(dy_m.mean()) if dy_m.ndim > 0 else float(dy_m)
     if u_arr.ndim == 2:
         result = np.asarray(_calc.divergence(np.ascontiguousarray(u_arr), np.ascontiguousarray(v_arr), dx_val, dy_val))
+        if u_unit is not None or v_unit is not None:
+            return _wrap_derivative_like(u if u_unit is not None else v, result, units.m)
         return _wrap_result_like(u, result, "1/s")
     lead_shape = u_arr.shape[:-2]
     ny, nx = u_arr.shape[-2:]
@@ -4290,6 +4308,8 @@ def divergence(u, v, dx=None, dy=None, x_dim=-1, y_dim=-2, parallel_scale=None,
         result.reshape((-1, ny, nx))[idx] = np.asarray(
             _calc.divergence(np.ascontiguousarray(u_flat[idx]), np.ascontiguousarray(v_flat[idx]), dx_val, dy_val)
         ).reshape((ny, nx))
+    if u_unit is not None or v_unit is not None:
+        return _wrap_derivative_like(u if u_unit is not None else v, result, units.m)
     return _wrap_result_like(u, result, "1/s")
 
 
@@ -4655,22 +4675,28 @@ def _cross_section_distance_coords(cross):
             lon,
             lat,
         )
+        x_vals = np.asarray(distance * np.sin(np.deg2rad(forward_az)), dtype=np.float64)
+        y_vals = np.asarray(distance * np.cos(np.deg2rad(forward_az)), dtype=np.float64)
         x = xr.DataArray(
-            units.Quantity(distance * np.sin(np.deg2rad(forward_az)), "meter"),
+            x_vals,
             coords=lon_coord.coords,
             dims=lon_coord.dims,
+            attrs={"units": "meter"},
         )
         y = xr.DataArray(
-            units.Quantity(distance * np.cos(np.deg2rad(forward_az)), "meter"),
+            y_vals,
             coords=lat_coord.coords,
             dims=lat_coord.dims,
+            attrs={"units": "meter"},
         )
         return x, y
     if "x" in coords and "y" in coords:
         x_coord = coords["x"]
         y_coord = coords["y"]
-        x = xr.DataArray(_dataarray_unit_array(x_coord, "meter"), coords=x_coord.coords, dims=x_coord.dims)
-        y = xr.DataArray(_dataarray_unit_array(y_coord, "meter"), coords=y_coord.coords, dims=y_coord.dims)
+        x_vals = np.asarray(_dataarray_unit_array(x_coord, "meter").to("meter").magnitude, dtype=np.float64)
+        y_vals = np.asarray(_dataarray_unit_array(y_coord, "meter").to("meter").magnitude, dtype=np.float64)
+        x = xr.DataArray(x_vals, coords=x_coord.coords, dims=x_coord.dims, attrs={"units": "meter"})
+        y = xr.DataArray(y_vals, coords=y_coord.coords, dims=y_coord.dims, attrs={"units": "meter"})
         return x, y
     raise AttributeError("Sufficient horizontal coordinates not defined.")
 
@@ -4680,16 +4706,18 @@ def _cross_section_latitude_coord(cross):
     if "latitude" in coords:
         latitude = coords["latitude"]
         return xr.DataArray(
-            _dataarray_unit_array(latitude, "degree"),
+            np.asarray(_dataarray_unit_array(latitude, "degree").to("degree").magnitude, dtype=np.float64),
             coords=latitude.coords,
             dims=latitude.dims,
+            attrs={**dict(latitude.attrs), "units": latitude.attrs.get("units", "degree")},
         )
     if "lat" in coords:
         latitude = coords["lat"]
         return xr.DataArray(
-            _dataarray_unit_array(latitude, "degree"),
+            np.asarray(_dataarray_unit_array(latitude, "degree").to("degree").magnitude, dtype=np.float64),
             coords=latitude.coords,
             dims=latitude.dims,
+            attrs={**dict(latitude.attrs), "units": latitude.attrs.get("units", "degree")},
         )
     if hasattr(cross, "metpy"):
         try:
@@ -4701,8 +4729,12 @@ def _cross_section_latitude_coord(cross):
                 inverse=True,
                 radians=False,
             )[1]
-            return xr.DataArray(units.Quantity(latitude, "degrees_north"), coords=y.coords,
-                                dims=y.dims)
+            return xr.DataArray(
+                np.asarray(latitude, dtype=np.float64),
+                coords=y.coords,
+                dims=y.dims,
+                attrs={"units": "degrees_north"},
+            )
         except Exception:
             pass
     raise AttributeError("Latitude coordinates are required for absolute_momentum.")
@@ -5114,7 +5146,12 @@ def absolute_momentum(u, v=None, index="index"):
         f = coriolis_parameter(latitude)
         x, y = _cross_section_distance_coords(norm_wind)
         distance_q = np.hypot(_dataarray_unit_array(x, "meter"), _dataarray_unit_array(y, "meter"))
-        distance = xr.DataArray(distance_q, coords=x.coords, dims=x.dims)
+        distance = xr.DataArray(
+            np.asarray(distance_q.to("meter").magnitude, dtype=np.float64),
+            coords=x.coords,
+            dims=x.dims,
+            attrs={"units": "meter"},
+        ).metpy.quantify()
         _, distance = xr.broadcast(norm_wind, distance)
         result = norm_wind + f * distance
         return result.metpy.convert_units("m/s") if hasattr(result, "metpy") else result
@@ -5142,12 +5179,14 @@ def coriolis_parameter(latitude):
     lat_arr = np.asarray(lat_stripped, dtype=np.float64)
     result = 2.0 * 7.292115e-5 * np.sin(np.deg2rad(lat_arr))
     if _is_dataarray_like(latitude):
+        attrs = dict(latitude.attrs)
+        attrs["units"] = "1/s"
         return xr.DataArray(
-            np.asarray(result, dtype=np.float64) * units("1/s"),
+            np.asarray(result, dtype=np.float64),
             coords=latitude.coords,
             dims=latitude.dims,
-            attrs=dict(latitude.attrs),
-        )
+            attrs=attrs,
+        ).metpy.quantify()
     return _wrap_result_like(latitude, result, "1/s")
 
 
@@ -5216,7 +5255,8 @@ def curvature_vorticity(u, v, dx=None, dy=None, x_dim=-1, y_dim=-2, parallel_sca
         longitude=longitude,
         crs=crs,
     )
-    return (u * u * dvdx - v * v * dudy - v * u * dudx + u * v * dvdy) / (u ** 2 + v ** 2)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return (u * u * dvdx - v * v * dudy - v * u * dudx + u * v * dvdy) / (u ** 2 + v ** 2)
 
 
 def inertial_advective_wind(u, v, u_geostrophic, v_geostrophic, dx=None, dy=None,
@@ -5362,7 +5402,8 @@ def shear_vorticity(u, v, dx=None, dy=None, x_dim=-1, y_dim=-2, parallel_scale=N
         longitude=longitude,
         crs=crs,
     )
-    return (v * u * dudx + v * v * dvdx - u * u * dudy - u * v * dvdy) / (u ** 2 + v ** 2)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return (v * u * dudx + v * v * dvdx - u * u * dudy - u * v * dvdy) / (u ** 2 + v ** 2)
 
 
 def shearing_deformation(u, v, dx=None, dy=None, x_dim=-1, y_dim=-2,
@@ -6449,16 +6490,16 @@ def _gradient_spacing(position, axis_size, mode):
 
 def _data_unit(data):
     if hasattr(data, "units"):
-        return data.units
+        return _normalize_unit_obj(data.units)
     try:
         unit_attr = data.metpy.units
         if str(unit_attr) != "dimensionless":
-            return unit_attr
+            return _normalize_unit_obj(unit_attr)
     except Exception:
         pass
     attrs = getattr(data, "attrs", {})
     if isinstance(attrs, dict) and "units" in attrs:
-        return units(attrs["units"])
+        return _normalize_unit_obj(attrs["units"])
     return None
 
 
