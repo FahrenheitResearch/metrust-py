@@ -54,6 +54,23 @@ All measurements are p50 (median) latency, collected on an AMD Ryzen 9 using the
 
 For grid kinematics the T2 and T1 numbers are nearly identical. The Rust array binding accepts raw NumPy arrays and performs the full 2-D finite-difference computation in compiled code, so the Pint wrapper cost is negligible relative to the grid traversal.
 
+### Workflow Replay Benchmarks
+
+These are end-to-end import-swap replays, not single-function timings. The
+same workflow shapes are also enforced in `tests/test_cookbook_replays.py`.
+
+Local snapshot from `python benches/bench_workflows.py` on Windows 11 with
+Python `3.13.7`:
+
+| Workflow | metrust p50 | MetPy p50 | Speedup |
+|---|---:|---:|---:|
+| Cookbook sounding replay | 10.38 ms | 30.79 ms | **2.97x** |
+| Cookbook grid diagnostics replay | 2.59 ms | 22.73 ms | **8.79x** |
+| Cookbook xarray replay | 2.51 ms | 3.66 ms | **1.46x** |
+
+The dedicated harness lives in `benches/bench_workflows.py`, with a published
+summary on the [Workflow Benchmarks](workflow-benchmarks.md) page.
+
 ---
 
 ## Where metrust is NOT Faster

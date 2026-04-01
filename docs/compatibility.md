@@ -31,8 +31,9 @@ Current differential-CI target:
 - Python `3.10` through `3.13`
 - dependency modes: `metrust-only`, `metrust + MetPy`, and `metrust + MetPy + xarray`
 
-For the exact list of parity-sensitive `metrust.calc` paths that may delegate
-to MetPy when available, see the [delegation ledger](delegation-ledger.md).
+The shared `metrust.calc` surface now stays on native metrust implementations
+even when MetPy is installed. For the current compatibility contract and any
+future exceptions, see the [delegation ledger](delegation-ledger.md).
 
 ---
 
@@ -79,15 +80,15 @@ to MetPy when available, see the [delegation ledger](delegation-ledger.md).
 | `mixing_ratio_from_specific_humidity` | Native + Array | `metpy.calc.mixing_ratio_from_specific_humidity` | |
 | `specific_humidity_from_mixing_ratio` | Native + Array | `metpy.calc.specific_humidity_from_mixing_ratio` | |
 | `lcl` | Native | `metpy.calc.lcl` | Scalar only. Returns (p_lcl, t_lcl). Rust also exposes `lcl_pressure` and `lcl_pressure_array` internally. See section 5 for approximation differences. |
-| `lfc` | Native (profile) | `metpy.calc.lfc` | Native by default; optionally delegates to MetPy for quantity-profile parity-sensitive cases. |
-| `el` | Native (profile) | `metpy.calc.el` | Native by default; optionally delegates to MetPy for quantity-profile parity-sensitive cases. |
-| `cape_cin` | Native (profile) | `metpy.calc.cape_cin` | Native by default; MetPy parcel-profile form can optionally delegate for exact parity. Extended signature supports parcel_type, ml_depth, mu_depth, top_m, and returns (CAPE, CIN, LCL height, LFC height). |
+| `lfc` | Native (profile) | `metpy.calc.lfc` | Native profile intersection solver with support for `top`, `bottom`, `wide`, `most_cape`, and `all`. |
+| `el` | Native (profile) | `metpy.calc.el` | Native profile intersection solver with support for `top`, `bottom`, `wide`, `most_cape`, and `all`. |
+| `cape_cin` | Native (profile) | `metpy.calc.cape_cin` | Native for both the MetPy parcel-profile form and the extended sounding-height form. Supports `which_lfc`, `which_el`, `parcel_type`, `ml_depth`, `mu_depth`, and `top_m`, returning either `(CAPE, CIN)` or `(CAPE, CIN, LCL height, LFC height)` depending on the calling convention. |
 | `surface_based_cape_cin` | Native (profile) | `metpy.calc.surface_based_cape_cin` | |
 | `mixed_layer_cape_cin` | Native (profile) | `metpy.calc.mixed_layer_cape_cin` | |
 | `most_unstable_cape_cin` | Native (profile) | `metpy.calc.most_unstable_cape_cin` | |
-| `downdraft_cape` | Native (profile) | `metpy.calc.downdraft_cape` | Native by default; optionally delegates on quantity-profile calls when MetPy is available. |
+| `downdraft_cape` | Native (profile) | `metpy.calc.downdraft_cape` | Native DCAPE layer selection, Normand wet-bulb start, and moist-adiabatic descent path. |
 | `parcel_profile` | Native (profile) | `metpy.calc.parcel_profile` | |
-| `parcel_profile_with_lcl` | Native (profile) | `metpy.calc.parcel_profile_with_lcl` | Native by default; optionally delegates on quantity-profile calls when MetPy is available. |
+| `parcel_profile_with_lcl` | Native (profile) | `metpy.calc.parcel_profile_with_lcl` | Native profile interpolation and parcel trace with the LCL inserted. |
 | `dry_lapse` | Native (profile) | `metpy.calc.dry_lapse` | |
 | `moist_lapse` | Native (profile) | `metpy.calc.moist_lapse` | |
 | `ccl` | Native (profile) | `metpy.calc.ccl` | Convective Condensation Level. |
@@ -188,7 +189,7 @@ major moisture conversions:
 | `frontogenesis` | Native (grid) | `metpy.calc.frontogenesis` | Petterssen frontogenesis. |
 | `geostrophic_wind` | Native (grid) | `metpy.calc.geostrophic_wind` | |
 | `ageostrophic_wind` | Native (grid) | `metpy.calc.ageostrophic_wind` | |
-| `potential_vorticity_baroclinic` | Native (grid) | `metpy.calc.potential_vorticity_baroclinic` | Ertel PV. Native by default with optional MetPy delegation on parity-sensitive quantity/DataArray calls. |
+| `potential_vorticity_baroclinic` | Native (grid) | `metpy.calc.potential_vorticity_baroclinic` | Ertel PV. Quantity and DataArray forms now stay native by default. |
 | `potential_vorticity_barotropic` | Native (grid) | `metpy.calc.potential_vorticity_barotropic` | |
 | `normal_component` | Native (profile) | `metpy.calc.normal_component` | Cross-section decomposition. |
 | `tangential_component` | Native (profile) | `metpy.calc.tangential_component` | Cross-section decomposition. |
@@ -206,7 +207,7 @@ major moisture conversions:
 | `stretching_deformation` | Native (grid) | `metpy.calc.stretching_deformation` | |
 | `total_deformation` | Native (grid) | `metpy.calc.total_deformation` | |
 | `geospatial_gradient` | Native (grid) | (no direct MetPy equivalent) | Gradient on lat/lon grids with spherical corrections. |
-| `geospatial_laplacian` | Native (grid) | (no direct MetPy equivalent) | Laplacian on lat/lon grids with spherical corrections. Native by default with optional MetPy delegation on parity-sensitive quantity/DataArray calls. |
+| `geospatial_laplacian` | Native (grid) | `metpy.calc.geospatial_laplacian` | Laplacian on lat/lon grids with spherical corrections. Quantity and DataArray forms now stay native by default. |
 | `advection_3d` | Native (grid) | (no direct MetPy equivalent) | 3-D advection including vertical term. |
 
 ### 2.5 Severe Weather Parameters

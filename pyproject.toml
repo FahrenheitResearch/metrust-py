@@ -4,9 +4,9 @@ build-backend = "maturin"
 
 [project]
 name = "metrust"
-version = "0.4.3"
+version = "0.4.4"
 description = "Rust-powered MetPy-compatible calculation layer with optional GPU acceleration"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [{name = "Fahrenheit Research"}]
 keywords = ["meteorology", "weather", "rust", "metpy", "atmospheric-science", "nwp", "cape", "sounding"]

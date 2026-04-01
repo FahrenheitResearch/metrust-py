@@ -109,6 +109,36 @@ def test_layer_and_mixed_layer_forms(sounding_profile):
     assert isinstance(idx, int)
 
 
+def test_get_layer_exact_boundary_parity(sounding_profile):
+    pres, temp, dewpoint, _, _, _ = sounding_profile
+
+    actual = mcalc.get_layer(
+        pres,
+        temp,
+        dewpoint,
+        bottom=700 * mp_units.hPa,
+        depth=200 * mp_units.hPa,
+        interpolate=True,
+    )
+    expected = mpcalc.get_layer(
+        pres,
+        temp,
+        dewpoint,
+        bottom=700 * mp_units.hPa,
+        depth=200 * mp_units.hPa,
+        interpolate=True,
+    )
+
+    for actual_item, expected_item in zip(actual, expected):
+        assert actual_item.shape == expected_item.shape
+        np.testing.assert_allclose(
+            actual_item.to(expected_item.units).magnitude,
+            expected_item.magnitude,
+            atol=1e-9,
+            rtol=1e-9,
+        )
+
+
 def test_moist_lapse_reference_pressure(sounding_profile):
     pres, temp, dewpoint, _, _, _ = sounding_profile
 

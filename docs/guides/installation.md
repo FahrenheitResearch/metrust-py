@@ -2,7 +2,7 @@
 
 ## From PyPI (recommended)
 
-Pre-built wheels are available for **Python 3.9+** on Windows, macOS, and Linux:
+Pre-built wheels are available for **Python 3.10+** on Windows, macOS, and Linux:
 
 ```bash
 pip install metrust
@@ -13,7 +13,7 @@ dependencies. No Rust toolchain is needed when installing from a wheel.
 
 ## From source
 
-Building from source requires a **Rust toolchain** (1.70+) and **Python 3.9+**.
+Building from source requires a **Rust toolchain** (1.70+) and **Python 3.10+**.
 
 ```bash
 git clone https://github.com/FahrenheitResearch/metrust-py.git
@@ -95,7 +95,7 @@ print(theta)  # ~298.9 K
 
 **`pip install metrust` fails with "no matching distribution"**
 :   Pre-built wheels may not be available for your platform or Python version.
-    Ensure you are running Python 3.9 or later (`python --version`) and that
+    Ensure you are running Python 3.10 or later (`python --version`) and that
     your pip is up to date (`pip install --upgrade pip`). If no wheel exists
     for your platform, pip will attempt a source build, which requires the Rust
     toolchain (see above).

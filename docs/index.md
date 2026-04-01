@@ -150,7 +150,7 @@ All `metrust.calc` functions compile to native machine code through the Rust too
 ### No MetPy Dependency for Calculations
 
 `pip install metrust` pulls in **only** NumPy and Pint. The calculation layer stays self-contained by default.
-A small parity-sensitive subset of `metrust.calc` can delegate to MetPy when MetPy is installed, but the default path remains the Rust backend.
+The shared `metrust.calc` surface now stays on native metrust implementations even when MetPy is installed.
 
 ### Optional MetPy for Plots, xarray, and Level 2
 
@@ -158,7 +158,7 @@ A handful of surfaces intentionally delegate to MetPy when it is installed:
 
 | Surface | Behavior |
 |---|---|
-| `metrust.calc` | Native Rust by default, with limited optional MetPy delegation on a few parity-sensitive paths. |
+| `metrust.calc` | Native Rust across the shared calc surface. |
 | `metrust.io.Level2File` | Forwards to MetPy's Level 2 reader when available. |
 | `metrust.plots` | Forwards to `metpy.plots`. |
 | `metrust.xarray` | Forwards to `metpy.xarray`. |
@@ -211,6 +211,14 @@ The architecture is designed for the kind of batch processing that meteorologica
     Three-tier benchmark methodology and full results.
 
     [&rarr;Benchmarks](performance.md)
+
+-   **Workflow Benchmarks**
+
+    ---
+
+    End-to-end import-swap benchmark replays for sounding, grid, and xarray workflows.
+
+    [&rarr;Workflow Benchmarks](workflow-benchmarks.md)
 
 -   **API Reference**
 

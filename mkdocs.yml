@@ -107,5 +107,6 @@ nav:
     - Architecture: methodology/architecture.md
     - I/O Formats: methodology/io-formats.md
   - Performance: performance.md
+  - Workflow Benchmarks: workflow-benchmarks.md
   - Compatibility: compatibility.md
   - Delegation Ledger: delegation-ledger.md

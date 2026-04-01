@@ -1,15 +1,39 @@
+#!/usr/bin/env python3
+"""End-to-end workflow replay benchmarks for metrust vs MetPy.
+
+This harness benchmarks three real workflow shapes that already have replay
+parity tests in the suite:
+
+- sounding analysis
+- gridded diagnostics
+- xarray-heavy dataset helpers
+
+It verifies output parity once before timing, then reports p50 latency and
+MetPy->metrust speedup.
+"""
+
 from __future__ import annotations
+
+import argparse
+import json
+import platform
+import sys
+import timeit
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import pytest
 import xarray as xr
 
 import metrust.calc as mcalc
+import metpy.calc as mpcalc
+from metpy.cbook import get_test_data
+from metpy.units import units
 
-mpcalc = pytest.importorskip("metpy.calc")
-units = pytest.importorskip("metpy.units").units
-get_test_data = pytest.importorskip("metpy.cbook").get_test_data
+
+WARMUP_CALLS = 3
+REPEATS = 7
+TARGET_SECONDS = 0.2
 
 
 def _compare_quantity(actual, expected):
@@ -107,8 +131,7 @@ def _load_sounding():
     }
 
 
-def _run_sounding_workflow(calc):
-    sounding = _load_sounding()
+def _run_sounding_workflow(calc, sounding):
     pressure = sounding["pressure"]
     height = sounding["height"]
     temperature = sounding["temperature"]
@@ -183,8 +206,8 @@ def _build_grid_fields():
     return u, v, theta
 
 
-def _run_grid_workflow(calc):
-    u, v, theta = _build_grid_fields()
+def _run_grid_workflow(calc, grid_fields):
+    u, v, theta = grid_fields
     absolute_vorticity = calc.vorticity(u, v)
     smoothed_vorticity = calc.smooth_n_point(absolute_vorticity, 9, 1)
     divergence = calc.divergence(u, v)
@@ -197,7 +220,7 @@ def _run_grid_workflow(calc):
     }
 
 
-def _run_xarray_workflow(calc):
+def _build_xarray_inputs():
     pressure = np.array([1000.0, 900.0, 800.0, 700.0]) * units.hPa
     temperature_profile = np.array([20.0, 15.0, 10.0, 5.0]) * units.degC
     dewpoint_profile = np.array([18.0, 10.0, 5.0, -2.0]) * units.degC
@@ -240,24 +263,36 @@ def _run_xarray_workflow(calc):
         name="u_wind",
     ).metpy.quantify()
     return {
+        "pressure": pressure,
+        "temperature_profile": temperature_profile,
+        "dewpoint_profile": dewpoint_profile,
+        "levels": levels,
+        "temperature_da": temperature_da,
+        "u_da": u_da,
+    }
+
+
+def _run_xarray_workflow(calc, ctx):
+    return {
         "parcel_profile_with_lcl": calc.parcel_profile_with_lcl_as_dataset(
-            pressure,
-            temperature_profile,
-            dewpoint_profile,
+            ctx["pressure"],
+            ctx["temperature_profile"],
+            ctx["dewpoint_profile"],
         ),
         "isentropic_interpolation": calc.isentropic_interpolation_as_dataset(
-            levels,
-            temperature_da,
-            u_da,
+            ctx["levels"],
+            ctx["temperature_da"],
+            ctx["u_da"],
         ),
     }
 
 
-def test_cookbook_sounding_workflow_replay():
-    _assert_close(
-        _run_sounding_workflow(mcalc),
-        _run_sounding_workflow(mpcalc),
-        {
+WORKFLOWS = (
+    {
+        "name": "Cookbook sounding replay",
+        "builder": _load_sounding,
+        "runner": _run_sounding_workflow,
+        "atol": {
             "cape": 1.0,
             "cin": 1.0,
             "lcl_pressure": 5e-2,
@@ -271,19 +306,108 @@ def test_cookbook_sounding_workflow_replay():
             "srh_1km": 5e-1,
             "bulk_shear": 5e-2,
         },
-    )
-
-
-def test_cookbook_grid_workflow_replay():
-    _assert_close(_run_grid_workflow(mcalc), _run_grid_workflow(mpcalc), 2e-6)
-
-
-def test_cookbook_xarray_workflow_replay():
-    _assert_close(
-        _run_xarray_workflow(mcalc),
-        _run_xarray_workflow(mpcalc),
-        {
+    },
+    {
+        "name": "Cookbook grid diagnostics replay",
+        "builder": _build_grid_fields,
+        "runner": _run_grid_workflow,
+        "atol": 2e-6,
+    },
+    {
+        "name": "Cookbook xarray replay",
+        "builder": _build_xarray_inputs,
+        "runner": _run_xarray_workflow,
+        "atol": {
             "parcel_profile_with_lcl": 3e-2,
             "isentropic_interpolation": 1e-6,
         },
+    },
+)
+
+
+def _auto_iterations(func, target_seconds=TARGET_SECONDS):
+    elapsed = timeit.timeit(func, number=1)
+    if elapsed <= 0:
+        elapsed = 1e-7
+    return max(1, int(target_seconds / elapsed))
+
+
+def _bench_ms(func):
+    for _ in range(WARMUP_CALLS):
+        func()
+    number = _auto_iterations(func)
+    samples = timeit.repeat(func, number=number, repeat=REPEATS)
+    per_call_ms = sorted((sample / number) * 1000.0 for sample in samples)
+    return {
+        "iterations": number,
+        "p50_ms": per_call_ms[len(per_call_ms) // 2],
+        "samples_ms": per_call_ms,
+    }
+
+
+def run_workflow_benchmarks():
+    results = []
+    for spec in WORKFLOWS:
+        ctx = spec["builder"]()
+        metrust_value = spec["runner"](mcalc, ctx)
+        metpy_value = spec["runner"](mpcalc, ctx)
+        _assert_close(metrust_value, metpy_value, spec["atol"])
+
+        metrust_bench = _bench_ms(lambda ctx=ctx, spec=spec: spec["runner"](mcalc, ctx))
+        metpy_bench = _bench_ms(lambda ctx=ctx, spec=spec: spec["runner"](mpcalc, ctx))
+        speedup = (
+            metpy_bench["p50_ms"] / metrust_bench["p50_ms"]
+            if metrust_bench["p50_ms"] > 0
+            else float("nan")
+        )
+        results.append(
+            {
+                "workflow": spec["name"],
+                "metrust_p50_ms": metrust_bench["p50_ms"],
+                "metpy_p50_ms": metpy_bench["p50_ms"],
+                "speedup": speedup,
+                "metrust_iterations": metrust_bench["iterations"],
+                "metpy_iterations": metpy_bench["iterations"],
+            }
+        )
+    return {
+        "platform": platform.platform(),
+        "python": sys.version.split()[0],
+        "results": results,
+    }
+
+
+def _print_table(payload):
+    print(f"Platform: {payload['platform']}")
+    print(f"Python:   {payload['python']}")
+    print()
+    print("| Workflow | metrust p50 | MetPy p50 | Speedup |")
+    print("|---|---:|---:|---:|")
+    for row in payload["results"]:
+        print(
+            f"| {row['workflow']} | {row['metrust_p50_ms']:.2f} ms | "
+            f"{row['metpy_p50_ms']:.2f} ms | {row['speedup']:.2f}x |"
+        )
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+    parser.add_argument(
+        "--json-file",
+        default="workflow_bench_results.json",
+        help="Path for JSON output when --json is set.",
     )
+    args = parser.parse_args()
+
+    payload = run_workflow_benchmarks()
+    _print_table(payload)
+    if args.json:
+        json_path = Path(args.json_file)
+        json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        print()
+        print(f"Wrote {json_path}")
+
+
+if __name__ == "__main__":
+    main()

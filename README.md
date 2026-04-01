@@ -101,6 +101,9 @@ Benchmarked on real-world workflows (v0.3.3, validated by Codex against MetPy):
 | MetPy isentropic example | **2.3x** | Isentropic interpolation + Montgomery |
 | Vorticity/divergence (global grid) | **2.3x** | Spherical corrections on 721x1440 |
 
+Current replay-harness snapshot from `benches/bench_workflows.py` on Windows 11 / Python `3.13.7`:
+sounding `2.16x`, grid diagnostics `8.53x`, xarray workflow `1.46x`.
+
 ### Three-Way Benchmark: MetPy vs Rust vs CUDA
 
 Real HRRR model output (40 isobaric levels, 1059 × 1799 grid, ~1.9 M points). RTX 5090, `python tests/benchmark_gpu.py`.
@@ -207,7 +210,9 @@ These forward to MetPy when installed:
 - `metrust.xarray` (xarray accessor)
 - `metrust.io.Level2File` (NEXRAD Level II)
 
-Core `metrust.calc` stays native Rust by default with no required MetPy dependency. A small parity-sensitive subset may delegate to MetPy when it is installed; otherwise those paths still fall back to local metrust implementations. The optional `met-cu` backend is an explicit accelerator, not a requirement.
+Core `metrust.calc` stays native Rust by default with no required MetPy dependency. The shared calc surface now stays on native metrust implementations even when MetPy is installed. The optional `met-cu` backend is an explicit accelerator, not a requirement.
+
+End-to-end replay benchmarks for sounding, grid, and xarray workflows live in `benches/bench_workflows.py` and the published docs page `workflow-benchmarks.md`.
 
 ## Examples
 

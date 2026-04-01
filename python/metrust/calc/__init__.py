@@ -42,49 +42,18 @@ class InvalidSoundingError(Exception):
 
 _BACKEND = "cpu"
 _GPU_CALC = None
+_UNIT_HPA = units.hPa
+_UNIT_PA = units.Pa
+_UNIT_DEGC = units.degC
+_UNIT_KELVIN = units.kelvin
+_UNIT_JPKG = units.joule / units.kilogram
 
 METPY_COMPATIBILITY_TARGET = {
     "metpy": "1.7.1",
     "python": ("3.10", "3.11", "3.12", "3.13"),
 }
 
-METPY_OPTIONAL_CALC_DELEGATIONS = (
-    {
-        "function": "lfc",
-        "trigger": "Quantity profile inputs, with MetPy-preferred handling for complex which selections.",
-        "fallback": "Native profile intersection solver in metrust.",
-    },
-    {
-        "function": "el",
-        "trigger": "Quantity profile inputs, with MetPy-preferred handling for complex which selections.",
-        "fallback": "Native profile intersection solver in metrust.",
-    },
-    {
-        "function": "cape_cin",
-        "trigger": "MetPy parcel-profile form where the 4th positional argument is temperature-like.",
-        "fallback": "Native CAPE/CIN integration path in metrust.",
-    },
-    {
-        "function": "downdraft_cape",
-        "trigger": "Quantity profile inputs when MetPy is available.",
-        "fallback": "Native metrust DCAPE layer-selection and integration path.",
-    },
-    {
-        "function": "parcel_profile_with_lcl",
-        "trigger": "Quantity profile inputs in the profile-returning MetPy form.",
-        "fallback": "Native metrust profile interpolation and parcel trace path.",
-    },
-    {
-        "function": "potential_vorticity_baroclinic",
-        "trigger": "Quantity/DataArray inputs in the MetPy-style baroclinic PV calling form.",
-        "fallback": "Native metrust PV computation with local dx/dy and latitude handling.",
-    },
-    {
-        "function": "geospatial_laplacian",
-        "trigger": "Quantity/DataArray geospatial laplacian inputs when MetPy is available.",
-        "fallback": "Native metrust geospatial gradient and derivative path.",
-    },
-)
+METPY_OPTIONAL_CALC_DELEGATIONS = ()
 
 
 def _normalize_backend_name(backend):
@@ -606,6 +575,7 @@ def _log_pressure_intersections(pressure_hpa, y1, y2, *, direction):
     y1_arr = np.asarray(y1, dtype=np.float64).ravel()
     y2_arr = np.asarray(y2, dtype=np.float64).ravel()
     diff = y1_arr - y2_arr
+    log_p = np.log(p_arr)
     tol = 1e-9
     x_out = []
     y_out = []
@@ -638,8 +608,8 @@ def _log_pressure_intersections(pressure_hpa, y1, y2, *, direction):
             frac = -d0 / (d1 - d0)
         frac = float(np.clip(frac, 0.0, 1.0))
 
-        log_p = np.log(p_arr[i]) + frac * (np.log(p_arr[i + 1]) - np.log(p_arr[i]))
-        x_val = float(np.exp(log_p))
+        log_px = log_p[i] + frac * (log_p[i + 1] - log_p[i])
+        x_val = float(np.exp(log_px))
         y_val = float(y1_arr[i] + frac * (y1_arr[i + 1] - y1_arr[i]))
 
         if x_out and abs(x_val - x_out[-1]) <= 1e-6:
@@ -651,14 +621,46 @@ def _log_pressure_intersections(pressure_hpa, y1, y2, *, direction):
     return np.asarray(x_out, dtype=np.float64), np.asarray(y_out, dtype=np.float64)
 
 
+def _find_log_pressure_intersections_native(pressure_hpa, profile_a, profile_b):
+    """Find all intersections between two profiles in log-pressure space."""
+    p_arr = np.asarray(pressure_hpa, dtype=np.float64).ravel()
+    a_arr = np.asarray(profile_a, dtype=np.float64).ravel()
+    b_arr = np.asarray(profile_b, dtype=np.float64).ravel()
+    log_p = np.log(p_arr)
+    tol = 1e-12
+
+    x_out = []
+    y_out = []
+    for idx in range(len(p_arr) - 1):
+        p0 = p_arr[idx]
+        p1 = p_arr[idx + 1]
+        d0 = a_arr[idx] - b_arr[idx]
+        d1 = a_arr[idx + 1] - b_arr[idx + 1]
+        if not (np.isfinite(p0) and np.isfinite(p1) and np.isfinite(d0) and np.isfinite(d1)):
+            continue
+        if abs(d0) <= tol:
+            x_out.append(float(p0))
+            y_out.append(float(b_arr[idx]))
+            continue
+        if d0 * d1 > 0:
+            continue
+
+        log_px = log_p[idx] - d0 * (log_p[idx + 1] - log_p[idx]) / (d1 - d0)
+        frac = (log_px - log_p[idx]) / (log_p[idx + 1] - log_p[idx])
+        x_out.append(float(np.exp(log_px)))
+        y_out.append(float(b_arr[idx] + frac * (b_arr[idx + 1] - b_arr[idx])))
+
+    return np.asarray(x_out, dtype=np.float64), np.asarray(y_out, dtype=np.float64)
+
+
 def _select_profile_intersection(pressures_hpa, temperatures_c, which):
     p_arr = np.asarray(pressures_hpa, dtype=np.float64).ravel()
     t_arr = np.asarray(temperatures_c, dtype=np.float64).ravel()
 
     if which == "all":
-        return p_arr * units.hPa, t_arr * units.degC
+        return p_arr, t_arr
     if p_arr.size == 0:
-        return np.nan * units.hPa, np.nan * units.degC
+        return np.nan, np.nan
     if which == "bottom":
         idx = 0
     elif which == "top":
@@ -666,7 +668,333 @@ def _select_profile_intersection(pressures_hpa, temperatures_c, which):
     else:
         raise ValueError('Invalid option for "which". Valid options are "top", "bottom", '
                          '"wide", "most_cape", and "all".')
-    return p_arr[idx] * units.hPa, t_arr[idx] * units.degC
+    return float(p_arr[idx]), float(t_arr[idx])
+
+
+def _multiple_el_lfc_options_native(intersect_pressures_hpa, intersect_temperatures_c, valid_mask,
+                                    which, pressure_hpa, parcel_temperature_c, temperature_c,
+                                    dewpoint_c, intersect_type):
+    """Choose which EL/LFC to return without delegating to MetPy."""
+    p_list = np.asarray(intersect_pressures_hpa, dtype=np.float64).ravel()[valid_mask]
+    t_list = np.asarray(intersect_temperatures_c, dtype=np.float64).ravel()[valid_mask]
+
+    if which in {"top", "bottom", "all"}:
+        return _select_profile_intersection(p_list, t_list, which)
+
+    if p_list.size == 0:
+        return np.nan, np.nan
+
+    if which == "wide":
+        if intersect_type == "LFC":
+            other_p_list, _ = _log_pressure_intersections(
+                pressure_hpa[1:],
+                parcel_temperature_c[1:],
+                temperature_c[1:],
+                direction="decreasing",
+            )
+            diffs = [lfc_p - el_p for lfc_p, el_p in zip(p_list, other_p_list, strict=False)]
+        else:
+            other_p_list, _ = _log_pressure_intersections(
+                pressure_hpa,
+                parcel_temperature_c,
+                temperature_c,
+                direction="increasing",
+            )
+            diffs = [lfc_p - el_p for lfc_p, el_p in zip(other_p_list, p_list, strict=False)]
+        if not diffs:
+            return _select_profile_intersection(p_list, t_list, "top")
+        idx = int(np.nanargmax(np.asarray(diffs, dtype=np.float64)))
+        return float(p_list[idx]), float(t_list[idx])
+
+    if which == "most_cape":
+        cape_pairs = []
+        for which_lfc in ("top", "bottom"):
+            for which_el in ("top", "bottom"):
+                cape, _ = _cape_cin_profile_native(
+                    pressure_hpa,
+                    temperature_c,
+                    dewpoint_c,
+                    parcel_temperature_c,
+                    which_lfc,
+                    which_el,
+                )
+                cape_pairs.append((float(cape), which_lfc, which_el))
+        _, lfc_choice, el_choice = max(cape_pairs, key=lambda item: item[0])
+        choice = lfc_choice if intersect_type == "LFC" else el_choice
+        return _select_profile_intersection(p_list, t_list, choice)
+
+    raise ValueError('Invalid option for "which". Valid options are "top", "bottom", '
+                     '"wide", "most_cape", and "all".')
+
+
+def _insert_lcl_level(pressure, values, lcl_pressure):
+    """Insert the LCL pressure into a profile using linear pressure interpolation."""
+    pressure_vals = np.asarray(_strip(pressure, "hPa"), dtype=np.float64)
+    lcl_val = float(_strip(lcl_pressure, "hPa"))
+    if hasattr(values, "units"):
+        value_unit = values.units
+        value_vals = np.asarray(values.magnitude, dtype=np.float64)
+    else:
+        value_unit = None
+        value_vals = np.asarray(values, dtype=np.float64)
+
+    interp_val = np.interp(lcl_val, pressure_vals[::-1], value_vals[::-1])
+    loc = pressure_vals.size - np.searchsorted(pressure_vals[::-1], lcl_val)
+    inserted = np.insert(value_vals, loc, interp_val)
+    if value_unit is not None:
+        return inserted * value_unit
+    return inserted
+
+
+def _parcel_profile_helper_native(pressure, temperature, dewpoint):
+    """Native equivalent of MetPy's parcel-profile helper."""
+    pressure_q = pressure if hasattr(pressure, "units") else np.asarray(pressure, dtype=np.float64) * units.hPa
+    temperature_q = temperature if hasattr(temperature, "units") else np.asarray(temperature, dtype=np.float64) * units.degC
+    dewpoint_q = dewpoint if hasattr(dewpoint, "units") else np.asarray(dewpoint, dtype=np.float64) * units.degC
+
+    press_lcl, temp_lcl = lcl(pressure_q[0], temperature_q, dewpoint_q)
+    press_lcl = press_lcl.to(pressure_q.units)
+
+    press_lower_vals = np.concatenate((
+        pressure_q[pressure_q >= press_lcl].to(pressure_q.units).magnitude,
+        [press_lcl.to(pressure_q.units).magnitude],
+    ))
+    press_lower = press_lower_vals * pressure_q.units
+    temp_lower = dry_lapse(press_lower, temperature_q).to(temperature_q.units)
+
+    if np.nanmin(pressure_q.to(pressure_q.units).magnitude) >= press_lcl.to(pressure_q.units).magnitude:
+        return (
+            press_lower[:-1],
+            press_lcl,
+            units.Quantity(np.array([]), press_lower.units),
+            temp_lower[:-1],
+            temp_lcl.to(temperature_q.units),
+            units.Quantity(np.array([]), temp_lower.units),
+        )
+
+    press_upper_vals = np.concatenate((
+        [press_lcl.to(pressure_q.units).magnitude],
+        pressure_q[pressure_q < press_lcl].to(pressure_q.units).magnitude,
+    ))
+    press_upper = press_upper_vals * pressure_q.units
+    unique_vals, indices = np.unique(press_upper.magnitude, return_inverse=True)
+    unique_press = unique_vals * press_upper.units
+    temp_upper = moist_lapse(unique_press[::-1], temp_lower[-1]).to(temp_lower.units)
+    temp_upper = temp_upper[::-1][indices]
+
+    return (
+        press_lower[:-1],
+        press_lcl,
+        press_upper[1:],
+        temp_lower[:-1],
+        temp_lcl.to(temperature_q.units),
+        temp_upper[1:],
+    )
+
+
+def _find_append_zero_crossings_native(pressure, profile_delta):
+    """Append log-pressure zero crossings and return sorted unique arrays."""
+    if hasattr(profile_delta, "units"):
+        delta_unit = profile_delta.units
+        profile_arr = np.asarray(profile_delta.to(delta_unit).magnitude, dtype=np.float64)
+    else:
+        delta_unit = None
+        profile_arr = np.asarray(profile_delta, dtype=np.float64)
+    pressure_arr = np.asarray(_strip(pressure, "hPa"), dtype=np.float64)
+    zero_profile = np.zeros_like(profile_arr)
+
+    crossings_p, crossings_y = _find_log_pressure_intersections_native(
+        pressure_arr[1:],
+        profile_arr[1:],
+        zero_profile[1:],
+    )
+
+    pressure_vals = np.concatenate((
+        pressure_arr,
+        crossings_p,
+    ))
+    profile_vals = np.concatenate((profile_arr, crossings_y))
+
+    sort_idx = np.argsort(pressure_vals)
+    pressure_vals = pressure_vals[sort_idx]
+    profile_vals = profile_vals[sort_idx]
+
+    keep_idx = np.ediff1d(pressure_vals, to_end=[1.0]) > 1e-6
+    pressure_vals = pressure_vals[keep_idx]
+    profile_vals = profile_vals[keep_idx]
+
+    if delta_unit is not None:
+        return pressure_vals * _UNIT_HPA, profile_vals * delta_unit
+    return pressure_vals, profile_vals
+
+
+def _lcl_native_hpa_degc(pressure_hpa, temperature_c, dewpoint_c):
+    return _calc.lcl(float(pressure_hpa), float(temperature_c), float(dewpoint_c))
+
+
+def _saturation_mixing_ratio_native(pressure_hpa, temperature_c):
+    p_arr, t_arr = np.broadcast_arrays(
+        np.asarray(pressure_hpa, dtype=np.float64),
+        np.asarray(temperature_c, dtype=np.float64),
+    )
+    if p_arr.ndim == 0:
+        return _calc.saturation_mixing_ratio(float(p_arr), float(t_arr)) / 1000.0
+    result = _calc.saturation_mixing_ratio_array(
+        np.ascontiguousarray(p_arr.ravel()),
+        np.ascontiguousarray(t_arr.ravel()),
+    )
+    return np.asarray(result, dtype=np.float64).reshape(p_arr.shape) / 1000.0
+
+
+def _virtual_temperature_from_mixing_ratio_native(temperature_c, mixing_ratio_kgkg, molecular_weight_ratio=0.6219569100577033):
+    t_arr = np.asarray(temperature_c, dtype=np.float64)
+    w_arr = np.asarray(mixing_ratio_kgkg, dtype=np.float64)
+    t_k = t_arr + 273.15
+    tv_k = t_k * (1.0 + w_arr / molecular_weight_ratio) / (1.0 + w_arr)
+    return tv_k - 273.15
+
+
+def _pressure_quantity_from_hpa(values_hpa, target_unit):
+    values = np.asarray(values_hpa, dtype=np.float64)
+    target_name = str(target_unit)
+    if target_name == "hectopascal":
+        return values * _UNIT_HPA
+    if target_name == "pascal":
+        return (values * 100.0) * _UNIT_PA
+    return (values * _UNIT_HPA).to(target_unit)
+
+
+def _temperature_quantity_from_degc(values_c, target_unit):
+    values = np.asarray(values_c, dtype=np.float64)
+    target_name = str(target_unit)
+    if target_name == "degree_Celsius":
+        return values * _UNIT_DEGC
+    if target_name == "kelvin":
+        return (values + 273.15) * _UNIT_KELVIN
+    return (values * _UNIT_DEGC).to(target_unit)
+
+
+def _lfc_native_arrays(pressure_hpa, temperature_c, dewpoint_c, parcel_temperature_c, dewpoint_start_c, which):
+    p_arr = np.asarray(pressure_hpa, dtype=np.float64).ravel()
+    t_arr = np.asarray(temperature_c, dtype=np.float64).ravel()
+    td_arr = np.asarray(dewpoint_c, dtype=np.float64).ravel()
+    parcel_arr = np.asarray(parcel_temperature_c, dtype=np.float64).ravel()
+
+    if np.isclose(parcel_arr[0], t_arr[0], atol=1e-9, rtol=1e-9):
+        x, y = _log_pressure_intersections(p_arr[1:], parcel_arr[1:], t_arr[1:], direction="increasing")
+    else:
+        x, y = _log_pressure_intersections(p_arr, parcel_arr, t_arr, direction="increasing")
+
+    lcl_p, lcl_t = _lcl_native_hpa_degc(p_arr[0], parcel_arr[0], dewpoint_start_c)
+
+    if x.size == 0:
+        mask = p_arr < lcl_p
+        if np.all(parcel_arr[mask] <= t_arr[mask] + 1e-9):
+            return np.nan, np.nan
+        return lcl_p, lcl_t
+
+    valid = x < lcl_p
+    if not np.any(valid):
+        el_x, _ = _log_pressure_intersections(
+            p_arr[1:],
+            parcel_arr[1:],
+            t_arr[1:],
+            direction="decreasing",
+        )
+        if el_x.size and np.min(el_x) > lcl_p:
+            return np.nan, np.nan
+        return lcl_p, lcl_t
+
+    return _multiple_el_lfc_options_native(
+        x,
+        y,
+        valid,
+        which,
+        p_arr,
+        parcel_arr,
+        t_arr,
+        td_arr,
+        "LFC",
+    )
+
+
+def _el_native_arrays(pressure_hpa, temperature_c, dewpoint_c, parcel_temperature_c, which):
+    p_arr = np.asarray(pressure_hpa, dtype=np.float64).ravel()
+    t_arr = np.asarray(temperature_c, dtype=np.float64).ravel()
+    td_arr = np.asarray(dewpoint_c, dtype=np.float64).ravel()
+    parcel_arr = np.asarray(parcel_temperature_c, dtype=np.float64).ravel()
+
+    if parcel_arr[-1] > t_arr[-1]:
+        return np.nan, np.nan
+
+    x, y = _log_pressure_intersections(p_arr[1:], parcel_arr[1:], t_arr[1:], direction="decreasing")
+    lcl_p, _ = _lcl_native_hpa_degc(p_arr[0], t_arr[0], td_arr[0])
+    valid = x < lcl_p
+    if np.any(valid):
+        return _multiple_el_lfc_options_native(
+            x,
+            y,
+            valid,
+            which,
+            p_arr,
+            parcel_arr,
+            t_arr,
+            td_arr,
+            "EL",
+        )
+    return np.nan, np.nan
+
+
+def _cape_cin_profile_native(pressure_hpa, temperature_c, dewpoint_c, parcel_temperature_c, which_lfc, which_el):
+    p_arr = np.asarray(pressure_hpa, dtype=np.float64).ravel()
+    t_arr = np.asarray(temperature_c, dtype=np.float64).ravel()
+    td_arr = np.asarray(dewpoint_c, dtype=np.float64).ravel()
+    parcel_arr = np.asarray(parcel_temperature_c, dtype=np.float64).ravel()
+
+    lcl_p, _ = _lcl_native_hpa_degc(p_arr[0], t_arr[0], td_arr[0])
+    below_lcl = p_arr > lcl_p
+    parcel_mixing_ratio = np.where(
+        below_lcl,
+        _saturation_mixing_ratio_native(p_arr[0], td_arr[0]),
+        _saturation_mixing_ratio_native(p_arr, parcel_arr),
+    )
+    env_mixing_ratio = _saturation_mixing_ratio_native(p_arr, td_arr)
+    env_virtual_temperature = _virtual_temperature_from_mixing_ratio_native(t_arr, env_mixing_ratio)
+    parcel_virtual_temperature = _virtual_temperature_from_mixing_ratio_native(parcel_arr, parcel_mixing_ratio)
+
+    lfc_pressure_hpa, _ = _lfc_native_arrays(
+        p_arr,
+        env_virtual_temperature,
+        td_arr,
+        parcel_virtual_temperature,
+        td_arr[0],
+        which_lfc,
+    )
+    if np.isnan(lfc_pressure_hpa):
+        return 0.0, 0.0
+
+    el_pressure_hpa, _ = _el_native_arrays(
+        p_arr,
+        env_virtual_temperature,
+        td_arr,
+        parcel_virtual_temperature,
+        which_el,
+    )
+    if np.isnan(el_pressure_hpa):
+        el_pressure_hpa = p_arr[-1]
+
+    y = parcel_virtual_temperature - env_virtual_temperature
+    x_vals, y_vals = _find_append_zero_crossings_native(p_arr, y)
+    trapz = getattr(np, "trapezoid", None) or np.trapz
+
+    cape_mask = (x_vals <= lfc_pressure_hpa + 1e-9) & (x_vals >= el_pressure_hpa - 1e-9)
+    cin_mask = x_vals >= lfc_pressure_hpa - 1e-9
+
+    cape = 287.04749097718457 * trapz(y_vals[cape_mask], np.log(x_vals[cape_mask]))
+    cin = 287.04749097718457 * trapz(y_vals[cin_mask], np.log(x_vals[cin_mask]))
+    if cin > 0.0:
+        cin = 0.0
+    return float(cape), float(cin)
 
 
 def lfc(pressure, temperature, dewpoint, parcel_temperature_profile=None,
@@ -684,83 +1012,48 @@ def lfc(pressure, temperature, dewpoint, parcel_temperature_profile=None,
     tuple of (Quantity (hPa), Quantity (degC))
         LFC pressure and parcel temperature at the LFC.
     """
-    if hasattr(pressure, "to") and hasattr(temperature, "to") and hasattr(dewpoint, "to"):
-        try:
-            import metpy.calc as _mpcalc
-            return _mpcalc.lfc(
-                pressure,
-                temperature,
-                dewpoint,
-                parcel_temperature_profile=parcel_temperature_profile,
-                dewpoint_start=dewpoint_start,
-                which=which,
-            )
-        except Exception:
-            pass
-
-    if which in {"wide", "most_cape"}:
-        try:
-            import metpy.calc as _mpcalc
-            return _mpcalc.lfc(
-                pressure,
-                temperature,
-                dewpoint,
-                parcel_temperature_profile=parcel_temperature_profile,
-                dewpoint_start=dewpoint_start,
-                which=which,
-            )
-        except Exception:
-            pass
-
     p_arr = np.asarray(_strip(pressure, "hPa"), dtype=np.float64).ravel()
     t_arr = np.asarray(_strip(temperature, "degC"), dtype=np.float64).ravel()
     td_arr = np.asarray(_strip(dewpoint, "degC"), dtype=np.float64).ravel()
 
+    output_temp_unit = getattr(parcel_temperature_profile, "units", None)
+
     if parcel_temperature_profile is None:
         p_arr, t_arr, td_arr = _drop_nan_profiles(p_arr, t_arr, td_arr)
         p_q, t_q, td_q, parcel_q = parcel_profile_with_lcl(
-            p_arr * units.hPa,
-            t_arr * units.degC,
-            td_arr * units.degC,
+            p_arr * _UNIT_HPA,
+            t_arr * _UNIT_DEGC,
+            td_arr * _UNIT_DEGC,
         )
         p_arr = np.asarray(p_q.to("hPa").magnitude, dtype=np.float64)
         t_arr = np.asarray(t_q.to("degC").magnitude, dtype=np.float64)
         td_arr = np.asarray(td_q.to("degC").magnitude, dtype=np.float64)
         parcel_arr = np.asarray(parcel_q.to("degC").magnitude, dtype=np.float64)
+        output_temp_unit = parcel_q.units
     else:
         parcel_arr = np.asarray(_strip(parcel_temperature_profile, "degC"), dtype=np.float64).ravel()
         p_arr, t_arr, td_arr, parcel_arr = _drop_nan_profiles(p_arr, t_arr, td_arr, parcel_arr)
 
+    if output_temp_unit is None:
+        output_temp_unit = _UNIT_DEGC
+
     if dewpoint_start is None:
-        dewpoint_start = td_arr[0] * units.degC
-
-    if np.isclose(parcel_arr[0], t_arr[0], atol=1e-9, rtol=1e-9):
-        x, y = _log_pressure_intersections(p_arr[1:], parcel_arr[1:], t_arr[1:], direction="increasing")
+        dewpoint_start_c = float(td_arr[0])
     else:
-        x, y = _log_pressure_intersections(p_arr, parcel_arr, t_arr, direction="increasing")
+        dewpoint_start_c = _as_float(_strip(dewpoint_start, "degC"))
 
-    this_lcl = lcl(p_arr[0] * units.hPa, parcel_arr[0] * units.degC, dewpoint_start)
-    lcl_p = float(this_lcl[0].to("hPa").magnitude)
-
-    if x.size == 0:
-        mask = p_arr < lcl_p
-        if np.all(parcel_arr[mask] <= t_arr[mask] + 1e-9):
-            return np.nan * units.hPa, np.nan * units.degC
-        return this_lcl
-
-    valid = x < lcl_p
-    if not np.any(valid):
-        el_x, _ = _log_pressure_intersections(
-            p_arr[1:],
-            parcel_arr[1:],
-            t_arr[1:],
-            direction="decreasing",
-        )
-        if el_x.size and np.min(el_x) > lcl_p:
-            return np.nan * units.hPa, np.nan * units.degC
-        return this_lcl
-
-    return _select_profile_intersection(x[valid], y[valid], which)
+    p_result, t_result = _lfc_native_arrays(
+        p_arr,
+        t_arr,
+        td_arr,
+        parcel_arr,
+        dewpoint_start_c,
+        which,
+    )
+    return (
+        _pressure_quantity_from_hpa(p_result, getattr(pressure, "units", _UNIT_HPA)),
+        _temperature_quantity_from_degc(t_result, output_temp_unit),
+    )
 
 
 def el(pressure, temperature, dewpoint, parcel_temperature_profile=None, which="top"):
@@ -777,61 +1070,42 @@ def el(pressure, temperature, dewpoint, parcel_temperature_profile=None, which="
     tuple of (Quantity (hPa), Quantity (degC))
         EL pressure and parcel temperature at the EL.
     """
-    if hasattr(pressure, "to") and hasattr(temperature, "to") and hasattr(dewpoint, "to"):
-        try:
-            import metpy.calc as _mpcalc
-            return _mpcalc.el(
-                pressure,
-                temperature,
-                dewpoint,
-                parcel_temperature_profile=parcel_temperature_profile,
-                which=which,
-            )
-        except Exception:
-            pass
-
-    if which in {"wide", "most_cape"}:
-        try:
-            import metpy.calc as _mpcalc
-            return _mpcalc.el(
-                pressure,
-                temperature,
-                dewpoint,
-                parcel_temperature_profile=parcel_temperature_profile,
-                which=which,
-            )
-        except Exception:
-            pass
-
     p_arr = np.asarray(_strip(pressure, "hPa"), dtype=np.float64).ravel()
     t_arr = np.asarray(_strip(temperature, "degC"), dtype=np.float64).ravel()
     td_arr = np.asarray(_strip(dewpoint, "degC"), dtype=np.float64).ravel()
 
+    output_temp_unit = getattr(parcel_temperature_profile, "units", None)
+
     if parcel_temperature_profile is None:
         p_arr, t_arr, td_arr = _drop_nan_profiles(p_arr, t_arr, td_arr)
         p_q, t_q, td_q, parcel_q = parcel_profile_with_lcl(
-            p_arr * units.hPa,
-            t_arr * units.degC,
-            td_arr * units.degC,
+            p_arr * _UNIT_HPA,
+            t_arr * _UNIT_DEGC,
+            td_arr * _UNIT_DEGC,
         )
         p_arr = np.asarray(p_q.to("hPa").magnitude, dtype=np.float64)
         t_arr = np.asarray(t_q.to("degC").magnitude, dtype=np.float64)
         td_arr = np.asarray(td_q.to("degC").magnitude, dtype=np.float64)
         parcel_arr = np.asarray(parcel_q.to("degC").magnitude, dtype=np.float64)
+        output_temp_unit = parcel_q.units
     else:
         parcel_arr = np.asarray(_strip(parcel_temperature_profile, "degC"), dtype=np.float64).ravel()
         p_arr, t_arr, td_arr, parcel_arr = _drop_nan_profiles(p_arr, t_arr, td_arr, parcel_arr)
 
-    if parcel_arr[-1] > t_arr[-1]:
-        return np.nan * units.hPa, np.nan * units.degC
+    if output_temp_unit is None:
+        output_temp_unit = _UNIT_DEGC
 
-    x, y = _log_pressure_intersections(p_arr[1:], parcel_arr[1:], t_arr[1:], direction="decreasing")
-    lcl_p, _ = lcl(p_arr[0] * units.hPa, t_arr[0] * units.degC, td_arr[0] * units.degC)
-    lcl_p_hpa = float(lcl_p.to("hPa").magnitude)
-    valid = x < lcl_p_hpa
-    if np.any(valid):
-        return _select_profile_intersection(x[valid], y[valid], which)
-    return np.nan * units.hPa, np.nan * units.degC
+    p_result, t_result = _el_native_arrays(
+        p_arr,
+        t_arr,
+        td_arr,
+        parcel_arr,
+        which,
+    )
+    return (
+        _pressure_quantity_from_hpa(p_result, getattr(pressure, "units", _UNIT_HPA)),
+        _temperature_quantity_from_degc(t_result, output_temp_unit),
+    )
 
 
 def lcl(pressure, temperature, dewpoint):
@@ -848,11 +1122,17 @@ def lcl(pressure, temperature, dewpoint):
     tuple of (Quantity (hPa), Quantity (degC))
         LCL pressure and temperature.
     """
-    p = _as_float(_strip(pressure, "hPa"))
-    t = _as_float(_strip(temperature, "degC"))
-    td = _as_float(_strip(dewpoint, "degC"))
-    p_lcl, t_lcl = _calc.lcl(p, t, td)
-    return p_lcl * units.hPa, t_lcl * units.degC
+    p_lcl, t_lcl = _lcl_native_hpa_degc(
+        _as_float(_strip(pressure, "hPa")),
+        _as_float(_strip(temperature, "degC")),
+        _as_float(_strip(dewpoint, "degC")),
+    )
+    pressure_unit = getattr(pressure, "units", _UNIT_HPA)
+    temperature_unit = getattr(temperature, "units", _UNIT_DEGC)
+    return (
+        _pressure_quantity_from_hpa(p_lcl, pressure_unit),
+        _temperature_quantity_from_degc(t_lcl, temperature_unit),
+    )
 
 
 def dewpoint_from_relative_humidity(temperature, relative_humidity):
@@ -1034,113 +1314,26 @@ def cape_cin(pressure, temperature, dewpoint, parcel_profile_or_height=None,
     fourth = parcel_profile_or_height
     metpy_profile_form = fourth is not None and _is_temperature_like(fourth)
     if metpy_profile_form:
-        if hasattr(pressure, "to") and hasattr(temperature, "to") and hasattr(dewpoint, "to"):
-            try:
-                import metpy.calc as _mpcalc
-                return _mpcalc.cape_cin(
-                    pressure,
-                    temperature,
-                    dewpoint,
-                    fourth,
-                    which_lfc=which_lfc,
-                    which_el=which_el,
-                )
-            except Exception:
-                pass
+        p_profile = np.asarray(_strip(pressure, "hPa"), dtype=np.float64).ravel()
+        t_profile = np.asarray(_strip(temperature, "degC"), dtype=np.float64).ravel()
+        td_profile = np.asarray(_strip(dewpoint, "degC"), dtype=np.float64).ravel()
+        parcel_profile_c = np.asarray(_strip(fourth, "degC"), dtype=np.float64).ravel()
+        p_profile, t_profile, td_profile, parcel_profile_c = _drop_nan_profiles(
+            p_profile,
+            t_profile,
+            td_profile,
+            parcel_profile_c,
+        )
+        cape_val, cin_val = _cape_cin_profile_native(
+            p_profile,
+            t_profile,
+            td_profile,
+            parcel_profile_c,
+            which_lfc,
+            which_el,
+        )
+        return (cape_val * _UNIT_JPKG, cin_val * _UNIT_JPKG)
 
-        # MetPy calling convention: 4th arg is a parcel temperature profile.
-        # Integrate CAPE/CIN directly using the provided parcel profile,
-        # matching MetPy's integration: g * (Tv_p - Tv_e) / Tv_e * dz
-        t_parcel = _as_1d(_strip(fourth, "degC"))
-        # Compute height from hypsometric equation using environment
-        h_calc = np.zeros(len(p))
-        for i in range(1, len(p)):
-            if p[i] <= 0 or p[i-1] <= 0:
-                h_calc[i] = h_calc[i-1]
-                continue
-            tv_mean = (_calc.virtual_temp(t[i-1], p[i-1], td[i-1])
-                       + _calc.virtual_temp(t[i], p[i], td[i])) / 2.0 + 273.15
-            h_calc[i] = h_calc[i-1] + (287.04749 * tv_mean / 9.80665) * np.log(p[i-1] / p[i])
-
-        # Integrate CAPE/CIN: trapezoidal rule
-        # Two-pass approach matching MetPy:
-        #   Pass 1: Find all buoyancy values to locate LFC and EL
-        #   Pass 2: Integrate CAPE between LFC-EL, CIN between LCL-LFC
-        #
-        # CIN is the negative area where the parcel is cooler than the
-        # environment.  For surface-based parcels, the parcel may be
-        # positively buoyant near the surface (superadiabatic layer),
-        # then negatively buoyant (the cap/CIN), then positively buoyant
-        # again above the LFC.  We need to capture that middle negative
-        # layer, not just stop at the first positive.
-
-        # Find LCL (where T_parcel ≈ Td, i.e. parcel becomes saturated)
-        lcl_idx = 0
-        for i in range(1, len(p)):
-            if t_parcel[i] <= t_parcel[0] - 1.0:  # parcel has cooled — above LCL
-                lcl_idx = i
-                break
-
-        # Compute buoyancy at each level
-        buoyancy = np.zeros(len(p))
-        for i in range(len(p)):
-            if p[i] <= 0:
-                continue
-            tv_e = _calc.virtual_temp(t[i], p[i], td[i]) + 273.15
-            tv_p = _calc.virtual_temp(t_parcel[i], p[i], t_parcel[i]) + 273.15
-            if tv_e > 0:
-                buoyancy[i] = (tv_p - tv_e) / tv_e
-
-        # Find LFC: first crossing from negative to positive buoyancy above LCL.
-        # If the parcel is positively buoyant from the start (no cap), LFC = 0.
-        lfc_idx = None
-        for i in range(1, len(p)):
-            if buoyancy[i] > 0 and buoyancy[i-1] <= 0:
-                lfc_idx = i
-                break  # first crossing is the LFC
-
-        # If no negative-to-positive crossing found, check if the parcel is
-        # positively buoyant everywhere (no cap at all) — LFC is the surface.
-        if lfc_idx is None and any(buoyancy[i] > 0 for i in range(1, len(p))):
-            lfc_idx = 0
-
-        # Find EL: last crossing from positive to negative after LFC
-        el_idx = len(p) - 1
-        if lfc_idx is not None:
-            for i in range(lfc_idx + 1, len(p)):
-                if buoyancy[i] <= 0 and buoyancy[i-1] > 0:
-                    el_idx = i
-
-        cape_val = 0.0
-        cin_val = 0.0
-        for i in range(1, len(p)):
-            if p[i] <= 0:
-                continue
-            tv_e_lo = _calc.virtual_temp(t[i-1], p[i-1], td[i-1]) + 273.15
-            tv_e_hi = _calc.virtual_temp(t[i], p[i], td[i]) + 273.15
-            tv_p_lo = _calc.virtual_temp(t_parcel[i-1], p[i-1], t_parcel[i-1]) + 273.15
-            tv_p_hi = _calc.virtual_temp(t_parcel[i], p[i], t_parcel[i]) + 273.15
-            dz = h_calc[i] - h_calc[i-1]
-            if abs(dz) < 1e-6 or tv_e_lo <= 0 or tv_e_hi <= 0:
-                continue
-            buoy_lo = (tv_p_lo - tv_e_lo) / tv_e_lo
-            buoy_hi = (tv_p_hi - tv_e_hi) / tv_e_hi
-            val = 9.80665 * (buoy_lo + buoy_hi) / 2.0 * dz
-
-            if lfc_idx is not None and i <= el_idx:
-                if val > 0 and i >= lfc_idx:
-                    cape_val += val
-                elif val < 0 and i <= lfc_idx:
-                    cin_val += val
-
-        # MetPy convention: if there is no LFC (no positive buoyancy / no
-        # free convection), CIN is zero — there is no energy barrier when
-        # there is nothing to convect into.
-        if lfc_idx is None or cape_val <= 0:
-            cin_val = 0.0
-            cape_val = 0.0
-
-        return cape_val * units("J/kg"), cin_val * units("J/kg")
     elif fourth is not None:
         h = _as_1d(_strip(fourth, "m"))
     else:
@@ -1161,11 +1354,9 @@ def cape_cin(pressure, temperature, dewpoint, parcel_profile_or_height=None,
         p, t, td, h, ps, t2, td2, parcel_type,
         float(ml_depth), float(mu_depth), top_m,
     )
-    if metpy_profile_form:
-        return cape_val * units("J/kg"), cin_val * units("J/kg")
     return (
-        cape_val * units("J/kg"),
-        cin_val * units("J/kg"),
+        cape_val * _UNIT_JPKG,
+        cin_val * _UNIT_JPKG,
         h_lcl * units.m,
         h_lfc * units.m,
     )
@@ -1296,13 +1487,6 @@ def downdraft_cape(pressure, temperature, dewpoint):
     -------
     Quantity (J/kg)
     """
-    if hasattr(pressure, "to") and hasattr(temperature, "to") and hasattr(dewpoint, "to"):
-        try:
-            import metpy.calc as _mpcalc
-            return _mpcalc.downdraft_cape(pressure, temperature, dewpoint)
-        except Exception:
-            pass
-
     pressure_q = pressure if hasattr(pressure, "to") else np.asarray(pressure, dtype=np.float64) * units.hPa
     temperature_q = temperature if hasattr(temperature, "to") else np.asarray(temperature, dtype=np.float64) * units.degC
     dewpoint_q = dewpoint if hasattr(dewpoint, "to") else np.asarray(dewpoint, dtype=np.float64) * units.degC
@@ -1326,7 +1510,14 @@ def downdraft_cape(pressure, temperature, dewpoint):
     theta_e = equivalent_potential_temperature(p_layer, t_layer, td_layer)
     min_idx = int(np.nanargmin(theta_e.magnitude))
     parcel_start_p = p_layer[min_idx]
-    parcel_start_wb = wet_bulb_temperature(parcel_start_p, t_layer[min_idx], td_layer[min_idx])
+    parcel_lcl_p, parcel_lcl_t = lcl(parcel_start_p, t_layer[min_idx], td_layer[min_idx])
+    parcel_start_wb = moist_lapse(
+        parcel_start_p,
+        parcel_lcl_t,
+        reference_pressure=parcel_lcl_p,
+    )
+    if np.ndim(getattr(parcel_start_wb, "magnitude", parcel_start_wb)) > 0:
+        parcel_start_wb = parcel_start_wb[0]
 
     mask = pressure_q >= parcel_start_p
     down_pressure = pressure_q[mask].to("hPa")
@@ -1612,13 +1803,6 @@ def parcel_profile_with_lcl(pressure, temperature, dewpoint):
         p_out, t_out = _calc.parcel_profile_with_lcl(p, t, td)
         return np.asarray(p_out, dtype=np.float64) * units.hPa, np.asarray(t_out, dtype=np.float64) * units.degC
 
-    if hasattr(pressure, "to") and hasattr(temperature, "to") and hasattr(dewpoint, "to"):
-        try:
-            import metpy.calc as _mpcalc
-            return _mpcalc.parcel_profile_with_lcl(pressure, temperature, dewpoint)
-        except Exception:
-            pass
-
     pressure_q = pressure if hasattr(pressure, "units") else np.asarray(p, dtype=np.float64) * units.hPa
     temperature_q = temperature if hasattr(temperature, "units") else np.asarray(t_raw, dtype=np.float64) * units.degC
     dewpoint_q = dewpoint if hasattr(dewpoint, "units") else np.asarray(td_raw, dtype=np.float64) * units.degC
@@ -1626,12 +1810,23 @@ def parcel_profile_with_lcl(pressure, temperature, dewpoint):
     if len(pressure_q) == 0:
         raise ValueError("parcel_profile_with_lcl requires at least one finite profile level")
 
-    lcl_pressure, _ = lcl(pressure_q[0], temperature_q[0], dewpoint_q[0])
-    pressure_values = np.asarray(_strip(pressure_q, "hPa"), dtype=np.float64)
-    pressure_out = np.sort(np.append(pressure_values, lcl_pressure.to("hPa").magnitude))[::-1] * units.hPa
-    ambient_temperature = _interp_profile_to_pressures(pressure_out, pressure_q, temperature_q)
-    ambient_dewpoint = _interp_profile_to_pressures(pressure_out, pressure_q, dewpoint_q)
-    parcel_temperature = parcel_profile(pressure_out, temperature_q[0], dewpoint_q[0])
+    press_lower, press_lcl, press_upper, temp_lower, temp_lcl, temp_upper = _parcel_profile_helper_native(
+        pressure_q,
+        temperature_q[0],
+        dewpoint_q[0],
+    )
+    pressure_out = np.concatenate((
+        press_lower.to("hPa").magnitude,
+        [press_lcl.to("hPa").magnitude],
+        press_upper.to("hPa").magnitude,
+    )) * units.hPa
+    parcel_temperature = np.concatenate((
+        temp_lower.to(temperature_q.units).magnitude,
+        [temp_lcl.to(temperature_q.units).magnitude],
+        temp_upper.to(temperature_q.units).magnitude,
+    )) * temperature_q.units
+    ambient_temperature = _insert_lcl_level(pressure_q, temperature_q, press_lcl)
+    ambient_dewpoint = _insert_lcl_level(pressure_q, dewpoint_q, press_lcl)
     return pressure_out, ambient_temperature, ambient_dewpoint, parcel_temperature
 
 
@@ -2287,9 +2482,14 @@ def get_layer(pressure, *args, height=None, bottom=None, depth=None, interpolate
         else:
             v = _as_1d(values)
         p_out, v_out = _calc.get_layer(p, v, pb, pt)
+        p_out = np.asarray(p_out, dtype=np.float64)
+        v_out = np.asarray(v_out)
+        keep = np.ediff1d(p_out, to_end=[1.0]) != 0
+        p_out = p_out[keep]
+        v_out = v_out[keep]
         if p_result is None:
-            p_result = np.asarray(p_out) * units.hPa
-        v_result = np.asarray(v_out)
+            p_result = p_out * units.hPa
+        v_result = v_out
         if v_unit is not None:
             v_result = v_result * v_unit
         value_results.append(v_result)
@@ -4592,48 +4792,6 @@ def potential_vorticity_baroclinic(potential_temp, pressure, *args, dx=None, dy=
     2-D array Quantity (K*m^2/(kg*s))
     """
     if len(args) == 2:
-        if (
-            (hasattr(potential_temp, "to") or _is_dataarray_like(potential_temp))
-            and (hasattr(pressure, "to") or _is_dataarray_like(pressure))
-            and all(hasattr(arg, "to") or _is_dataarray_like(arg) for arg in args)
-        ):
-            try:
-                lat_source = latitude
-                dx_source = dx
-                dy_source = dy
-                if dx_source is None or dy_source is None:
-                    dx_source, dy_source = _resolve_dx_dy(
-                        potential_temp,
-                        dx=dx_source,
-                        dy=dy_source,
-                        latitude=lat_source,
-                        longitude=longitude,
-                    )
-                if lat_source is None:
-                    lat_source, _ = _infer_lat_lon(
-                        potential_temp,
-                        latitude=latitude,
-                        longitude=longitude,
-                    )
-                import metpy.calc as _mpcalc
-                return _mpcalc.potential_vorticity_baroclinic(
-                    potential_temp,
-                    pressure,
-                    args[0],
-                    args[1],
-                    dx=dx_source,
-                    dy=dy_source,
-                    latitude=lat_source,
-                    x_dim=x_dim,
-                    y_dim=y_dim,
-                    vertical_dim=vertical_dim,
-                    parallel_scale=parallel_scale,
-                    meridional_scale=meridional_scale,
-                    longitude=longitude,
-                    crs=crs,
-                )
-            except Exception:
-                pass
         u, v = args
         dx, dy = _resolve_dx_dy(potential_temp, dx=dx, dy=dy, latitude=latitude, longitude=longitude)
         if (dx is None or dy is None) and u is not None:
@@ -5404,25 +5562,6 @@ def geospatial_laplacian(f, *args, dx=None, dy=None, x_dim=-1, y_dim=-2,
     -------
     2-D array
     """
-    if (
-        hasattr(f, "to") or _is_dataarray_like(f)
-    ):
-        try:
-            import metpy.calc as _mpcalc
-            return _mpcalc.geospatial_laplacian(
-                f,
-                dx=dx,
-                dy=dy,
-                x_dim=x_dim,
-                y_dim=y_dim,
-                parallel_scale=parallel_scale,
-                meridional_scale=meridional_scale,
-                latitude=latitude,
-                longitude=longitude,
-                crs=crs,
-            )
-        except Exception:
-            pass
     if len(args) == 2 and dx is None and dy is None and latitude is None and longitude is None:
         latitude, longitude = args
     if dx is None or dy is None:

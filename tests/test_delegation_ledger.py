@@ -11,11 +11,13 @@ import metrust.calc as mcalc
 from metrust.units import units
 
 
-EXPECTED_DELEGATIONS = {
-    "lfc",
-    "el",
+EXPECTED_DELEGATIONS = set()
+
+NATIVE_NONDELEGATING_FUNCTIONS = {
     "cape_cin",
     "downdraft_cape",
+    "lfc",
+    "el",
     "parcel_profile_with_lcl",
     "potential_vorticity_baroclinic",
     "geospatial_laplacian",
@@ -65,18 +67,14 @@ def _laplacian_inputs():
     return (field,), {"dx": 100000.0 * units.m, "dy": 100000.0 * units.m}
 
 
-def _delegation_inputs():
+def _cape_cin_inputs():
     pressure, temperature, dewpoint = _profile_inputs()
     parcel_profile = mcalc.parcel_profile(pressure, temperature[0], dewpoint[0])
-    return {
-        "lfc": ((pressure, temperature, dewpoint), {}),
-        "el": ((pressure, temperature, dewpoint), {}),
-        "cape_cin": ((pressure, temperature, dewpoint, parcel_profile), {}),
-        "downdraft_cape": ((pressure, temperature, dewpoint), {}),
-        "parcel_profile_with_lcl": ((pressure, temperature, dewpoint), {}),
-        "potential_vorticity_baroclinic": _pv_inputs(),
-        "geospatial_laplacian": _laplacian_inputs(),
-    }
+    return (pressure, temperature, dewpoint, parcel_profile), {}
+
+
+def _delegation_inputs():
+    return {}
 
 
 def test_optional_metpy_calc_delegation_ledger_is_current():
@@ -101,6 +99,26 @@ def test_optional_metpy_calc_delegations_use_metpy_when_available(monkeypatch, n
     args, kwargs = _delegation_inputs()[name]
     result = getattr(mcalc, name)(*args, **kwargs)
     assert result is sentinel
+
+
+@pytest.mark.parametrize("name", sorted(NATIVE_NONDELEGATING_FUNCTIONS))
+def test_native_calc_paths_do_not_delegate_when_metpy_is_available(monkeypatch, name):
+    mpcalc = pytest.importorskip("metpy.calc")
+
+    def _boom(*args, **kwargs):
+        raise AssertionError(f"{name} should stay on the native metrust path")
+
+    monkeypatch.setattr(mpcalc, name, _boom)
+    args, kwargs = {
+        "cape_cin": _cape_cin_inputs(),
+        "downdraft_cape": (_profile_inputs(), {}),
+        "lfc": (_profile_inputs(), {}),
+        "el": (_profile_inputs(), {}),
+        "parcel_profile_with_lcl": (_profile_inputs(), {}),
+        "potential_vorticity_baroclinic": _pv_inputs(),
+        "geospatial_laplacian": _laplacian_inputs(),
+    }[name]
+    getattr(mcalc, name)(*args, **kwargs)
 
 
 def test_optional_metpy_calc_delegations_fall_back_without_metpy():

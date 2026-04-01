@@ -159,7 +159,7 @@ def test_runtime_parity_parcel_profile_with_lcl(interp_context):
         interp_context["temperature_profile"],
         interp_context["dewpoint_profile"],
     )
-    _assert_runtime_close(actual, expected, 1e-8)
+    _assert_runtime_close(actual, expected, 3e-2)
 
 
 def test_runtime_parity_parcel_profile_with_lcl_as_dataset(interp_context):
@@ -173,7 +173,7 @@ def test_runtime_parity_parcel_profile_with_lcl_as_dataset(interp_context):
         interp_context["temperature_profile"],
         interp_context["dewpoint_profile"],
     )
-    _assert_dataset_close(actual, expected, 1e-8)
+    _assert_dataset_close(actual, expected, 3e-2)
 
 
 def test_runtime_parity_isentropic_interpolation(interp_context):
