@@ -131,3 +131,35 @@ jobs:
           name: python-bench-results
           path: bench_results.json
           retention-days: 30
+
+  bench-workflows:
+    name: Workflow Benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install metrust, MetPy, and workflow deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e "." numpy pint pandas xarray "MetPy==${METPY_VERSION}"
+
+      - name: Run workflow replay benchmarks
+        run: python benches/bench_workflows.py --json --json-file workflow_bench_results.json
+
+      - name: Upload workflow benchmark results
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: workflow-bench-results
+          path: workflow_bench_results.json
+          retention-days: 30

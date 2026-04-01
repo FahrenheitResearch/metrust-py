@@ -25,6 +25,9 @@ python benches/bench_workflows.py --json
 
 The JSON mode writes `workflow_bench_results.json` by default.
 
+CI also runs this harness on Ubuntu/Python 3.12 and uploads the same
+`workflow_bench_results.json` file as a workflow artifact for each run.
+
 ## Current Snapshot
 
 The table below is updated from a local run of `python benches/bench_workflows.py`

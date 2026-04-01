@@ -258,4 +258,4 @@ cape, cin = cape_cin(p, T, Td, prof)
 
 ---
 
-*metrust v0.3.6 -- MIT License -- [GitHub](https://github.com/FahrenheitResearch/metrust-py)*
+*metrust v0.4.5 -- MIT License -- [GitHub](https://github.com/FahrenheitResearch/metrust-py)*

@@ -69,7 +69,9 @@ Python `3.13.7`:
 | Cookbook xarray replay | 2.51 ms | 3.66 ms | **1.46x** |
 
 The dedicated harness lives in `benches/bench_workflows.py`, with a published
-summary on the [Workflow Benchmarks](workflow-benchmarks.md) page.
+summary on the [Workflow Benchmarks](workflow-benchmarks.md) page. CI also
+uploads `workflow_bench_results.json` as a build artifact so benchmark snapshots
+are preserved per run.
 
 ---
 
