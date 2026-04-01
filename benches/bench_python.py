@@ -127,6 +127,7 @@ _raw_calc = None   # metrust._metrust.calc  (T1)
 _mr_calc = None    # metrust.calc            (T2 -- Pint wrapper)
 _mp_calc = None    # metpy.calc              (T3)
 _mp_units = None   # metpy.units.units
+_mr_units = None   # metrust.units.units
 
 
 def _import_raw():
@@ -143,6 +144,14 @@ def _import_metrust():
         import metrust.calc as mc
         _mr_calc = mc
     return _mr_calc
+
+
+def _import_metrust_units():
+    global _mr_units
+    if _mr_units is None:
+        from metrust.units import units as mu
+        _mr_units = mu
+    return _mr_units
 
 
 def _import_metpy():
@@ -345,8 +354,16 @@ def _bench_wind(tiers):
             lambda: rc.storm_relative_helicity(u_p, v_p, z_p, 1000.0, 10.0, 5.0)))
     if 2 in tiers:
         mc = _import_metrust()
+        mu = _import_metrust_units()
         results.append(run_bench(name, 2, "T2 metrust+Pint",
-            lambda: mc.storm_relative_helicity(u_p, v_p, z_p, 1000.0, 10.0, 5.0)))
+            lambda: mc.storm_relative_helicity(
+                z_p * mu.meter,
+                u_p * mu("m/s"),
+                v_p * mu("m/s"),
+                1000 * mu.meter,
+                storm_u=10 * mu("m/s"),
+                storm_v=5 * mu("m/s"),
+            )))
     if 3 in tiers:
         try:
             mpc, mu = _import_metpy()
