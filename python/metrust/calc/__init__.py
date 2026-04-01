@@ -928,10 +928,11 @@ def showalter_index(pressure, temperature, dewpoint):
     -------
     Quantity (delta_degC)
     """
-    p = _as_1d(_strip(pressure, "hPa"))
-    t = _as_1d(_strip(temperature, "degC"))
-    td = _as_1d(_strip(dewpoint, "degC"))
-    return _calc.showalter_index(p, t, td) * units.delta_degC
+    t850 = _interp_profile_level(pressure, temperature, 850.0, "degC") * units.degC
+    td850 = _interp_profile_level(pressure, dewpoint, 850.0, "degC") * units.degC
+    t500 = np.asarray([_interp_profile_level(pressure, temperature, 500.0, "degC")]) * units.degC
+    prof = parcel_profile(np.asarray([850.0, 500.0]) * units.hPa, t850, td850)
+    return t500 - prof[-1]
 
 
 def k_index(*args, vertical_dim=0):
@@ -1714,12 +1715,13 @@ def geopotential_to_height(geopotential):
     return result * units.m
 
 
-def get_layer(pressure, *args, p_bottom=None, p_top=None,
-              bottom=None, depth=None, interpolate=True):
+def get_layer(pressure, *args, height=None, bottom=None, depth=None, interpolate=True,
+              p_bottom=None, p_top=None):
     """Extract one or more fields from a sounding layer.
 
     Supports both the original form ``get_layer(pressure, values, p_bottom, p_top)``
-    and the MetPy-style form ``get_layer(pressure, values..., bottom=..., depth=...)``.
+    and the MetPy-style pressure-coordinate form
+    ``get_layer(pressure, values..., height=None, bottom=..., depth=...)``.
     """
     if not args:
         raise TypeError("get_layer requires at least one value profile")
@@ -1733,10 +1735,14 @@ def get_layer(pressure, *args, p_bottom=None, p_top=None,
             p_top = tail_top
 
     if p_bottom is None:
-        p_bottom = bottom if bottom is not None else pressure[0]
+        if bottom is not None:
+            p_bottom = bottom
+        else:
+            p_vals = np.asarray(_strip(pressure, "hPa"), dtype=np.float64)
+            p_bottom = np.nanmax(p_vals) * units.hPa
     if p_top is None:
         if depth is None:
-            raise TypeError("get_layer requires either p_top or depth")
+            depth = 100 * units.hPa
         p_top = p_bottom - depth
 
     p = _as_1d(_strip(pressure, "hPa"))
@@ -1762,9 +1768,7 @@ def get_layer(pressure, *args, p_bottom=None, p_top=None,
             v_result = v_result * v_unit
         value_results.append(v_result)
 
-    if len(value_results) == 1:
-        return p_result, value_results[0]
-    return (p_result, *value_results)
+    return [p_result, *value_results]
 
 
 def get_layer_heights(pressure, heights, p_bottom, p_top):
@@ -1839,7 +1843,7 @@ def isentropic_interpolation(theta_levels, pressure_3d, temperature_3d,
     return [np.asarray(r) for r in result]
 
 
-def mean_pressure_weighted(pressure, values):
+def mean_pressure_weighted(pressure, *args, height=None, bottom=None, depth=None):
     """Pressure-weighted mean of a quantity.
 
     Parameters
@@ -1851,12 +1855,25 @@ def mean_pressure_weighted(pressure, values):
     -------
     float
     """
-    p = _as_1d(_strip(pressure, "hPa"))
-    v = _as_1d(_strip(values, "")) if hasattr(values, "magnitude") else _as_1d(values)
-    return _calc.mean_pressure_weighted(p, v)
+    if not args:
+        raise TypeError("mean_pressure_weighted requires at least one value profile")
+
+    layer = get_layer(pressure, *args, height=height, bottom=bottom, depth=depth)
+    p_layer = layer[0]
+    value_layers = layer[1:]
+
+    trapz = getattr(np, "trapezoid", None) or np.trapz
+    pres_int = 0.5 * (p_layer[-1] ** 2 - p_layer[0] ** 2)
+
+    results = []
+    for values in value_layers:
+        if hasattr(values, "to") and _can_convert(values, "kelvin"):
+            values = values.to("kelvin")
+        results.append(trapz(values * p_layer, x=p_layer) / pres_int)
+    return results
 
 
-def mixed_layer(pressure, *args, height=None, bottom=None, depth=100.0, interpolate=True):
+def mixed_layer(pressure, *args, height=None, bottom=None, depth=None, interpolate=True):
     """Mixed-layer mean of one or more profiles.
 
     Supports both the original form ``mixed_layer(pressure, values, depth=...)``
@@ -1864,33 +1881,31 @@ def mixed_layer(pressure, *args, height=None, bottom=None, depth=100.0, interpol
     """
     if not args:
         raise TypeError("mixed_layer requires at least one value profile")
+    if depth is None:
+        depth = 100 * units.hPa
 
-    p_layer = pressure
-    value_layers = args
-    if bottom is not None and abs(_as_float(_strip(bottom, "hPa")) - _as_float(_strip(pressure[0], "hPa"))) > 1e-6:
-        extracted = get_layer(pressure, *args, bottom=bottom, depth=depth, interpolate=interpolate)
-        p_layer, *value_layers = extracted
+    layer = get_layer(
+        pressure,
+        *args,
+        height=height,
+        bottom=bottom,
+        depth=depth,
+        interpolate=interpolate,
+    )
+    p_layer = layer[0]
+    value_layers = layer[1:]
 
-    p = _as_1d(_strip(p_layer, "hPa"))
-    d = _as_float(_strip(depth, "hPa")) if hasattr(depth, "magnitude") else float(depth)
+    trapz = getattr(np, "trapezoid", None) or np.trapz
+    actual_depth = abs(p_layer[0] - p_layer[-1])
     results = []
     for values in value_layers:
-        has_units = hasattr(values, "units")
-        if has_units:
-            unit_obj = values.units
-            v = _as_1d(np.asarray(values.magnitude, dtype=np.float64))
-        elif hasattr(values, "values"):
-            unit_obj = None
-            v = _as_1d(np.asarray(values.values, dtype=np.float64))
+        if hasattr(values, "units"):
+            mixed = trapz(values.magnitude, p_layer.magnitude) / -actual_depth.magnitude
+            results.append(units.Quantity(mixed, values.units))
         else:
-            unit_obj = None
-            v = _as_1d(values)
-        mixed = _calc.mixed_layer(p, v, d)
-        results.append(mixed * unit_obj if unit_obj is not None else mixed)
-
-    if len(results) == 1:
-        return results[0]
-    return tuple(results)
+            mixed = trapz(np.asarray(values, dtype=np.float64), p_layer.magnitude) / -actual_depth.magnitude
+            results.append(mixed)
+    return results
 
 
 def mixed_layer_cape_cin(pressure, temperature, dewpoint, depth=100.0):
@@ -2275,7 +2290,7 @@ def specific_humidity_from_dewpoint(pressure, dewpoint_val):
     return result * units("kg/kg")
 
 
-def static_stability(pressure, temperature):
+def static_stability(pressure, temperature, vertical_dim=0):
     """Static stability.
 
     Parameters
@@ -2287,10 +2302,15 @@ def static_stability(pressure, temperature):
     -------
     array Quantity (K/Pa)
     """
-    p = _as_1d(_strip(pressure, "hPa"))
-    t_k = _as_1d(_strip(temperature, "K"))
-    result = np.asarray(_calc.static_stability(p, t_k))
-    return result * units("K/Pa")
+    p_hpa = pressure.to("hPa") if hasattr(pressure, "to") else np.asarray(pressure, dtype=np.float64) * units.hPa
+    t_k = temperature.to("K") if hasattr(temperature, "to") else np.asarray(temperature, dtype=np.float64) * units.K
+    theta = potential_temperature(pressure, temperature).to("K")
+    p_vals = np.asarray(p_hpa.magnitude, dtype=np.float64)
+    log_theta = np.asarray(np.log(theta.magnitude), dtype=np.float64)
+    ax = vertical_dim % log_theta.ndim
+    dlogtheta_dp = np.gradient(log_theta, p_vals, axis=ax, edge_order=2) / units.hPa
+    rd = 287.05 * units("J/(kg*K)")
+    return -rd * t_k / p_hpa * dlogtheta_dp
 
 
 def surface_based_cape_cin(pressure, temperature, dewpoint):
@@ -2721,11 +2741,11 @@ def storm_relative_helicity(*args, bottom=None, depth=None, storm_u=None, storm_
     d = _scalar_strip(depth_a, "m")
     if storm_u is None or storm_v is None:
         # Auto-compute Bunkers right-mover if storm motion not provided
-        (ru, rv), _, _ = bunkers_storm_motion(u, v, height_a)
+        right_mover, _, _ = bunkers_storm_motion(u, v, height_a)
         if storm_u is None:
-            storm_u = ru
+            storm_u = right_mover[0]
         if storm_v is None:
-            storm_v = rv
+            storm_v = right_mover[1]
     su = _scalar_strip(storm_u, "m/s")
     sv = _scalar_strip(storm_v, "m/s")
     pos, neg, total = _calc.storm_relative_helicity(u_arr, v_arr, h_arr, d, su, sv)
@@ -2763,11 +2783,15 @@ def bunkers_storm_motion(pressure_or_u, u_or_v, v_or_height, height=None):
         h_arr = _as_1d(_strip(v_or_height, "m"))
         p_arr = np.array([_calc.height_to_pressure_std(float(hi)) for hi in h_arr])
     (ru, rv), (lu, lv), (mu, mv) = _calc.bunkers_storm_motion(p_arr, u_arr, v_arr, h_arr)
-    return (
-        (_attach(ru, "m/s"), _attach(rv, "m/s")),
-        (_attach(lu, "m/s"), _attach(lv, "m/s")),
-        (_attach(mu, "m/s"), _attach(mv, "m/s")),
-    )
+    out_unit = getattr(pressure_or_u, "units", None) if height is None else getattr(u_or_v, "units", None)
+    right = units.Quantity(np.asarray([ru, rv]), "m/s")
+    left = units.Quantity(np.asarray([lu, lv]), "m/s")
+    mean = units.Quantity(np.asarray([mu, mv]), "m/s")
+    if out_unit is not None:
+        right = right.to(out_unit)
+        left = left.to(out_unit)
+        mean = mean.to(out_unit)
+    return right, left, mean
 
 
 def corfidi_storm_motion(pressure_or_u, u_or_v, v_or_height, *args, u_llj=None, v_llj=None):
@@ -3455,7 +3479,12 @@ def geostrophic_wind(heights, dx=None, dy=None, latitude=None, x_dim=-1, y_dim=-
         # u_g = -(g/f) * dZ/dy,  v_g = (g/f) * dZ/dx
         g = 9.80665
         omega = 7.2921159e-5
-        lat_2d = lat_arr if lat_arr.ndim == 2 else np.broadcast_to(lat_arr[:, None], h_arr.shape)
+        if lat_arr.ndim == 2:
+            lat_2d = lat_arr
+        elif lat_arr.ndim == 1:
+            lat_2d = np.broadcast_to(lat_arr[:, None], h_arr.shape)
+        else:
+            lat_2d = np.broadcast_to(lat_arr, h_arr.shape)
         f = 2.0 * omega * np.sin(np.deg2rad(lat_2d))
         f = np.where(np.abs(f) < 1e-10, np.nan, f)
         dzdx = _first_derivative_variable(h_arr, dx_m, axis=-1)
@@ -3465,7 +3494,11 @@ def geostrophic_wind(heights, dx=None, dy=None, latitude=None, x_dim=-1, y_dim=-
         return _wrap_result_like(heights, u_g, "m/s"), _wrap_result_like(heights, v_g, "m/s")
 
     h_f = _as_2d(heights, "m")
-    lats_f = _as_2d(latitude, "degree") if hasattr(latitude, "magnitude") else _as_2d(latitude)
+    if lat_arr.ndim == 0:
+        lat_input = np.broadcast_to(lat_arr, h_arr.shape)
+    else:
+        lat_input = latitude
+    lats_f = _as_2d(lat_input, "degree") if hasattr(lat_input, "magnitude") else _as_2d(lat_input)
     dx_val = float(dx_m.mean()) if dx_m.ndim > 0 else float(dx_m)
     dy_val = float(dy_m.mean()) if dy_m.ndim > 0 else float(dy_m)
     u_g, v_g = _calc.geostrophic_wind(h_f, lats_f, dx_val, dy_val)
@@ -3859,7 +3892,7 @@ def q_vector(u, v, temperature, pressure, dx=None, dy=None, **kwargs):
     dx_val = _mean_spacing(dx, "m")
     dy_val = _mean_spacing(dy, "m")
     q1, q2 = _calc.q_vector(t_2d, u_2d, v_2d, p_val, dx_val, dy_val)
-    return _wrap_result_like(u, q1), _wrap_result_like(v, q2)
+    return _wrap_result_like(u, q1, "m**2/(kg*s)"), _wrap_result_like(v, q2, "m**2/(kg*s)")
 
 
 def shear_vorticity(u, v, dx, dy):
@@ -4091,7 +4124,7 @@ def significant_tornado_parameter(sbcape, lcl_height, srh_0_1km, bulk_shear_0_6k
     lcl = _as_float(_strip(lcl_height, "m"))
     srh = _as_float(_strip(srh_0_1km, "m**2/s**2"))
     shear = _as_float(_strip(bulk_shear_0_6km, "m/s"))
-    return _calc.significant_tornado_parameter(cape, lcl, srh, shear) * units.dimensionless
+    return np.asarray([_calc.significant_tornado_parameter(cape, lcl, srh, shear)]) * units.dimensionless
 
 
 def supercell_composite_parameter(mucape, srh_eff, bulk_shear_eff):
@@ -4110,7 +4143,7 @@ def supercell_composite_parameter(mucape, srh_eff, bulk_shear_eff):
     cape = _as_float(_strip(mucape, "J/kg"))
     srh = _as_float(_strip(srh_eff, "m**2/s**2"))
     shear = _as_float(_strip(bulk_shear_eff, "m/s"))
-    return _calc.supercell_composite_parameter(cape, srh, shear) * units.dimensionless
+    return np.asarray([_calc.supercell_composite_parameter(cape, srh, shear)]) * units.dimensionless
 
 
 def critical_angle(*args):
@@ -4492,7 +4525,7 @@ def heat_index(temperature, relative_humidity):
     Quantity (degC)
     """
     result = _vec_call(_calc.heat_index, _strip(temperature, "degC"), _rh_to_percent(relative_humidity))
-    return result * units.degC
+    return np.atleast_1d(result) * units.degC
 
 
 def windchill(temperature, wind_speed_val):
@@ -4530,7 +4563,7 @@ def apparent_temperature(temperature, relative_humidity, wind_speed_val):
         _rh_to_percent(relative_humidity),
         _strip(wind_speed_val, "m/s"),
     )
-    return result * units.degC
+    return np.atleast_1d(result) * units.degC
 
 
 # ============================================================================
