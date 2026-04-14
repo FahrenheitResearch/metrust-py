@@ -403,6 +403,81 @@ fn compute_ecape<'py>(
     ))
 }
 
+/// Compute ECAPE-family diagnostics and a per-column failure mask.
+///
+/// Returns `(ecape, ncape, cape, cin, lfc, el, failure_mask)` as seven 1-D
+/// arrays of length `nx*ny`. `failure_mask` is `1` where the column was
+/// zero-filled because it was too short after filtering or the ECAPE solver
+/// returned an error.
+#[pyfunction]
+#[pyo3(signature = (pressure_3d, temperature_c_3d, qvapor_3d, height_agl_3d, u_3d, v_3d, psfc, t2, q2, u10, v10, nx, ny, nz, parcel_type="surface", storm_motion_type="right_moving", entrainment_rate=None, pseudoadiabatic=Some(true), storm_u=None, storm_v=None))]
+fn compute_ecape_with_failure_mask<'py>(
+    py: Python<'py>,
+    pressure_3d: PyReadonlyArray1<f64>,
+    temperature_c_3d: PyReadonlyArray1<f64>,
+    qvapor_3d: PyReadonlyArray1<f64>,
+    height_agl_3d: PyReadonlyArray1<f64>,
+    u_3d: PyReadonlyArray1<f64>,
+    v_3d: PyReadonlyArray1<f64>,
+    psfc: PyReadonlyArray1<f64>,
+    t2: PyReadonlyArray1<f64>,
+    q2: PyReadonlyArray1<f64>,
+    u10: PyReadonlyArray1<f64>,
+    v10: PyReadonlyArray1<f64>,
+    nx: usize,
+    ny: usize,
+    nz: usize,
+    parcel_type: &str,
+    storm_motion_type: &str,
+    entrainment_rate: Option<f64>,
+    pseudoadiabatic: Option<bool>,
+    storm_u: Option<f64>,
+    storm_v: Option<f64>,
+) -> PyResult<(
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<u8>>,
+)> {
+    let (ecape, ncape, cape, cin, lfc, el, failure_mask) =
+        metrust::calc::severe::grid::compute_ecape_with_failure_mask(
+            pressure_3d.as_slice().unwrap(),
+            temperature_c_3d.as_slice().unwrap(),
+            qvapor_3d.as_slice().unwrap(),
+            height_agl_3d.as_slice().unwrap(),
+            u_3d.as_slice().unwrap(),
+            v_3d.as_slice().unwrap(),
+            psfc.as_slice().unwrap(),
+            t2.as_slice().unwrap(),
+            q2.as_slice().unwrap(),
+            u10.as_slice().unwrap(),
+            v10.as_slice().unwrap(),
+            nx,
+            ny,
+            nz,
+            parcel_type,
+            storm_motion_type,
+            entrainment_rate,
+            pseudoadiabatic,
+            storm_u,
+            storm_v,
+        )
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+
+    Ok((
+        ecape.into_pyarray(py),
+        ncape.into_pyarray(py),
+        cape.into_pyarray(py),
+        cin.into_pyarray(py),
+        lfc.into_pyarray(py),
+        el.into_pyarray(py),
+        failure_mask.into_pyarray(py),
+    ))
+}
+
 /// Compute storm-relative helicity on a 3-D grid.
 ///
 /// Returns a 1-D array of length nx*ny.
@@ -788,6 +863,7 @@ pub fn register(_py: Python, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     // Grid-based 3-D compute functions
     parent.add_function(wrap_pyfunction!(compute_cape_cin, parent)?)?;
     parent.add_function(wrap_pyfunction!(compute_ecape, parent)?)?;
+    parent.add_function(wrap_pyfunction!(compute_ecape_with_failure_mask, parent)?)?;
     parent.add_function(wrap_pyfunction!(compute_srh, parent)?)?;
     parent.add_function(wrap_pyfunction!(compute_shear, parent)?)?;
     parent.add_function(wrap_pyfunction!(compute_lapse_rate, parent)?)?;

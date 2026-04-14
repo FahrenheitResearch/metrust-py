@@ -452,13 +452,13 @@ dependencies = [
 
 [[package]]
 name = "ecape-rs"
-version = "0.1.1"
-source = "git+https://github.com/FahrenheitResearch/ecape-rs?rev=ce739db733dfb12464761935243418e0a155124b#ce739db733dfb12464761935243418e0a155124b"
+version = "0.1.4"
+source = "git+https://github.com/FahrenheitResearch/ecape-rs?rev=82922534c02a888e773c50463b5a49d535606276#82922534c02a888e773c50463b5a49d535606276"
 dependencies = [
  "metrust 0.3.9",
  "serde",
  "serde_json",
- "wx-math 0.3.6 (git+https://github.com/FahrenheitResearch/metrust-py.git)",
+ "wx-math 0.3.6 (git+https://github.com/FahrenheitResearch/metrust-py.git?rev=1b8436779832be326f24bd2acd40a908e9f54685)",
 ]
 
 [[package]]
@@ -800,20 +800,20 @@ dependencies = [
 [[package]]
 name = "metrust"
 version = "0.3.9"
-source = "git+https://github.com/FahrenheitResearch/metrust-py.git#1b8436779832be326f24bd2acd40a908e9f54685"
+source = "git+https://github.com/FahrenheitResearch/metrust-py.git?rev=1b8436779832be326f24bd2acd40a908e9f54685#1b8436779832be326f24bd2acd40a908e9f54685"
 dependencies = [
  "chrono",
  "flate2",
  "rayon",
- "wx-core 0.3.9 (git+https://github.com/FahrenheitResearch/metrust-py.git)",
- "wx-field 0.3.6 (git+https://github.com/FahrenheitResearch/metrust-py.git)",
- "wx-math 0.3.6 (git+https://github.com/FahrenheitResearch/metrust-py.git)",
- "wx-radar 0.3.6 (git+https://github.com/FahrenheitResearch/metrust-py.git)",
+ "wx-core 0.3.9 (git+https://github.com/FahrenheitResearch/metrust-py.git?rev=1b8436779832be326f24bd2acd40a908e9f54685)",
+ "wx-field 0.3.6 (git+https://github.com/FahrenheitResearch/metrust-py.git?rev=1b8436779832be326f24bd2acd40a908e9f54685)",
+ "wx-math 0.3.6 (git+https://github.com/FahrenheitResearch/metrust-py.git?rev=1b8436779832be326f24bd2acd40a908e9f54685)",
+ "wx-radar 0.3.6 (git+https://github.com/FahrenheitResearch/metrust-py.git?rev=1b8436779832be326f24bd2acd40a908e9f54685)",
 ]
 
 [[package]]
 name = "metrust"
-version = "0.3.10"
+version = "0.3.11"
 dependencies = [
  "chrono",
  "criterion",
@@ -828,9 +828,9 @@ dependencies = [
 
 [[package]]
 name = "metrust-py"
-version = "0.4.5"
+version = "0.4.7"
 dependencies = [
- "metrust 0.3.10",
+ "metrust 0.3.11",
  "numpy",
  "pyo3",
  "rayon",
@@ -1970,7 +1970,7 @@ dependencies = [
 [[package]]
 name = "wx-core"
 version = "0.3.9"
-source = "git+https://github.com/FahrenheitResearch/metrust-py.git#1b8436779832be326f24bd2acd40a908e9f54685"
+source = "git+https://github.com/FahrenheitResearch/metrust-py.git?rev=1b8436779832be326f24bd2acd40a908e9f54685#1b8436779832be326f24bd2acd40a908e9f54685"
 dependencies = [
  "chrono",
  "flate2",
@@ -1982,8 +1982,8 @@ dependencies = [
  "thiserror",
  "ureq",
  "webpki-roots 0.26.11",
- "wx-field 0.3.6 (git+https://github.com/FahrenheitResearch/metrust-py.git)",
- "wx-math 0.3.6 (git+https://github.com/FahrenheitResearch/metrust-py.git)",
+ "wx-field 0.3.6 (git+https://github.com/FahrenheitResearch/metrust-py.git?rev=1b8436779832be326f24bd2acd40a908e9f54685)",
+ "wx-math 0.3.6 (git+https://github.com/FahrenheitResearch/metrust-py.git?rev=1b8436779832be326f24bd2acd40a908e9f54685)",
 ]
 
 [[package]]
@@ -1996,7 +1996,7 @@ dependencies = [
 [[package]]
 name = "wx-field"
 version = "0.3.6"
-source = "git+https://github.com/FahrenheitResearch/metrust-py.git#1b8436779832be326f24bd2acd40a908e9f54685"
+source = "git+https://github.com/FahrenheitResearch/metrust-py.git?rev=1b8436779832be326f24bd2acd40a908e9f54685#1b8436779832be326f24bd2acd40a908e9f54685"
 dependencies = [
  "chrono",
 ]
@@ -2012,10 +2012,10 @@ dependencies = [
 [[package]]
 name = "wx-math"
 version = "0.3.6"
-source = "git+https://github.com/FahrenheitResearch/metrust-py.git#1b8436779832be326f24bd2acd40a908e9f54685"
+source = "git+https://github.com/FahrenheitResearch/metrust-py.git?rev=1b8436779832be326f24bd2acd40a908e9f54685#1b8436779832be326f24bd2acd40a908e9f54685"
 dependencies = [
  "rayon",
- "wx-field 0.3.6 (git+https://github.com/FahrenheitResearch/metrust-py.git)",
+ "wx-field 0.3.6 (git+https://github.com/FahrenheitResearch/metrust-py.git?rev=1b8436779832be326f24bd2acd40a908e9f54685)",
 ]
 
 [[package]]
@@ -2034,7 +2034,7 @@ dependencies = [
 [[package]]
 name = "wx-radar"
 version = "0.3.6"
-source = "git+https://github.com/FahrenheitResearch/metrust-py.git#1b8436779832be326f24bd2acd40a908e9f54685"
+source = "git+https://github.com/FahrenheitResearch/metrust-py.git?rev=1b8436779832be326f24bd2acd40a908e9f54685#1b8436779832be326f24bd2acd40a908e9f54685"
 dependencies = [
  "byteorder",
  "bzip2",
@@ -2042,7 +2042,7 @@ dependencies = [
  "flate2",
  "rayon",
  "serde",
- "wx-field 0.3.6 (git+https://github.com/FahrenheitResearch/metrust-py.git)",
+ "wx-field 0.3.6 (git+https://github.com/FahrenheitResearch/metrust-py.git?rev=1b8436779832be326f24bd2acd40a908e9f54685)",
 ]
 
 [[package]]

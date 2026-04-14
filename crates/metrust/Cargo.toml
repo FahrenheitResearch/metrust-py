@@ -1,6 +1,6 @@
 [package]
 name = "metrust"
-version = "0.3.10"
+version = "0.3.11"
 edition = "2021"
 description = "A pure-Rust meteorology toolkit with a MetPy-compatible calculation layer"
 license = "MIT"
@@ -11,7 +11,7 @@ wx-core = { path = "../wx-core" }
 wx-math = { path = "../wx-math" }
 wx-field = { path = "../wx-field" }
 wx-radar = { path = "../wx-radar" }
-ecape-rs = { git = "https://github.com/FahrenheitResearch/ecape-rs", rev = "ce739db733dfb12464761935243418e0a155124b" }
+ecape-rs = { git = "https://github.com/FahrenheitResearch/ecape-rs", rev = "82922534c02a888e773c50463b5a49d535606276" }
 
 # Minimal external deps
 chrono = "0.4"

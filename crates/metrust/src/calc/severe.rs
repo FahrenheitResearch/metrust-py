@@ -76,38 +76,37 @@ pub mod grid {
         el: f64,
     }
 
+    #[derive(Debug, Clone, Copy, Default)]
+    struct EcapeColumnResult {
+        summary: EcapeSummary,
+        failed: bool,
+    }
+
     fn resolve_ecape_cape_type(parcel_type: &str) -> Result<EcapeCapeType, String> {
-        match parcel_type.trim().to_ascii_lowercase().as_str() {
-            "surface" | "surface_based" | "sb" => Ok(EcapeCapeType::SurfaceBased),
-            "mixed_layer" | "ml" => Ok(EcapeCapeType::MixedLayer),
-            "most_unstable" | "mu" => Ok(EcapeCapeType::MostUnstable),
-            other => Err(format!(
-                "unsupported ECAPE parcel_type '{other}'; expected 'surface', 'sb', 'mixed_layer', 'ml', 'most_unstable', or 'mu'"
-            )),
+        let cape_type = EcapeCapeType::parse_normalized(parcel_type).map_err(|err| {
+            format!(
+                "unsupported ECAPE parcel_type '{}'; expected 'surface', 'sb', 'mixed_layer', 'ml', 'most_unstable', or 'mu'",
+                err.value()
+            )
+        })?;
+        match cape_type {
+            EcapeCapeType::UserDefined => Err(
+                "ECAPE grid calculations do not support user_defined custom parcel thermodynamics"
+                    .to_string(),
+            ),
+            _ => Ok(cape_type),
         }
     }
 
     fn resolve_ecape_storm_motion_type(
         storm_motion_type: &str,
     ) -> Result<EcapeStormMotionType, String> {
-        match storm_motion_type
-            .trim()
-            .to_ascii_lowercase()
-            .replace('-', "_")
-            .as_str()
-        {
-            "right_moving" | "bunkers_rm" | "rm" | "right" => {
-                Ok(EcapeStormMotionType::RightMoving)
-            }
-            "left_moving" | "bunkers_lm" | "lm" | "left" => {
-                Ok(EcapeStormMotionType::LeftMoving)
-            }
-            "mean_wind" | "mean" => Ok(EcapeStormMotionType::MeanWind),
-            "user_defined" | "custom" => Ok(EcapeStormMotionType::UserDefined),
-            other => Err(format!(
-                "unsupported ECAPE storm_motion_type '{other}'; expected 'right_moving', 'bunkers_rm', 'left_moving', 'bunkers_lm', or 'mean_wind'"
-            )),
-        }
+        EcapeStormMotionType::parse_normalized(storm_motion_type).map_err(|err| {
+            format!(
+                "unsupported ECAPE storm_motion_type '{}'; expected 'right_moving', 'bunkers_rm', 'left_moving', 'bunkers_lm', or 'mean_wind'",
+                err.value()
+            )
+        })
     }
 
     fn dewpoint_k_from_q(q_kgkg: f64, p_pa: f64, temp_k: f64) -> f64 {
@@ -275,6 +274,69 @@ pub mod grid {
         storm_u: Option<f64>,
         storm_v: Option<f64>,
     ) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>), String> {
+        let (ecape, ncape, cape, cin, lfc, el, _) = compute_ecape_with_failure_mask(
+            pressure_3d,
+            temperature_c_3d,
+            qvapor_3d,
+            height_agl_3d,
+            u_3d,
+            v_3d,
+            psfc,
+            t2,
+            q2,
+            u10,
+            v10,
+            nx,
+            ny,
+            nz,
+            parcel_type,
+            storm_motion_type,
+            entrainment_rate,
+            pseudoadiabatic,
+            storm_u,
+            storm_v,
+        )?;
+        Ok((ecape, ncape, cape, cin, lfc, el))
+    }
+
+    /// Compute ECAPE-family diagnostics and return a per-column failure mask.
+    ///
+    /// The first six return arrays match [`compute_ecape`]. The final `u8`
+    /// array is `1` where the column fell back to zero-fill because it was too
+    /// short after filtering or the ECAPE solver returned an error.
+    pub fn compute_ecape_with_failure_mask(
+        pressure_3d: &[f64],
+        temperature_c_3d: &[f64],
+        qvapor_3d: &[f64],
+        height_agl_3d: &[f64],
+        u_3d: &[f64],
+        v_3d: &[f64],
+        psfc: &[f64],
+        t2: &[f64],
+        q2: &[f64],
+        u10: &[f64],
+        v10: &[f64],
+        nx: usize,
+        ny: usize,
+        nz: usize,
+        parcel_type: &str,
+        storm_motion_type: &str,
+        entrainment_rate: Option<f64>,
+        pseudoadiabatic: Option<bool>,
+        storm_u: Option<f64>,
+        storm_v: Option<f64>,
+    ) -> Result<
+        (
+            Vec<f64>,
+            Vec<f64>,
+            Vec<f64>,
+            Vec<f64>,
+            Vec<f64>,
+            Vec<f64>,
+            Vec<u8>,
+        ),
+        String,
+    > {
         let n2d = nx * ny;
         let expected_3d = n2d * nz;
         if pressure_3d.len() != expected_3d
@@ -306,7 +368,7 @@ pub mod grid {
             motion_type = EcapeStormMotionType::UserDefined;
         }
 
-        let results: Vec<EcapeSummary> = (0..n2d)
+        let results: Vec<EcapeColumnResult> = (0..n2d)
             .into_par_iter()
             .map(|ij| {
                 let top_idx = ij;
@@ -334,7 +396,10 @@ pub mod grid {
                     );
 
                 if pressure_pa.len() < 2 {
-                    return EcapeSummary::default();
+                    return EcapeColumnResult {
+                        summary: EcapeSummary::default(),
+                        failed: true,
+                    };
                 }
 
                 let mut options = ParcelOptions {
@@ -360,15 +425,21 @@ pub mod grid {
                     &v_ms,
                     &options,
                 ) {
-                    Ok(result) => EcapeSummary {
-                        ecape: result.ecape_jkg,
-                        ncape: result.ncape_jkg,
-                        cape: result.cape_jkg,
-                        cin: result.cin_jkg,
-                        lfc: result.lfc_m.unwrap_or(0.0),
-                        el: result.el_m.unwrap_or(0.0),
+                    Ok(result) => EcapeColumnResult {
+                        summary: EcapeSummary {
+                            ecape: result.ecape_jkg,
+                            ncape: result.ncape_jkg,
+                            cape: result.cape_jkg,
+                            cin: result.cin_jkg,
+                            lfc: result.lfc_m.unwrap_or(0.0),
+                            el: result.el_m.unwrap_or(0.0),
+                        },
+                        failed: false,
                     },
-                    Err(_) => EcapeSummary::default(),
+                    Err(_) => EcapeColumnResult {
+                        summary: EcapeSummary::default(),
+                        failed: true,
+                    },
                 }
             })
             .collect();
@@ -379,17 +450,19 @@ pub mod grid {
         let mut cin = Vec::with_capacity(n2d);
         let mut lfc = Vec::with_capacity(n2d);
         let mut el = Vec::with_capacity(n2d);
+        let mut failure_mask = Vec::with_capacity(n2d);
 
         for result in results {
-            ecape.push(result.ecape);
-            ncape.push(result.ncape);
-            cape.push(result.cape);
-            cin.push(result.cin);
-            lfc.push(result.lfc);
-            el.push(result.el);
+            ecape.push(result.summary.ecape);
+            ncape.push(result.summary.ncape);
+            cape.push(result.summary.cape);
+            cin.push(result.summary.cin);
+            lfc.push(result.summary.lfc);
+            el.push(result.summary.el);
+            failure_mask.push(u8::from(result.failed));
         }
 
-        Ok((ecape, ncape, cape, cin, lfc, el))
+        Ok((ecape, ncape, cape, cin, lfc, el, failure_mask))
     }
 
     // ── 2-D grid composite parameters ──
@@ -760,6 +833,21 @@ mod tests {
         (td_c + 273.15).min(temp_k)
     }
 
+    fn q_from_dewpoint_k(td_k: f64, p_pa: f64) -> f64 {
+        let td_c = td_k - 273.15;
+        let e_hpa = 6.112 * ((17.67 * td_c) / (td_c + 243.5)).exp();
+        let p_hpa = p_pa / 100.0;
+        0.622 * e_hpa / (p_hpa - e_hpa)
+    }
+
+    fn assert_close(actual: f64, expected: f64) {
+        let tolerance = 1e-6_f64.max(expected.abs() * 1e-10);
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "actual={actual}, expected={expected}, tolerance={tolerance}"
+        );
+    }
+
     #[test]
     fn test_compute_ecape_single_column_matches_direct_solver() {
         let nx = 1;
@@ -844,6 +932,125 @@ mod tests {
     }
 
     #[test]
+    fn test_compute_ecape_matches_shared_parity_fixture() {
+        let height_m = [
+            0.0, 250.0, 500.0, 750.0, 1000.0, 1500.0, 2000.0, 2500.0, 3000.0, 4000.0, 5000.0,
+            6000.0, 7500.0, 9000.0, 10500.0, 12000.0, 14000.0, 16000.0,
+        ];
+        let pressure_pa = [
+            100000.0,
+            96923.32344763441,
+            93941.30628134758,
+            91051.03613800342,
+            88249.69025845954,
+            82902.91181804004,
+            77880.07830714049,
+            73161.56289466418,
+            68728.92787909723,
+            60653.06597126334,
+            53526.142851899036,
+            47236.65527410147,
+            39160.5626676799,
+            32465.24673583497,
+            26914.634872918385,
+            22313.016014842982,
+            17377.394345044515,
+            13533.52832366127,
+        ];
+        let temperature_k = [
+            302.0, 300.2, 298.4, 296.6, 294.8, 291.2, 287.6, 284.0, 280.4, 273.2, 266.0, 258.8,
+            248.0, 237.2, 226.4, 215.6, 215.6, 215.6,
+        ];
+        let dewpoint_k = [
+            296.0, 295.625, 295.25, 294.875, 294.3, 290.7, 287.1, 283.5, 279.9, 272.7, 265.5,
+            258.3, 247.5, 236.7, 225.9, 215.1, 215.1, 215.1,
+        ];
+        let u_wind_ms = [
+            4.0, 4.625, 5.25, 5.875, 6.5, 7.75, 9.0, 10.25, 11.5, 14.0, 16.5, 19.0, 22.75, 26.5,
+            30.25, 34.0, 39.0, 44.0,
+        ];
+        let v_wind_ms = [
+            1.0, 1.375, 1.75, 2.125, 2.5, 3.25, 4.0, 4.75, 5.5, 7.0, 8.5, 10.0, 12.25, 14.5, 16.75,
+            19.0, 22.0, 25.0,
+        ];
+        let qvapor: Vec<f64> = pressure_pa
+            .iter()
+            .zip(dewpoint_k)
+            .map(|(&p, td)| q_from_dewpoint_k(td, p))
+            .collect();
+        let temperature_c_3d: Vec<f64> = temperature_k[1..].iter().map(|t| t - 273.15).collect();
+
+        let cases = [
+            (
+                "surface_based",
+                (
+                    2011.5445493759416,
+                    0.0,
+                    2846.0409852115004,
+                    -44.991140025487326,
+                    1360.0,
+                    12220.0,
+                ),
+            ),
+            (
+                "mixed_layer",
+                (
+                    2115.38982529213,
+                    0.0,
+                    3040.829940651471,
+                    -8.677832569217891,
+                    1180.0,
+                    12240.0,
+                ),
+            ),
+            (
+                "most_unstable",
+                (
+                    2097.6810414544825,
+                    0.0,
+                    3010.1256185714574,
+                    -0.23088078138348503,
+                    1100.0,
+                    12200.0,
+                ),
+            ),
+        ];
+
+        for (parcel_type, expected) in cases {
+            let (ecape, ncape, cape, cin, lfc, el) = grid::compute_ecape(
+                &pressure_pa[1..],
+                &temperature_c_3d,
+                &qvapor[1..],
+                &height_m[1..],
+                &u_wind_ms[1..],
+                &v_wind_ms[1..],
+                &[pressure_pa[0]],
+                &[temperature_k[0]],
+                &[qvapor[0]],
+                &[u_wind_ms[0]],
+                &[v_wind_ms[0]],
+                1,
+                1,
+                pressure_pa.len() - 1,
+                parcel_type,
+                "bunkers_rm",
+                None,
+                Some(true),
+                Some(12.0),
+                Some(6.0),
+            )
+            .unwrap();
+
+            assert_close(ecape[0], expected.0);
+            assert_close(ncape[0], expected.1);
+            assert_close(cape[0], expected.2);
+            assert_close(cin[0], expected.3);
+            assert_close(lfc[0], expected.4);
+            assert_close(el[0], expected.5);
+        }
+    }
+
+    #[test]
     fn test_compute_ecape_requires_both_storm_motion_components() {
         let err = grid::compute_ecape(
             &[95000.0, 90000.0],
@@ -869,5 +1076,40 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("storm_u and storm_v"));
+    }
+
+    #[test]
+    fn test_compute_ecape_with_failure_mask_flags_zero_fill_columns() {
+        let (ecape, ncape, cape, cin, lfc, el, failures) = grid::compute_ecape_with_failure_mask(
+            &[f64::NAN, f64::NAN],
+            &[f64::NAN, f64::NAN],
+            &[f64::NAN, f64::NAN],
+            &[f64::NAN, f64::NAN],
+            &[f64::NAN, f64::NAN],
+            &[f64::NAN, f64::NAN],
+            &[100000.0],
+            &[300.0],
+            &[0.014],
+            &[4.0],
+            &[1.0],
+            1,
+            1,
+            2,
+            "sb",
+            "mean_wind",
+            None,
+            Some(true),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(failures, vec![1]);
+        assert_eq!(ecape, vec![0.0]);
+        assert_eq!(ncape, vec![0.0]);
+        assert_eq!(cape, vec![0.0]);
+        assert_eq!(cin, vec![0.0]);
+        assert_eq!(lfc, vec![0.0]);
+        assert_eq!(el, vec![0.0]);
     }
 }

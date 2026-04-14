@@ -163,6 +163,84 @@ def test_compute_ecape_smoke():
 
 # ── 6. test_wind_functions ───────────────────────────────────────────
 
+def test_compute_ecape_converts_pint_units_at_boundary():
+    """ECAPE converts Pint inputs to its documented kernel units."""
+    import metrust.calc as mcalc
+    from metrust.units import units
+
+    pressure = np.array([95000, 90000, 85000, 70000, 50000, 30000], dtype=float)
+    temperature = np.array([26, 22, 18, 8, -10, -38], dtype=float)
+    qvapor = np.array([0.016, 0.013, 0.010, 0.005, 0.0015, 0.0003], dtype=float)
+    height = np.array([150, 800, 1500, 3000, 5600, 9200], dtype=float)
+    u = np.array([6, 9, 12, 18, 26, 33], dtype=float)
+    v = np.array([2, 5, 8, 13, 20, 28], dtype=float)
+
+    p_native = pressure[:, None, None] * np.ones((6, 1, 1)) * units.Pa
+    t_native = temperature[:, None, None] * np.ones((6, 1, 1)) * units.degC
+    q_native = qvapor[:, None, None] * np.ones((6, 1, 1))
+    h_native = height[:, None, None] * np.ones((6, 1, 1)) * units.m
+    u_native = u[:, None, None] * np.ones((6, 1, 1)) * units("m/s")
+    v_native = v[:, None, None] * np.ones((6, 1, 1)) * units("m/s")
+
+    native = mcalc.compute_ecape(
+        p_native, t_native, q_native, h_native, u_native, v_native,
+        np.array([[100000.0]]) * units.Pa,
+        np.array([[303.15]]) * units.K,
+        np.array([[0.018]]),
+        np.array([[5.0]]) * units("m/s"),
+        np.array([[1.5]]) * units("m/s"),
+        parcel_type="ml",
+        storm_motion_type="bunkers_rm",
+    )
+
+    converted = mcalc.compute_ecape(
+        (pressure / 100.0)[:, None, None] * np.ones((6, 1, 1)) * units.hPa,
+        (temperature + 273.15)[:, None, None] * np.ones((6, 1, 1)) * units.K,
+        (qvapor * 1000.0)[:, None, None] * np.ones((6, 1, 1)) * units("g/kg"),
+        h_native,
+        u_native,
+        v_native,
+        np.array([[1000.0]]) * units.hPa,
+        np.array([[30.0]]) * units.degC,
+        np.array([[18.0]]) * units("g/kg"),
+        np.array([[5.0]]) * units("m/s"),
+        np.array([[1.5]]) * units("m/s"),
+        parcel_type="ml",
+        storm_motion_type="bunkers_rm",
+    )
+
+    for lhs, rhs in zip(native, converted):
+        np.testing.assert_allclose(lhs.m, rhs.m, rtol=0, atol=1.0e-8)
+
+
+def test_compute_ecape_with_failure_mask_flags_zero_filled_columns():
+    """The debug ECAPE helper exposes columns that silently zero-fill."""
+    import metrust.calc as mcalc
+
+    nan3 = np.full((2, 1, 1), np.nan)
+    ecape, ncape, cape, cin, lfc, el, failure_mask = (
+        mcalc.compute_ecape_with_failure_mask(
+            nan3,
+            nan3,
+            nan3,
+            nan3,
+            nan3,
+            nan3,
+            np.array([[100000.0]]),
+            np.array([[300.0]]),
+            np.array([[0.014]]),
+            np.array([[4.0]]),
+            np.array([[1.0]]),
+        )
+    )
+
+    assert failure_mask.shape == (1, 1)
+    assert failure_mask.dtype == np.bool_
+    assert failure_mask[0, 0]
+    for field in (ecape, ncape, cape, cin, lfc, el):
+        assert field.m[0, 0] == 0.0
+
+
 def test_wind_functions():
     """wind_speed, wind_direction, and wind_components round-trip."""
     import metrust.calc as mcalc

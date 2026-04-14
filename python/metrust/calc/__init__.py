@@ -7262,6 +7262,15 @@ def _grid_strip(arr):
     return np.ascontiguousarray(arr, dtype=np.float64)
 
 
+def _grid_strip_unit(arr, target_unit):
+    """Strip Pint units after converting to the exact grid-kernel unit."""
+    if hasattr(arr, "to"):
+        arr = arr.to(target_unit).magnitude
+    elif hasattr(arr, "magnitude"):
+        arr = arr.magnitude
+    return np.ascontiguousarray(arr, dtype=np.float64)
+
+
 def _scalar_strip(val, target_unit=None):
     """Strip Pint unit from a scalar, optionally converting first."""
     if val is None:
@@ -7276,6 +7285,15 @@ def _scalar_strip(val, target_unit=None):
 def _grid_flatten_3d(arr):
     """Flatten a 3D array [nz, ny, nx] → 1D, return (flat, nx, ny, nz)."""
     a = _grid_strip(arr)
+    if a.ndim != 3:
+        raise ValueError(f"Expected 3-D array (nz, ny, nx), got {a.ndim}-D")
+    nz, ny, nx = a.shape
+    return a.ravel(), nx, ny, nz
+
+
+def _grid_flatten_3d_unit(arr, target_unit):
+    """Flatten a 3D input after converting Pint quantities to `target_unit`."""
+    a = _grid_strip_unit(arr, target_unit)
     if a.ndim != 3:
         raise ValueError(f"Expected 3-D array (nz, ny, nx), got {a.ndim}-D")
     nz, ny, nx = a.shape
@@ -7342,6 +7360,40 @@ def compute_cape_cin(pressure_3d, temperature_c_3d, qvapor_3d,
     )
 
 
+def _prep_ecape_grid_inputs(pressure_3d, temperature_c_3d, qvapor_3d,
+                            height_agl_3d, u_3d, v_3d,
+                            psfc, t2, q2, u10, v10):
+    """Normalize ECAPE grid inputs to the Rust kernel's unit contract."""
+    p3, nx, ny, nz = _grid_flatten_3d_unit(pressure_3d, "Pa")
+    return (
+        p3,
+        _grid_strip_unit(temperature_c_3d, "degC").ravel(),
+        _grid_strip_unit(qvapor_3d, "kg/kg").ravel(),
+        _grid_strip_unit(height_agl_3d, "m").ravel(),
+        _grid_strip_unit(u_3d, "m/s").ravel(),
+        _grid_strip_unit(v_3d, "m/s").ravel(),
+        _grid_strip_unit(psfc, "Pa").ravel(),
+        _grid_strip_unit(t2, "K").ravel(),
+        _grid_strip_unit(q2, "kg/kg").ravel(),
+        _grid_strip_unit(u10, "m/s").ravel(),
+        _grid_strip_unit(v10, "m/s").ravel(),
+        nx,
+        ny,
+        nz,
+    )
+
+
+def _attach_ecape_outputs(ecape, ncape, cape, cin, lfc, el, shape):
+    return (
+        np.asarray(ecape).reshape(shape) * units("J/kg"),
+        np.asarray(ncape).reshape(shape) * units("J/kg"),
+        np.asarray(cape).reshape(shape) * units("J/kg"),
+        np.asarray(cin).reshape(shape) * units("J/kg"),
+        np.asarray(lfc).reshape(shape) * units.m,
+        np.asarray(el).reshape(shape) * units.m,
+    )
+
+
 def compute_ecape(pressure_3d, temperature_c_3d, qvapor_3d,
                   height_agl_3d, u_3d, v_3d,
                   psfc, t2, q2, u10, v10,
@@ -7350,25 +7402,29 @@ def compute_ecape(pressure_3d, temperature_c_3d, qvapor_3d,
                   storm_u=None, storm_v=None):
     """ECAPE-family diagnostics for every grid point (parallelized Rust).
 
-    3-D inputs: shape (nz, ny, nx) -- pressure (Pa), temperature (C),
-    mixing ratio (kg/kg), height AGL (m), and u/v wind (m/s).
-    2-D inputs: shape (ny, nx) -- surface pressure (Pa), T2m (K), Q2m (kg/kg),
-    and 10 m winds (m/s).
+    3-D inputs: shape (nz, ny, nx) -- pressure (Pa), temperature (degC),
+    water-vapor mixing ratio (kg/kg), height AGL (m), and earth-relative
+    u/v wind (m/s). 2-D inputs: shape (ny, nx) -- surface pressure (Pa),
+    T2m (`t2`, Kelvin), Q2m mixing ratio (kg/kg), and earth-relative 10 m
+    winds (m/s). Pint quantities are converted to these units before the
+    Rust kernel is called; plain ndarrays must already use these units.
+
+    `metrust` does not rotate model-grid winds here. WRF/HRRR callers must
+    pass earth-relative wind components if that is what the ECAPE storm-motion
+    calculation should use.
 
     Returns `(ecape, ncape, cape, cin, lfc_height, el_height)` each shaped `(ny, nx)`.
+    Invalid or unsolved columns are zero-filled by default. Use
+    `compute_ecape_with_failure_mask` when you need to inspect those columns.
     This path is currently CPU-backed even when the global backend is set to `"gpu"`.
     """
-    p3, nx, ny, nz = _grid_flatten_3d(pressure_3d)
-    t3 = _grid_strip(temperature_c_3d).ravel()
-    q3 = _grid_strip(qvapor_3d).ravel()
-    h3 = _grid_strip(height_agl_3d).ravel()
-    u3 = _grid_strip(u_3d).ravel()
-    v3 = _grid_strip(v_3d).ravel()
-    ps = _grid_strip(psfc).ravel()
-    t2v = _grid_strip(t2).ravel()
-    q2v = _grid_strip(q2).ravel()
-    u10v = _grid_strip(u10).ravel()
-    v10v = _grid_strip(v10).ravel()
+    p3, t3, q3, h3, u3, v3, ps, t2v, q2v, u10v, v10v, nx, ny, nz = (
+        _prep_ecape_grid_inputs(
+            pressure_3d, temperature_c_3d, qvapor_3d,
+            height_agl_3d, u_3d, v_3d,
+            psfc, t2, q2, u10, v10,
+        )
+    )
     ecape, ncape, cape, cin, lfc, el = _calc.compute_ecape(
         p3, t3, q3, h3, u3, v3,
         ps, t2v, q2v, u10v, v10v,
@@ -7381,14 +7437,49 @@ def compute_ecape(pressure_3d, temperature_c_3d, qvapor_3d,
         None if storm_v is None else float(_scalar_strip(storm_v, "m/s")),
     )
     shape = (ny, nx)
-    return (
-        np.asarray(ecape).reshape(shape) * units("J/kg"),
-        np.asarray(ncape).reshape(shape) * units("J/kg"),
-        np.asarray(cape).reshape(shape) * units("J/kg"),
-        np.asarray(cin).reshape(shape) * units("J/kg"),
-        np.asarray(lfc).reshape(shape) * units.m,
-        np.asarray(el).reshape(shape) * units.m,
+    return _attach_ecape_outputs(ecape, ncape, cape, cin, lfc, el, shape)
+
+
+def compute_ecape_with_failure_mask(pressure_3d, temperature_c_3d, qvapor_3d,
+                                    height_agl_3d, u_3d, v_3d,
+                                    psfc, t2, q2, u10, v10,
+                                    parcel_type="surface",
+                                    storm_motion_type="right_moving",
+                                    entrainment_rate=None,
+                                    pseudoadiabatic=True,
+                                    storm_u=None,
+                                    storm_v=None):
+    """ECAPE-family diagnostics plus a boolean zero-fill/failure mask.
+
+    This is the debug/inspection variant of `compute_ecape`. Inputs and
+    defaults are identical. The first six return values are the same fields
+    returned by `compute_ecape`; the seventh is a boolean `(ny, nx)` mask.
+    `True` means the column was zero-filled because it became too short after
+    filtering invalid levels or because the ECAPE solver returned an error.
+    """
+    p3, t3, q3, h3, u3, v3, ps, t2v, q2v, u10v, v10v, nx, ny, nz = (
+        _prep_ecape_grid_inputs(
+            pressure_3d, temperature_c_3d, qvapor_3d,
+            height_agl_3d, u_3d, v_3d,
+            psfc, t2, q2, u10, v10,
+        )
     )
+    ecape, ncape, cape, cin, lfc, el, failure_mask = (
+        _calc.compute_ecape_with_failure_mask(
+            p3, t3, q3, h3, u3, v3,
+            ps, t2v, q2v, u10v, v10v,
+            nx, ny, nz,
+            parcel_type,
+            storm_motion_type,
+            _scalar_strip(entrainment_rate),
+            bool(pseudoadiabatic) if pseudoadiabatic is not None else None,
+            None if storm_u is None else float(_scalar_strip(storm_u, "m/s")),
+            None if storm_v is None else float(_scalar_strip(storm_v, "m/s")),
+        )
+    )
+    shape = (ny, nx)
+    return (*_attach_ecape_outputs(ecape, ncape, cape, cin, lfc, el, shape),
+            np.asarray(failure_mask, dtype=bool).reshape(shape))
 
 
 def compute_srh(u_3d, v_3d, height_agl_3d, top_m=1000.0):
@@ -8382,6 +8473,7 @@ __all__ = [
     # grid composites
     "compute_cape_cin",
     "compute_ecape",
+    "compute_ecape_with_failure_mask",
     "compute_srh",
     "compute_shear",
     "compute_lapse_rate",
