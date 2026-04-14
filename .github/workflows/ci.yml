@@ -90,7 +90,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run Criterion benchmarks
-        run: cargo bench --package metrust --bench calc_bench
+        run: cargo bench --manifest-path crates/metrust/Cargo.toml --bench calc_bench
 
       - name: Upload criterion artifacts
         uses: actions/upload-artifact@v7
