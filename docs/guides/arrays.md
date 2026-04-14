@@ -202,6 +202,7 @@ to write column-by-column loops in Python.
 | Function | 3-D inputs | 2-D inputs | Returns |
 |----------|-----------|-----------|---------|
 | `compute_cape_cin` | pressure, T, qvapor, height AGL | psfc, T2m, Q2m | CAPE, CIN, LCL height, LFC height |
+| `compute_ecape` | pressure, T, qvapor, height AGL, u, v | psfc, T2m, Q2m, U10m, V10m | ECAPE, NCAPE, CAPE, CIN, LFC height, EL height |
 | `compute_srh` | u, v, height AGL | -- | storm-relative helicity |
 | `compute_shear` | u, v, height AGL | -- | bulk wind shear magnitude |
 | `compute_lapse_rate` | T, qvapor, height AGL | -- | environmental lapse rate |

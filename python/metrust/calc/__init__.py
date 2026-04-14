@@ -7342,6 +7342,55 @@ def compute_cape_cin(pressure_3d, temperature_c_3d, qvapor_3d,
     )
 
 
+def compute_ecape(pressure_3d, temperature_c_3d, qvapor_3d,
+                  height_agl_3d, u_3d, v_3d,
+                  psfc, t2, q2, u10, v10,
+                  parcel_type="surface", storm_motion_type="right_moving",
+                  entrainment_rate=None, pseudoadiabatic=True,
+                  storm_u=None, storm_v=None):
+    """ECAPE-family diagnostics for every grid point (parallelized Rust).
+
+    3-D inputs: shape (nz, ny, nx) -- pressure (Pa), temperature (C),
+    mixing ratio (kg/kg), height AGL (m), and u/v wind (m/s).
+    2-D inputs: shape (ny, nx) -- surface pressure (Pa), T2m (K), Q2m (kg/kg),
+    and 10 m winds (m/s).
+
+    Returns `(ecape, ncape, cape, cin, lfc_height, el_height)` each shaped `(ny, nx)`.
+    This path is currently CPU-backed even when the global backend is set to `"gpu"`.
+    """
+    p3, nx, ny, nz = _grid_flatten_3d(pressure_3d)
+    t3 = _grid_strip(temperature_c_3d).ravel()
+    q3 = _grid_strip(qvapor_3d).ravel()
+    h3 = _grid_strip(height_agl_3d).ravel()
+    u3 = _grid_strip(u_3d).ravel()
+    v3 = _grid_strip(v_3d).ravel()
+    ps = _grid_strip(psfc).ravel()
+    t2v = _grid_strip(t2).ravel()
+    q2v = _grid_strip(q2).ravel()
+    u10v = _grid_strip(u10).ravel()
+    v10v = _grid_strip(v10).ravel()
+    ecape, ncape, cape, cin, lfc, el = _calc.compute_ecape(
+        p3, t3, q3, h3, u3, v3,
+        ps, t2v, q2v, u10v, v10v,
+        nx, ny, nz,
+        parcel_type,
+        storm_motion_type,
+        _scalar_strip(entrainment_rate),
+        bool(pseudoadiabatic) if pseudoadiabatic is not None else None,
+        None if storm_u is None else float(_scalar_strip(storm_u, "m/s")),
+        None if storm_v is None else float(_scalar_strip(storm_v, "m/s")),
+    )
+    shape = (ny, nx)
+    return (
+        np.asarray(ecape).reshape(shape) * units("J/kg"),
+        np.asarray(ncape).reshape(shape) * units("J/kg"),
+        np.asarray(cape).reshape(shape) * units("J/kg"),
+        np.asarray(cin).reshape(shape) * units("J/kg"),
+        np.asarray(lfc).reshape(shape) * units.m,
+        np.asarray(el).reshape(shape) * units.m,
+    )
+
+
 def compute_srh(u_3d, v_3d, height_agl_3d, top_m=1000.0):
     """Storm-relative helicity for every grid point.
 
@@ -8332,6 +8381,7 @@ __all__ = [
     "galvez_davison_index",
     # grid composites
     "compute_cape_cin",
+    "compute_ecape",
     "compute_srh",
     "compute_shear",
     "compute_lapse_rate",

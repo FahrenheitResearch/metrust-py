@@ -115,6 +115,52 @@ def test_cape_cin():
     assert cin.m <= 0
 
 
+def test_compute_ecape_smoke():
+    """Grid ECAPE returns the expected field family with units and shapes."""
+    import metrust.calc as mcalc
+    from metrust.units import units
+
+    pressure = np.array([95000, 90000, 85000, 70000, 50000, 30000], dtype=float)
+    temperature = np.array([26, 22, 18, 8, -10, -38], dtype=float)
+    qvapor = np.array([0.016, 0.013, 0.010, 0.005, 0.0015, 0.0003], dtype=float)
+    height = np.array([150, 800, 1500, 3000, 5600, 9200], dtype=float)
+    u = np.array([6, 9, 12, 18, 26, 33], dtype=float)
+    v = np.array([2, 5, 8, 13, 20, 28], dtype=float)
+
+    p3 = pressure[:, None, None] * np.ones((6, 2, 2)) * units.Pa
+    t3 = temperature[:, None, None] * np.ones((6, 2, 2)) * units.degC
+    q3 = qvapor[:, None, None] * np.ones((6, 2, 2))
+    h3 = height[:, None, None] * np.ones((6, 2, 2)) * units.m
+    u3 = u[:, None, None] * np.ones((6, 2, 2)) * units("m/s")
+    v3 = v[:, None, None] * np.ones((6, 2, 2)) * units("m/s")
+
+    ecape, ncape, cape, cin, lfc, el = mcalc.compute_ecape(
+        p3,
+        t3,
+        q3,
+        h3,
+        u3,
+        v3,
+        np.full((2, 2), 100000.0) * units.Pa,
+        np.full((2, 2), 303.15) * units.K,
+        np.full((2, 2), 0.018),
+        np.full((2, 2), 5.0) * units("m/s"),
+        np.full((2, 2), 1.5) * units("m/s"),
+        parcel_type="ml",
+        storm_motion_type="bunkers_rm",
+    )
+
+    for field in (ecape, ncape, cape, cin):
+        assert field.shape == (2, 2)
+        assert field.units == units("J/kg")
+        assert np.all(np.isfinite(field.m))
+
+    for field in (lfc, el):
+        assert field.shape == (2, 2)
+        assert field.units == units.m
+        assert np.all(np.isfinite(field.m))
+
+
 # ── 6. test_wind_functions ───────────────────────────────────────────
 
 def test_wind_functions():

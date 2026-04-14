@@ -11,7 +11,7 @@ All functions live in `metrust.calc`:
 
 ```python
 from metrust.calc import (
-    compute_cape_cin, compute_srh, compute_shear,
+    compute_cape_cin, compute_ecape, compute_srh, compute_shear,
     compute_lapse_rate, compute_pw,
     compute_stp, compute_scp, compute_ehi, compute_ship,
     compute_dcp, compute_grid_scp, compute_grid_critical_angle,
@@ -104,6 +104,90 @@ cape, cin, lcl_hgt, lfc_hgt = compute_cape_cin(
 
 print(cape.shape)  # (ny, nx)
 print(cape.max())  # e.g. 3500 J/kg
+```
+
+---
+
+### `compute_ecape`
+
+Entraining CAPE and companion parcel diagnostics for every grid column,
+computed in parallel. Returns six 2-D fields: ECAPE, NCAPE, entraining CAPE,
+entraining CIN, LFC height, and EL height.
+
+```python
+compute_ecape(
+    pressure_3d,
+    temperature_c_3d,
+    qvapor_3d,
+    height_agl_3d,
+    u_3d,
+    v_3d,
+    psfc,
+    t2,
+    q2,
+    u10,
+    v10,
+    parcel_type="surface",
+    storm_motion_type="right_moving",
+    entrainment_rate=None,
+    pseudoadiabatic=True,
+    storm_u=None,
+    storm_v=None,
+)
+```
+
+**Parameters**
+
+| Parameter | Shape | Units | Description |
+|---|---|---|---|
+| `pressure_3d` | `(nz, ny, nx)` | Pa | 3-D pressure field |
+| `temperature_c_3d` | `(nz, ny, nx)` | degrees Celsius | 3-D temperature field |
+| `qvapor_3d` | `(nz, ny, nx)` | kg/kg | 3-D water vapor mixing ratio |
+| `height_agl_3d` | `(nz, ny, nx)` | m | 3-D height above ground level |
+| `u_3d`, `v_3d` | `(nz, ny, nx)` | m/s | 3-D wind components |
+| `psfc` | `(ny, nx)` | Pa | Surface pressure |
+| `t2` | `(ny, nx)` | K | 2-meter temperature |
+| `q2` | `(ny, nx)` | kg/kg | 2-meter water vapor mixing ratio |
+| `u10`, `v10` | `(ny, nx)` | m/s | 10-meter wind components |
+| `parcel_type` | scalar | -- | `"surface"`, `"mixed_layer"`, or `"most_unstable"` |
+| `storm_motion_type` | scalar | -- | `"right_moving"`, `"bunkers_rm"`, `"left_moving"`, `"bunkers_lm"`, or `"mean_wind"` |
+| `entrainment_rate` | scalar or `None` | 1/m | Optional explicit entrainment rate |
+| `pseudoadiabatic` | scalar or `None` | -- | Whether to use pseudoadiabatic ascent |
+| `storm_u`, `storm_v` | scalar or `None` | m/s | Optional explicit storm-motion override. Provide both or neither. |
+
+**Returns**
+
+A tuple of six 2-D arrays, each shaped `(ny, nx)`:
+
+| Index | Field | Units |
+|---|---|---|
+| 0 | ECAPE | J/kg |
+| 1 | NCAPE | J/kg |
+| 2 | Entraining CAPE | J/kg |
+| 3 | Entraining CIN | J/kg |
+| 4 | LFC height | m |
+| 5 | EL height | m |
+
+**Example**
+
+```python
+from metrust.calc import compute_ecape
+
+ecape, ncape, cape, cin, lfc_hgt, el_hgt = compute_ecape(
+    pressure_3d,
+    temperature_c_3d,
+    qvapor_3d,
+    height_agl_3d,
+    u_3d,
+    v_3d,
+    psfc,
+    t2,
+    q2,
+    u10,
+    v10,
+    parcel_type="mixed_layer",
+    storm_motion_type="bunkers_rm",
+)
 ```
 
 ---

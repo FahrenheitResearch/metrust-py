@@ -18,7 +18,12 @@ fn significant_tornado_parameter(
     srh_0_1km: f64,
     bulk_shear_0_6km_ms: f64,
 ) -> f64 {
-    metrust::calc::significant_tornado_parameter(mlcape, lcl_height_m, srh_0_1km, bulk_shear_0_6km_ms)
+    metrust::calc::significant_tornado_parameter(
+        mlcape,
+        lcl_height_m,
+        srh_0_1km,
+        bulk_shear_0_6km_ms,
+    )
 }
 
 /// Supercell Composite Parameter (SCP).
@@ -169,14 +174,8 @@ fn hot_dry_windy(t_c: f64, rh: f64, wspd_ms: f64, vpd: f64) -> f64 {
 /// Profiles are surface-first (decreasing pressure).
 #[pyfunction]
 #[pyo3(text_signature = "(t_profile, p_profile)")]
-fn warm_nose_check(
-    t_profile: PyReadonlyArray1<f64>,
-    p_profile: PyReadonlyArray1<f64>,
-) -> bool {
-    metrust::calc::warm_nose_check(
-        t_profile.as_slice().unwrap(),
-        p_profile.as_slice().unwrap(),
-    )
+fn warm_nose_check(t_profile: PyReadonlyArray1<f64>, p_profile: PyReadonlyArray1<f64>) -> bool {
+    metrust::calc::warm_nose_check(t_profile.as_slice().unwrap(), p_profile.as_slice().unwrap())
 }
 
 /// Galvez-Davison Index (GDI) for tropical convection potential.
@@ -272,14 +271,7 @@ fn vertical_totals(t850: f64, t500: f64) -> f64 {
 /// - wdir850, wdir500: Wind directions at 850/500 hPa (degrees)
 #[pyfunction]
 #[pyo3(text_signature = "(tt, td850, wspd850, wdir850, wspd500, wdir500)")]
-fn sweat_index(
-    tt: f64,
-    td850: f64,
-    wspd850: f64,
-    wdir850: f64,
-    wspd500: f64,
-    wdir500: f64,
-) -> f64 {
+fn sweat_index(tt: f64, td850: f64, wspd850: f64, wdir850: f64, wspd500: f64, wdir500: f64) -> f64 {
     metrust::calc::severe::grid::sweat_index(tt, td850, wspd850, wdir850, wspd500, wdir500)
 }
 
@@ -336,6 +328,79 @@ fn compute_cape_cin<'py>(
         lcl_p.into_pyarray(py),
         lfc_p.into_pyarray(py),
     )
+}
+
+/// Compute ECAPE-family diagnostics on a 3-D grid.
+///
+/// Returns `(ecape, ncape, cape, cin, lfc, el)` as six 1-D arrays of length `nx*ny`.
+///
+/// - pressure_3d, temperature_c_3d, qvapor_3d, height_agl_3d: flattened [nz][ny][nx]
+/// - u_3d, v_3d: flattened [nz][ny][nx] winds in m/s
+/// - psfc, t2, q2, u10, v10: flattened [ny][nx] surface fields
+#[pyfunction]
+#[pyo3(signature = (pressure_3d, temperature_c_3d, qvapor_3d, height_agl_3d, u_3d, v_3d, psfc, t2, q2, u10, v10, nx, ny, nz, parcel_type="surface", storm_motion_type="right_moving", entrainment_rate=None, pseudoadiabatic=Some(true), storm_u=None, storm_v=None))]
+fn compute_ecape<'py>(
+    py: Python<'py>,
+    pressure_3d: PyReadonlyArray1<f64>,
+    temperature_c_3d: PyReadonlyArray1<f64>,
+    qvapor_3d: PyReadonlyArray1<f64>,
+    height_agl_3d: PyReadonlyArray1<f64>,
+    u_3d: PyReadonlyArray1<f64>,
+    v_3d: PyReadonlyArray1<f64>,
+    psfc: PyReadonlyArray1<f64>,
+    t2: PyReadonlyArray1<f64>,
+    q2: PyReadonlyArray1<f64>,
+    u10: PyReadonlyArray1<f64>,
+    v10: PyReadonlyArray1<f64>,
+    nx: usize,
+    ny: usize,
+    nz: usize,
+    parcel_type: &str,
+    storm_motion_type: &str,
+    entrainment_rate: Option<f64>,
+    pseudoadiabatic: Option<bool>,
+    storm_u: Option<f64>,
+    storm_v: Option<f64>,
+) -> PyResult<(
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+)> {
+    let (ecape, ncape, cape, cin, lfc, el) = metrust::calc::severe::grid::compute_ecape(
+        pressure_3d.as_slice().unwrap(),
+        temperature_c_3d.as_slice().unwrap(),
+        qvapor_3d.as_slice().unwrap(),
+        height_agl_3d.as_slice().unwrap(),
+        u_3d.as_slice().unwrap(),
+        v_3d.as_slice().unwrap(),
+        psfc.as_slice().unwrap(),
+        t2.as_slice().unwrap(),
+        q2.as_slice().unwrap(),
+        u10.as_slice().unwrap(),
+        v10.as_slice().unwrap(),
+        nx,
+        ny,
+        nz,
+        parcel_type,
+        storm_motion_type,
+        entrainment_rate,
+        pseudoadiabatic,
+        storm_u,
+        storm_v,
+    )
+    .map_err(pyo3::exceptions::PyValueError::new_err)?;
+
+    Ok((
+        ecape.into_pyarray(py),
+        ncape.into_pyarray(py),
+        cape.into_pyarray(py),
+        cin.into_pyarray(py),
+        lfc.into_pyarray(py),
+        el.into_pyarray(py),
+    ))
 }
 
 /// Compute storm-relative helicity on a 3-D grid.
@@ -407,7 +472,9 @@ fn compute_shear<'py>(
 /// - temperature_c_3d, qvapor_3d, height_agl_3d: flattened [nz][ny][nx]
 /// - bottom_km, top_km: layer bounds in km AGL
 #[pyfunction]
-#[pyo3(text_signature = "(temperature_c_3d, qvapor_3d, height_agl_3d, nx, ny, nz, bottom_km, top_km)")]
+#[pyo3(
+    text_signature = "(temperature_c_3d, qvapor_3d, height_agl_3d, nx, ny, nz, bottom_km, top_km)"
+)]
 fn compute_lapse_rate<'py>(
     py: Python<'py>,
     temperature_c_3d: PyReadonlyArray1<f64>,
@@ -512,10 +579,8 @@ fn compute_ehi<'py>(
     cape: PyReadonlyArray1<f64>,
     srh: PyReadonlyArray1<f64>,
 ) -> Bound<'py, PyArray1<f64>> {
-    let result = metrust::calc::severe::grid::compute_ehi(
-        cape.as_slice().unwrap(),
-        srh.as_slice().unwrap(),
-    );
+    let result =
+        metrust::calc::severe::grid::compute_ehi(cape.as_slice().unwrap(), srh.as_slice().unwrap());
     result.into_pyarray(py)
 }
 
@@ -664,7 +729,9 @@ fn composite_reflectivity_from_refl<'py>(
 /// - temperature_c_3d: Celsius
 /// - qrain_3d, qsnow_3d, qgraup_3d: kg/kg
 #[pyfunction]
-#[pyo3(text_signature = "(pressure_3d, temperature_c_3d, qrain_3d, qsnow_3d, qgraup_3d, nx, ny, nz)")]
+#[pyo3(
+    text_signature = "(pressure_3d, temperature_c_3d, qrain_3d, qsnow_3d, qgraup_3d, nx, ny, nz)"
+)]
 fn composite_reflectivity_from_hydrometeors<'py>(
     py: Python<'py>,
     pressure_3d: PyReadonlyArray1<f64>,
@@ -720,6 +787,7 @@ pub fn register(_py: Python, parent: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Grid-based 3-D compute functions
     parent.add_function(wrap_pyfunction!(compute_cape_cin, parent)?)?;
+    parent.add_function(wrap_pyfunction!(compute_ecape, parent)?)?;
     parent.add_function(wrap_pyfunction!(compute_srh, parent)?)?;
     parent.add_function(wrap_pyfunction!(compute_shear, parent)?)?;
     parent.add_function(wrap_pyfunction!(compute_lapse_rate, parent)?)?;
@@ -731,12 +799,18 @@ pub fn register(_py: Python, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     parent.add_function(wrap_pyfunction!(compute_ehi, parent)?)?;
     parent.add_function(wrap_pyfunction!(significant_hail_parameter, parent)?)?;
     parent.add_function(wrap_pyfunction!(derecho_composite_parameter, parent)?)?;
-    parent.add_function(wrap_pyfunction!(grid_supercell_composite_parameter, parent)?)?;
+    parent.add_function(wrap_pyfunction!(
+        grid_supercell_composite_parameter,
+        parent
+    )?)?;
     parent.add_function(wrap_pyfunction!(grid_critical_angle, parent)?)?;
 
     // Grid-based reflectivity composites
     parent.add_function(wrap_pyfunction!(composite_reflectivity_from_refl, parent)?)?;
-    parent.add_function(wrap_pyfunction!(composite_reflectivity_from_hydrometeors, parent)?)?;
+    parent.add_function(wrap_pyfunction!(
+        composite_reflectivity_from_hydrometeors,
+        parent
+    )?)?;
 
     Ok(())
 }
