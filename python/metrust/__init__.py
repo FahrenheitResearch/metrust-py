@@ -1,11 +1,18 @@
 """metrust -- Rust-powered meteorology toolkit for Python."""
 
+from importlib.metadata import PackageNotFoundError, version
+
 from metrust import calc
 from metrust import constants
 from metrust import interpolate
 from metrust import io
 from metrust import units
 from metrust.calc import get_backend, set_backend, use_backend
+
+try:
+    __version__ = version("metrust")
+except PackageNotFoundError:
+    __version__ = "0+unknown"
 
 __all__ = [
     "calc",
@@ -16,4 +23,5 @@ __all__ = [
     "get_backend",
     "set_backend",
     "use_backend",
+    "__version__",
 ]

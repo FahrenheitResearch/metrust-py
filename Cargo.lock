@@ -828,7 +828,7 @@ dependencies = [
 
 [[package]]
 name = "metrust-py"
-version = "0.4.7"
+version = "0.5.0"
 dependencies = [
  "metrust 0.3.11",
  "numpy",

@@ -5,7 +5,9 @@ import pandas as pd
 import pint
 import pytest
 
+import metrust
 import metrust.calc as mcalc
+import metrust.interpolate as minterp
 from metrust.units import units as mr_units
 
 mpcalc = pytest.importorskip("metpy.calc")
@@ -67,7 +69,12 @@ def test_sounding_index_forms(sounding_profile):
     assert mcalc.cross_totals(pres, temp, dewpoint).units == mp_units.delta_degC
     assert mcalc.vertical_totals(pres, temp).units == mp_units.delta_degC
     assert mcalc.total_totals(pres, temp, dewpoint).units == mp_units.delta_degC
-    assert mcalc.k_index(pres, temp, dewpoint).units == mp_units.delta_degC
+    assert mcalc.k_index(pres, temp, dewpoint).units == mp_units.degC
+
+
+def test_package_exposes_version():
+    assert isinstance(metrust.__version__, str)
+    assert metrust.__version__
 
 
 def test_layer_and_mixed_layer_forms(sounding_profile):
@@ -351,6 +358,124 @@ def test_common_keyword_forms_match_metpy():
         dy=1000 * mp_units.m,
     )
     np.testing.assert_allclose(mr_fg.to("K/m/s").m, mp_fg.to("K/m/s").m, atol=1e-12)
+
+    mr_adv = mcalc.advection(theta, u=u_grid, v=v_grid, dx=1000 * mp_units.m, dy=1000 * mp_units.m)
+    mp_adv = mpcalc.advection(theta, u=u_grid, v=v_grid, dx=1000 * mp_units.m, dy=1000 * mp_units.m)
+    np.testing.assert_allclose(mr_adv.to(mp_adv.units).m, mp_adv.m, atol=1e-12)
+
+
+def test_interpolate_preserves_quantity_units_and_metpy_return_shape():
+    x = np.array([925.0, 700.0, 500.0]) * mp_units.hPa
+    xp = np.array([1000.0, 925.0, 850.0, 700.0, 500.0]) * mp_units.hPa
+    temperature = np.array([31.0, 25.0, 19.0, 7.0, -10.0]) * mp_units.degC
+    height = np.array([100.0, 750.0, 1500.0, 3000.0, 5600.0]) * mp_units.m
+
+    mr_one = minterp.log_interpolate_1d(x, xp, temperature)
+    mp_one = pytest.importorskip("metpy.interpolate").log_interpolate_1d(x, xp, temperature)
+    assert hasattr(mr_one, "units")
+    assert mr_one.units == mp_one.units
+    np.testing.assert_allclose(mr_one.to(mp_one.units).m, mp_one.m, atol=1e-12)
+
+    mr_many = minterp.log_interpolate_1d(x, xp, temperature, height)
+    mp_many = pytest.importorskip("metpy.interpolate").log_interpolate_1d(x, xp, temperature, height)
+    assert isinstance(mr_many, list)
+    assert len(mr_many) == len(mp_many) == 2
+    for actual, expected in zip(mr_many, mp_many):
+        assert actual.units == expected.units
+        np.testing.assert_allclose(actual.to(expected.units).m, expected.m, atol=1e-12)
+
+
+def test_apparent_temperature_family_preserves_temperature_units():
+    temp_f = 95 * mp_units.degF
+    rh = 55 * mp_units.percent
+    speed = 25 * mp_units("mile/hour")
+
+    mr_hi = mcalc.heat_index(temp_f, rh, mask_undefined=False)
+    mp_hi = mpcalc.heat_index(temp_f, rh, mask_undefined=False)
+    assert mr_hi.units == mp_hi.units == mp_units.degF
+    np.testing.assert_allclose(mr_hi.m, mp_hi.m, atol=0.25)
+
+    mr_wc = mcalc.windchill(20 * mp_units.degF, speed, mask_undefined=False)
+    mp_wc = mpcalc.windchill(20 * mp_units.degF, speed, mask_undefined=False)
+    assert mr_wc.units == mp_wc.units == mp_units.degF
+    np.testing.assert_allclose(mr_wc.m, mp_wc.m, atol=0.25)
+
+    mr_at = mcalc.apparent_temperature(temp_f, rh, speed, mask_undefined=False)
+    mp_at = mpcalc.apparent_temperature(temp_f, rh, speed, mask_undefined=False)
+    assert mr_at.units == mp_at.units == mp_units.degF
+    np.testing.assert_allclose(mr_at.m, mp_at.m, atol=0.25)
+
+
+def test_metpy_signature_edge_cases_match():
+    pressure = np.array([1000.0, 900.0, 800.0]) * mp_units.hPa
+    temperature = np.array([20.0, 12.0, 4.0]) * mp_units.degC
+    specific_humidity = np.array([0.012, 0.009, 0.006]) * mp_units("kg/kg")
+
+    mr_dewpoint = mcalc.dewpoint_from_specific_humidity(
+        pressure,
+        temperature,
+        specific_humidity,
+    )
+    mp_dewpoint = mpcalc.dewpoint_from_specific_humidity(
+        pressure,
+        temperature,
+        specific_humidity,
+    )
+    np.testing.assert_allclose(mr_dewpoint.to("degC").m, mp_dewpoint.to("degC").m, atol=1e-10)
+
+    field = np.arange(9.0).reshape(3, 3) * mp_units.K
+    mr_derivative = mcalc.first_derivative(field, axis=-1, delta=1000 * mp_units.m)
+    mp_derivative = mpcalc.first_derivative(field, axis=-1, delta=1000 * mp_units.m)
+    np.testing.assert_allclose(mr_derivative.to("K/m").m, mp_derivative.to("K/m").m, atol=1e-12)
+
+    mr_x, mr_y = mcalc.find_intersections(
+        np.arange(5.0),
+        np.array([0.0, 1.0, 2.0, 1.0, 0.0]),
+        np.ones(5),
+    )
+    mp_x, mp_y = mpcalc.find_intersections(
+        np.arange(5.0),
+        np.array([0.0, 1.0, 2.0, 1.0, 0.0]),
+        np.ones(5),
+    )
+    assert mr_x.units == mp_x.units == mp_units.dimensionless
+    assert mr_y.units == mp_y.units == mp_units.dimensionless
+    np.testing.assert_allclose(mr_x.m, mp_x.m, atol=1e-12)
+    np.testing.assert_allclose(mr_y.m, mp_y.m, atol=1e-12)
+
+    smoothed = mcalc.smooth_gaussian(np.arange(25.0).reshape(5, 5), 2)
+    windowed = mcalc.smooth_window(np.arange(25.0).reshape(5, 5), np.ones((3, 3)))
+    assert smoothed.units == mp_units.dimensionless
+    assert windowed.units == mp_units.dimensionless
+
+
+def test_cross_section_xarray_components_match_metpy_unit_surface():
+    cross = xr.DataArray(
+        np.arange(4.0),
+        dims=("index",),
+        coords={
+            "index": np.arange(4),
+            "latitude": ("index", np.linspace(35, 36, 4)),
+            "longitude": ("index", np.linspace(-99, -98, 4)),
+        },
+    ).metpy.assign_crs(grid_mapping_name="latitude_longitude")
+    data_x = cross.copy(data=np.ones(4))
+    data_x.attrs["units"] = "m/s"
+    data_y = cross.copy(data=np.ones(4) * 2)
+    data_y.attrs["units"] = "m/s"
+
+    mr_tangential, mr_normal = mcalc.cross_section_components(data_x, data_y)
+    mp_tangential, mp_normal = mpcalc.cross_section_components(data_x, data_y)
+
+    for actual, expected in ((mr_tangential, mp_tangential), (mr_normal, mp_normal)):
+        assert actual.attrs["units"] == expected.attrs["units"] == "m/s"
+        assert getattr(actual.data, "units", None) == getattr(expected.data, "units", None)
+        np.testing.assert_allclose(actual.values, expected.values, atol=1e-12)
+
+    mr_abs = mcalc.absolute_momentum(data_x, data_x)
+    mp_abs = mpcalc.absolute_momentum(data_x, data_x)
+    assert getattr(mr_abs.data, "units", None) == getattr(mp_abs.data, "units", None)
+    np.testing.assert_allclose(mr_abs.values, mp_abs.values, atol=1e-12)
 
 
 def test_plain_relative_humidity_arrays_match_metpy():

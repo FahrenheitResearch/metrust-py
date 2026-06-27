@@ -18,14 +18,69 @@ def _mag(x):
     return x.magnitude if hasattr(x, 'magnitude') else x
 
 
+def _unit(x):
+    """Return a Pint unit from *x*, if one is attached."""
+    return getattr(x, "units", None)
+
+
 def _f64(x):
     """Convert *x* to a contiguous float64 numpy array, stripping units."""
     return np.asarray(_mag(x), dtype=np.float64)
 
 
+def _coordinate_magnitudes(x, xp):
+    """Return x/xp magnitudes in compatible coordinate units."""
+    xp_unit = _unit(xp)
+    x_unit = _unit(x)
+    if xp_unit is not None:
+        xp_arr = np.asarray(xp.magnitude, dtype=np.float64)
+        x_arr = np.asarray(x.to(xp_unit).magnitude if x_unit is not None else x, dtype=np.float64)
+    else:
+        xp_arr = np.asarray(xp, dtype=np.float64)
+        x_arr = np.asarray(x.magnitude if x_unit is not None else x, dtype=np.float64)
+    return np.atleast_1d(x_arr), np.asarray(xp_arr, dtype=np.float64)
+
+
+def _attach_like(values, template):
+    unit = _unit(template)
+    return values * unit if unit is not None else values
+
+
+def _interp_along_axis(x, xp, values, axis, fill_value):
+    values = np.asarray(values, dtype=np.float64)
+    xp = np.asarray(xp, dtype=np.float64)
+    x = np.asarray(x, dtype=np.float64)
+
+    if xp.ndim != 1:
+        raise ValueError("xp must be a 1-dimensional array")
+    if values.shape[axis] != xp.size:
+        raise ValueError("fp and xp must be the same length along the interpolation axis")
+
+    if xp[0] > xp[-1]:
+        xp = xp[::-1]
+        values = np.flip(values, axis=axis)
+
+    if values.ndim == 1:
+        return np.interp(x, xp, values, left=fill_value, right=fill_value)
+
+    moved = np.moveaxis(values, axis, 0)
+    rest_shape = moved.shape[1:]
+    out = np.full((x.size,) + rest_shape, fill_value, dtype=np.float64)
+    for idx in np.ndindex(rest_shape):
+        out[(slice(None),) + idx] = np.interp(
+            x,
+            xp,
+            moved[(slice(None),) + idx],
+            left=fill_value,
+            right=fill_value,
+        )
+    return np.moveaxis(out, 0, axis)
+
+
 # ── 1-D interpolation ───────────────────────────────────────────────────
 
-def interpolate_1d(x, xp, fp):
+def interpolate_1d(x, xp, *args, axis=0, fill_value=np.nan,
+                   return_list_always=False):
     """Piecewise linear interpolation (like numpy.interp).
 
     Parameters
@@ -34,17 +89,31 @@ def interpolate_1d(x, xp, fp):
         Points at which to evaluate the interpolant.
     xp : array-like
         Monotonically increasing breakpoints.
-    fp : array-like
+    *args : array-like
         Values at each breakpoint (same length as *xp*).
 
     Returns
     -------
-    numpy.ndarray
+    numpy.ndarray, pint.Quantity, or list
     """
-    return _interp.interpolate_1d(_f64(x), _f64(xp), _f64(fp))
+    if not args:
+        raise TypeError("interpolate_1d requires at least one data array")
+
+    x_arr, xp_arr = _coordinate_magnitudes(x, xp)
+    results = [
+        _attach_like(
+            _interp_along_axis(x_arr, xp_arr, _mag(fp), axis, fill_value),
+            fp,
+        )
+        for fp in args
+    ]
+
+    if len(results) == 1 and not return_list_always:
+        return results[0]
+    return results
 
 
-def log_interpolate_1d(x, xp, *args):
+def log_interpolate_1d(x, xp, *args, axis=0, fill_value=np.nan):
     """Interpolation in log-pressure space (MetPy compatible).
 
     Performs linear interpolation in ``ln(x)`` space, which is the
@@ -62,15 +131,18 @@ def log_interpolate_1d(x, xp, *args):
 
     Returns
     -------
-    numpy.ndarray or tuple of numpy.ndarray
-        Single array when one data array is given, tuple otherwise.
+    numpy.ndarray, pint.Quantity, or list
+        Single array when one data array is given, list otherwise.
     """
-    x_arr = _f64(x)
-    xp_arr = _f64(xp)
-    results = []
-    for fp in args:
-        results.append(_interp.log_interpolate_1d(x_arr, xp_arr, _f64(fp)))
-    return tuple(results) if len(results) > 1 else results[0]
+    x_arr, xp_arr = _coordinate_magnitudes(x, xp)
+    return interpolate_1d(
+        np.log(x_arr),
+        np.log(xp_arr),
+        *args,
+        axis=axis,
+        fill_value=fill_value,
+        return_list_always=len(args) > 1,
+    )
 
 
 # ── NaN handling ─────────────────────────────────────────────────────────

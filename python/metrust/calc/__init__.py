@@ -1427,7 +1427,7 @@ def k_index(*args, vertical_dim=0):
 
     Returns
     -------
-    Quantity (delta_degC)
+    Quantity (degC)
     """
     if len(args) == 3:
         pressure, temperature, dewpoint = args
@@ -1448,7 +1448,7 @@ def k_index(*args, vertical_dim=0):
             _as_float(_strip(td850, "degC")),
             _as_float(_strip(td700, "degC")),
         ),
-        "delta_degC",
+        "degC",
     )
 
 
@@ -2326,18 +2326,35 @@ def dewpoint(vapor_pressure_val):
     return result * units.degC
 
 
-def dewpoint_from_specific_humidity(pressure, specific_humidity):
+def dewpoint_from_specific_humidity(*args, **kwargs):
     """Dewpoint from pressure and specific humidity.
 
     Parameters
     ----------
     pressure : Quantity (pressure)
+    temperature : Quantity, optional
+        Accepted for MetPy compatibility and ignored.
     specific_humidity : Quantity (kg/kg)
 
     Returns
     -------
     Quantity (degC)
     """
+    if kwargs:
+        if "pressure" not in kwargs or "specific_humidity" not in kwargs:
+            raise TypeError("dewpoint_from_specific_humidity requires pressure and specific_humidity")
+        pressure = kwargs["pressure"]
+        specific_humidity = kwargs["specific_humidity"]
+    elif len(args) == 2:
+        pressure, specific_humidity = args
+    elif len(args) == 3:
+        pressure, _temperature, specific_humidity = args
+    else:
+        raise TypeError(
+            "dewpoint_from_specific_humidity expects (pressure, specific_humidity) "
+            "or the deprecated MetPy form (pressure, temperature, specific_humidity)"
+        )
+
     vals, shape, is_arr = _prep(
         _strip(pressure, "hPa"),
         _strip(specific_humidity, "kg/kg") if hasattr(specific_humidity, "magnitude") else specific_humidity,
@@ -4416,9 +4433,9 @@ def absolute_vorticity(u, v, lats=None, dx=None, dy=None, latitude=None,
     return relative_vorticity + coriolis_parameter(lat_source)
 
 
-def advection(scalar, *args, dx=None, dy=None, dz=None, x_dim=-1, y_dim=-2,
-              vertical_dim=-3, parallel_scale=None, meridional_scale=None,
-              latitude=None, longitude=None, crs=None):
+def advection(scalar, *args, u=None, v=None, w=None, dx=None, dy=None, dz=None,
+              x_dim=-1, y_dim=-2, vertical_dim=-3, parallel_scale=None,
+              meridional_scale=None, latitude=None, longitude=None, crs=None):
     """Advection of a scalar field by a 2-D wind.
 
     Parameters
@@ -4431,22 +4448,28 @@ def advection(scalar, *args, dx=None, dy=None, dz=None, x_dim=-1, y_dim=-2,
     -------
     2-D array Quantity (scalar_units / s)
     """
-    if len(args) == 2:
-        u, v = args
-        w = None
-    elif len(args) == 3:
-        u, v, w = args
-    elif len(args) == 4:
-        u, v, dx_pos, dy_pos = args
-        w = None
-        dx = dx_pos if dx is None else dx
-        dy = dy_pos if dy is None else dy
-    elif len(args) == 5:
-        u, v, w, dx_pos, dy_pos = args
-        dx = dx_pos if dx is None else dx
-        dy = dy_pos if dy is None else dy
-    else:
-        raise TypeError("advection expects (scalar, u, v, ...) with optional dx/dy or 3-D placeholders")
+    if args:
+        if any(item is not None for item in (u, v, w)):
+            raise TypeError("advection got multiple values for wind component arguments")
+        if len(args) == 2:
+            u, v = args
+            w = None
+        elif len(args) == 3:
+            u, v, w = args
+        elif len(args) == 4:
+            u, v, dx_pos, dy_pos = args
+            w = None
+            dx = dx_pos if dx is None else dx
+            dy = dy_pos if dy is None else dy
+        elif len(args) == 5:
+            u, v, w, dx_pos, dy_pos = args
+            dx = dx_pos if dx is None else dx
+            dy = dy_pos if dy is None else dy
+        else:
+            raise TypeError("advection expects (scalar, u, v, ...) with optional dx/dy or 3-D placeholders")
+
+    if u is None or v is None:
+        raise TypeError("advection requires u and v wind components")
 
     if w is not None or dz is not None:
         raise NotImplementedError("3-D advection with w/dz is not yet supported in metrust.advection; use advection_3d")
@@ -4631,12 +4654,6 @@ def _is_dataarray_like(value):
 
 
 def _dataarray_unit_array(data, unit=None):
-    if hasattr(data, "metpy"):
-        try:
-            arr = data.metpy.unit_array
-            return arr.to(unit) if unit is not None and hasattr(arr, "to") else arr
-        except Exception:
-            pass
     raw = data.data if hasattr(data, "data") else data
     if hasattr(raw, "to"):
         return raw.to(unit) if unit is not None else raw
@@ -4647,6 +4664,13 @@ def _dataarray_unit_array(data, unit=None):
     if unit_name:
         quantity = values * units(unit_name)
         return quantity.to(unit) if unit is not None else quantity
+    if unit is not None:
+        return values * units(unit)
+    if hasattr(data, "metpy"):
+        try:
+            return data.metpy.unit_array
+        except Exception:
+            pass
     return values * units(unit) if unit is not None else values
 
 
@@ -4988,8 +5012,6 @@ def normal_component(data_x, data_y, index="index", *legacy_args):
     array Quantity (m/s)
     """
     if _is_dataarray_like(data_x) and _is_dataarray_like(data_y) and not legacy_args:
-        data_x = data_x.metpy.quantify() if hasattr(data_x, "metpy") else data_x
-        data_y = data_y.metpy.quantify() if hasattr(data_y, "metpy") else data_y
         _, unit_norm = _cross_section_unit_vectors(data_x, index=index)
         component_norm = data_x * unit_norm[0] + data_y * unit_norm[1]
         if "grid_mapping" in data_x.attrs:
@@ -5018,8 +5040,6 @@ def tangential_component(data_x, data_y, index="index", *legacy_args):
     array Quantity (m/s)
     """
     if _is_dataarray_like(data_x) and _is_dataarray_like(data_y) and not legacy_args:
-        data_x = data_x.metpy.quantify() if hasattr(data_x, "metpy") else data_x
-        data_y = data_y.metpy.quantify() if hasattr(data_y, "metpy") else data_y
         unit_tang, _ = _cross_section_unit_vectors(data_x, index=index)
         component_tang = data_x * unit_tang[0] + data_y * unit_tang[1]
         if "grid_mapping" in data_x.attrs:
@@ -5205,8 +5225,6 @@ def cross_section_components(data_x, data_y, index="index", *legacy_args):
         (parallel, perpendicular) components.
     """
     if _is_dataarray_like(data_x) and _is_dataarray_like(data_y) and not legacy_args:
-        data_x = data_x.metpy.quantify() if hasattr(data_x, "metpy") else data_x
-        data_y = data_y.metpy.quantify() if hasattr(data_y, "metpy") else data_y
         unit_tang, unit_norm = _cross_section_unit_vectors(data_x, index=index)
         component_tang = data_x * unit_tang[0] + data_y * unit_tang[1]
         component_norm = data_x * unit_norm[0] + data_y * unit_norm[1]
@@ -6189,7 +6207,18 @@ def sigma_to_pressure(sigma, pressure_sfc, pressure_top):
     return sigma_arr * (pressure_sfc - pressure_top) + pressure_top
 
 
-def heat_index(temperature, relative_humidity):
+def _temperature_output_unit(temperature):
+    return getattr(temperature, "units", units.degC)
+
+
+def _maybe_mask_quantity(quantity, mask):
+    mask = np.asarray(mask)
+    if mask.any():
+        return np.ma.array(quantity.magnitude, mask=mask) * quantity.units
+    return quantity
+
+
+def heat_index(temperature, relative_humidity, mask_undefined=True):
     """Heat index (NWS Rothfusz regression).
 
     Parameters
@@ -6202,33 +6231,47 @@ def heat_index(temperature, relative_humidity):
     Quantity (degC)
     """
     result = _vec_call(_calc.heat_index, _strip(temperature, "degC"), _rh_to_percent(relative_humidity))
-    return np.atleast_1d(result) * units.degC
+    output = (np.atleast_1d(result) * units.degC).to(_temperature_output_unit(temperature))
+    if mask_undefined:
+        mask = np.asarray(np.atleast_1d(temperature) < (80 * units.degF))
+        output = _maybe_mask_quantity(output, mask)
+    return output
 
 
-def windchill(temperature, wind_speed_val):
+def windchill(temperature, speed, face_level_winds=False, mask_undefined=True):
     """Wind chill index (NWS formula).
 
     Parameters
     ----------
     temperature : Quantity (temperature)
-    wind_speed_val : Quantity (m/s)
+    speed : Quantity (m/s)
 
     Returns
     -------
     Quantity (degC)
     """
-    result = _vec_call(_calc.windchill, _strip(temperature, "degC"), _strip(wind_speed_val, "m/s"))
-    return result * units.degC
+    if face_level_winds:
+        speed = speed * 1.5
+    result = _vec_call(_calc.windchill, _strip(temperature, "degC"), _strip(speed, "m/s"))
+    output = (result * units.degC).to(_temperature_output_unit(temperature))
+    if mask_undefined:
+        mask = np.asarray(
+            (np.atleast_1d(temperature) > (10 * units.degC))
+            | (np.atleast_1d(speed) <= (3 * units("mile/hour")))
+        )
+        output = _maybe_mask_quantity(output, mask)
+    return output
 
 
-def apparent_temperature(temperature, relative_humidity, wind_speed_val):
+def apparent_temperature(temperature, relative_humidity, speed, face_level_winds=False,
+                         mask_undefined=True):
     """Apparent temperature combining heat index and wind chill.
 
     Parameters
     ----------
     temperature : Quantity (temperature)
     relative_humidity : float or Quantity (percent)
-    wind_speed_val : Quantity (m/s)
+    speed : Quantity (m/s)
 
     Returns
     -------
@@ -6238,9 +6281,17 @@ def apparent_temperature(temperature, relative_humidity, wind_speed_val):
         _calc.apparent_temperature,
         _strip(temperature, "degC"),
         _rh_to_percent(relative_humidity),
-        _strip(wind_speed_val, "m/s"),
+        _strip(speed * 1.5 if face_level_winds else speed, "m/s"),
     )
-    return np.atleast_1d(result) * units.degC
+    output = (np.atleast_1d(result) * units.degC).to(_temperature_output_unit(temperature))
+    if mask_undefined:
+        wind_mask = np.asarray(
+            (np.atleast_1d(temperature) > (10 * units.degC))
+            | (np.atleast_1d(speed) <= (3 * units("mile/hour")))
+        )
+        heat_mask = np.asarray(np.atleast_1d(temperature) < (80 * units.degF))
+        output = _maybe_mask_quantity(output, wind_mask & heat_mask)
+    return output
 
 
 # ============================================================================
@@ -6265,7 +6316,7 @@ def smooth_gaussian(scalar_grid, n):
     sigma = n / (2 * np.pi)
     num_axes = len(scalar_grid.shape)
     sigma_seq = [sigma if i > num_axes - 3 else 0 for i in range(num_axes)]
-    data_units = getattr(scalar_grid, "units", None)
+    data_units = getattr(scalar_grid, "units", None) or units.dimensionless
     data = getattr(scalar_grid, "magnitude", scalar_grid)
     filter_args = {"sigma": sigma_seq, "truncate": 2 * np.sqrt(2)}
     if hasattr(data, "mask"):
@@ -6400,6 +6451,8 @@ def smooth_window(scalar_grid, window, passes=1, normalize_weights=True):
     unit_str = str(data_units) if data_units is not None else None
     if unit_str is None:
         unit_str = getattr(getattr(scalar_grid, "attrs", None), "get", lambda *_: None)("units")
+    if unit_str is None:
+        unit_str = "dimensionless"
     data = np.array(getattr(scalar_grid, "magnitude", scalar_grid))
     for _ in range(int(passes)):
         data[inner_full_index] = sum(
@@ -6652,11 +6705,13 @@ def first_derivative(data, axis_spacing=None, axis=0, x=None, delta=None):
         axis_spacing.to("m").magnitude if hasattr(axis_spacing, "to") else axis_spacing,
         dtype=np.float64,
     )
+    axis_mod = int(axis) % d_arr.ndim
     if spacing_arr.size > 1:
-        result = _first_derivative_variable(d_arr, spacing_arr, int(axis))
+        result = _first_derivative_variable(d_arr, spacing_arr, axis_mod)
     else:
         ds = float(spacing_arr.ravel()[0])
-        result = np.asarray(_calc.first_derivative(d_arr, ds, int(axis)))
+        kernel_axis = 1 - axis_mod if d_arr.ndim == 2 else axis_mod
+        result = np.asarray(_calc.first_derivative(d_arr, ds, kernel_axis))
     if has_units:
         return result * (data.units / units.m)
     if hasattr(axis_spacing, "magnitude"):
@@ -6686,7 +6741,9 @@ def second_derivative(data, axis_spacing=None, axis=0, x=None, delta=None):
     if axis_spacing is None:
         raise TypeError("second_derivative requires axis spacing via axis_spacing, x, or delta")
     ds = _mean_spacing(axis_spacing, "m")
-    result = np.asarray(_calc.second_derivative(d_arr, ds, int(axis)))
+    axis_mod = int(axis) % d_arr.ndim
+    kernel_axis = 1 - axis_mod if d_arr.ndim == 2 else axis_mod
+    result = np.asarray(_calc.second_derivative(d_arr, ds, kernel_axis))
     if has_units:
         return result * (data.units / units.m ** 2)
     if hasattr(axis_spacing, "magnitude"):
@@ -7151,8 +7208,8 @@ def azimuth_range_to_lat_lon(azimuths, ranges, center_lon, center_lat, geod=None
 
 def find_intersections(x, a, b, direction="all", log_x=False):
     """Calculate the best estimate of intersection."""
-    x_unit = getattr(x, "units", None)
-    y_unit = getattr(a, "units", getattr(b, "units", None))
+    x_unit = getattr(x, "units", units.dimensionless)
+    y_unit = getattr(a, "units", getattr(b, "units", units.dimensionless))
     x_arr = np.asarray(getattr(x, "magnitude", x), dtype=np.float64)
     a_arr = np.asarray(getattr(a, "magnitude", a), dtype=np.float64)
     b_arr = np.asarray(getattr(b, "magnitude", b), dtype=np.float64)
